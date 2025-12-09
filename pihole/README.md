@@ -48,5 +48,13 @@ If your MASTER Pi-Hole is currently the MASTER, you should see something like th
 
 If there is no output, keepalived is not running or your MASTR Pi-Hle is in BACKUP moode.
 
+### Configure your router
+Configure your router to use the VIP `192.168.178.9` instead of the Pi-Hole IP
+
+### Clear your DNS cache from your device
+Disconnect from the network (turn off/on WLAN, pull/insert the network cable, reboot) or wait some time till your lease is expired.
+
+
+
 
 
