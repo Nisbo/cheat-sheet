@@ -7,6 +7,8 @@ sudo apt update
 sudo apt install keepalived -y
 ```
 
+## Configuration
+
 ### create / edit the configuration
 
 ```
@@ -33,6 +35,7 @@ On both server
 > [!IMPORTANT]
 > make sure that this IP is **not** in your DHCP range to avoid that your DHCP server assign this IP to an other device.
 
+---
 ### start the services on both server
 
 ```
@@ -40,6 +43,7 @@ sudo systemctl enable keepalived
 sudo systemctl restart keepalived
 ```
 
+---
 ### check if the service is running on both server
 
 ```sudo systemctl status keepalived```
@@ -78,7 +82,7 @@ pi@pihole:~ $
 
 
 
-
+---
 ### Check if the VIP is assigned to the MASTER Pi-Hole
 
 On your MASTER Pi-Hole run this command:
@@ -91,7 +95,7 @@ If your MASTER Pi-Hole is currently the MASTER, you should see something like th
 
 If there is no output, keepalived is not running or your MASTER Pi-Hole is in BACKUP mode.
 
-
+---
 ### Check if the VIP changes to the BACKUP Pi-Hole
 
 On your MASTER Pi-Hole run this command:
@@ -116,9 +120,11 @@ On your MASTER Pi-Hole run this command:
 
 to make the MASTER Pi-Hole again to the MASTER
 
+---
 ### Configure your router
 Configure your router to use the VIP `192.168.178.9` instead of the Pi-Hole IP
 
+---
 ### Clear your DNS cache from your device
 Disconnect from the network (turn off/on WLAN, pull/insert the network cable, reboot) or wait some time till your lease is expired.
 
