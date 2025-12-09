@@ -26,7 +26,9 @@ for the `BACKUP` from here:
 
 https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
 
-replace the VIP (Virtual IP) `192.168.178.9` with an IP from your subnet.
+On both server
+- replace the VIP (Virtual IP) `192.168.178.9` with an IP from your subnet.
+- replace the netwotk interface `eth0` with your interface.
 
 > [!IMPORTANT]
 > make sure that this IP is **not** in your DHCP range to avoid that your DHCP server assign this IP to an other device.
@@ -38,9 +40,54 @@ sudo systemctl enable keepalived
 sudo systemctl restart keepalived
 ```
 
+### check if the service is running on both server
+
+```sudo systemctl status keepalived```
+
+you should see something like this
+
+```
+pi@pihole:~ $ sudo systemctl status keepalived
+● keepalived.service - Keepalive Daemon (LVS and VRRP)
+     Loaded: loaded (/lib/systemd/system/keepalived.service; enabled; preset: enabled)
+     Active: active (running) since Tue 2025-12-09 05:27:35 CET; 1h 53min ago
+       Docs: man:keepalived(8)
+             man:keepalived.conf(5)
+             man:genhash(1)
+             https://keepalived.org
+   Main PID: 1208180 (keepalived)
+      Tasks: 2 (limit: 760)
+        CPU: 1.383s
+     CGroup: /system.slice/keepalived.service
+             ├─1208180 /usr/sbin/keepalived --dont-fork
+             └─1208181 /usr/sbin/keepalived --dont-fork
+
+Dec 09 05:27:35 pihole Keepalived[1208180]: Starting VRRP child process, pid=1208181
+Dec 09 05:27:35 pihole systemd[1]: keepalived.service: Got notification message from PID 1208181, but reception only permitted for main PID 1208180
+Dec 09 05:27:35 pihole Keepalived[1208180]: Startup complete
+Dec 09 05:27:35 pihole Keepalived_vrrp[1208181]: (VI_1) Entering BACKUP STATE (init)
+Dec 09 05:27:35 pihole systemd[1]: Started keepalived.service - Keepalive Daemon (LVS and VRRP).
+Dec 09 05:27:36 pihole Keepalived_vrrp[1208181]: (VI_1) received lower priority (100) advert from 192.168.178.13 - discarding
+Dec 09 05:27:37 pihole Keepalived_vrrp[1208181]: (VI_1) received lower priority (100) advert from 192.168.178.13 - discarding
+Dec 09 05:27:38 pihole Keepalived_vrrp[1208181]: (VI_1) received lower priority (100) advert from 192.168.178.13 - discarding
+Dec 09 05:27:39 pihole Keepalived_vrrp[1208181]: (VI_1) received lower priority (100) advert from 192.168.178.13 - discarding
+Dec 09 05:27:39 pihole Keepalived_vrrp[1208181]: (VI_1) Entering MASTER STATE
+pi@pihole:~ $
+```
+
+
+
+
+
 ### Check if the VIP is assigned to the MASTER Pi-Hole
 
 ```ip addr show eth0 | grep 192.168.178.9```
+
+
+
+
+
+
 
 If your MASTER Pi-Hole is currently the MASTER, you should see something like this:
 
