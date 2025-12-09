@@ -81,19 +81,40 @@ pi@pihole:~ $
 
 ### Check if the VIP is assigned to the MASTER Pi-Hole
 
+On your MASTER Pi-Hole run this command:
+
 ```ip addr show eth0 | grep 192.168.178.9```
-
-
-
-
-
-
 
 If your MASTER Pi-Hole is currently the MASTER, you should see something like this:
 
 ```inet 192.168.178.9/32 scope global eth0```
 
-If there is no output, keepalived is not running or your MASTR Pi-Hle is in BACKUP moode.
+If there is no output, keepalived is not running or your MASTER Pi-Hole is in BACKUP mode.
+
+
+### Check if the VIP changes to the BACKUP Pi-Hole
+
+On your MASTER Pi-Hole run this command:
+
+```sudo systemctl stop keepalived```
+
+to stop keepalived and simulate an outage
+
+On your BACKUP Pi-Hole run this command:
+
+```ip addr show eth0 | grep 192.168.178.9```
+
+If your BACKUP Pi-Hole is now the MASTER, you should see something like this:
+
+```inet 192.168.178.9/32 scope global eth0```
+
+If there is no output, keepalived is not running or your BACKUP Pi-Hole is still in BACKUP mode.
+
+On your MASTER Pi-Hole run this command:
+
+```sudo systemctl start keepalived```
+
+to make the MASTER Pi-Hole again to the MASTER
 
 ### Configure your router
 Configure your router to use the VIP `192.168.178.9` instead of the Pi-Hole IP
