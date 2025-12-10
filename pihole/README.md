@@ -333,6 +333,12 @@ Start:
 curl http://<your-pi-ip>:5000/keepalived/start
 ```
 
+Restart:
+
+```
+curl http://<your-pi-ip>:5000/keepalived/restart
+```
+
 Stop:
 
 ```
