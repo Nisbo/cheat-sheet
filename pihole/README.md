@@ -285,7 +285,27 @@ port = 5000
 interface = eth0
 vip = 192.168.178.9
 allowed_ips = 192.168.178.87,192.168.178.72
+
+[mqtt]
+enabled = true
+name = MASTER Pi-Hole
+ip = 192.168.178.27
+port = 1883
+username =
+password =
+update_interval = 30
 ```
+
+### MQTT Paho client installation
+
+```
+sudo apt update
+sudo apt install -y mosquitto mosquitto-clients python3-paho-mqtt
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto
+```
+
+
 
 ### Systemd service
 
