@@ -166,14 +166,19 @@ and use this content
 from flask import Flask, request, jsonify, abort
 import subprocess
 import configparser
+import threading
+import time
+import paho.mqtt.client as mqtt
+import json
+import re
 
 app = Flask(__name__)
 
-# Konfigurationsdatei laden
+# Config laden
 config = configparser.ConfigParser()
 config.read('/usr/local/bin/keepalived_api.conf')
 
-# Werte aus der Config auslesen
+# keepalived_api Section
 PORT = int(config['keepalived_api'].get('port', '5000'))
 INTERFACE = config['keepalived_api'].get('interface', 'eth0')
 VIRTUAL_IP = config['keepalived_api'].get('vip', '192.168.178.9')
@@ -181,13 +186,24 @@ VIRTUAL_IP = config['keepalived_api'].get('vip', '192.168.178.9')
 allowed_ips_str = config['keepalived_api'].get('allowed_ips', '')
 ALLOWED_IPS = [ip.strip() for ip in allowed_ips_str.split(',') if ip.strip()]
 
+# MQTT Section
+mqtt_enabled = config['mqtt'].getboolean('enabled', fallback=False)
+mqtt_name = config['mqtt'].get('name', 'Pi-Hole')
+mqtt_ip = config['mqtt'].get('ip', '127.0.0.1')
+mqtt_port = int(config['mqtt'].get('port', 1883))
+mqtt_username = config['mqtt'].get('username', '')
+mqtt_password = config['mqtt'].get('password', '')
+update_interval = int(config['mqtt'].get('update_interval', 30))
+
+mqtt_client = None
+
 def is_allowed_ip():
     return request.remote_addr in ALLOWED_IPS
 
 @app.before_request
 def limit_remote_addr():
     if not is_allowed_ip():
-        abort(403)  # Forbidden
+        abort(403)
 
 def get_keepalived_status():
     try:
@@ -254,14 +270,146 @@ def control(action):
         )
         keepalived_status, stdout_status, stderr_status = get_keepalived_status()
         vip_assigned = get_vip_assigned()
-        # Für stdout und stderr hier geben wir die systemctl action Ausgabe zurück,
-        # nicht die status Ausgabe.
         return compose_response(action, keepalived_status, vip_assigned, result.stdout.strip(), result.stderr.strip())
     except subprocess.CalledProcessError as e:
         return jsonify({"error": str(e)}), 500
 
+
+# MQTT Integration
+def mqtt_connect():
+    global mqtt_client
+    mqtt_client = mqtt.Client()
+    if mqtt_username and mqtt_password:
+        mqtt_client.username_pw_set(mqtt_username, mqtt_password)
+    mqtt_client.connect(mqtt_ip, mqtt_port, 60)
+    mqtt_client.loop_start()
+
+def sanitize_topic_name(name):
+    # Ersetzt alles außer a-z, A-Z, 0-9 durch _
+    return re.sub(r'[^a-zA-Z0-9]', '_', name)
+
+def publish_discovery():
+    unique_id = sanitize_topic_name(mqtt_name).lower()
+    base_command_topic = f"homeassistant/button/{unique_id}/set_keepalived"
+    state_topic = f"homeassistant/sensor/{unique_id}_keepalived_status/state"
+    sensor_config_topic = f"homeassistant/sensor/{unique_id}_keepalived_status/config"
+
+    device_info = {
+        "identifiers": [unique_id],
+        "name": mqtt_name,
+        "manufacturer": "Custom",
+        "model": "Keepalived API",
+        "sw_version": "1.0"
+    }
+
+    # Buttons discovery (start, stop, restart)
+    actions = ['start', 'stop', 'restart']
+    for action in actions:
+        topic = f"homeassistant/button/{unique_id}_keepalived_{action}/config"
+        payload = {
+            "name": f"{mqtt_name} Keepalived {action.capitalize()}",
+            "unique_id": f"{unique_id}_keepalived_{action}",
+            "command_topic": f"{base_command_topic}/{action}",
+            "device": device_info
+        }
+        mqtt_client.publish(topic, json.dumps(payload), retain=True)
+
+    # Mainsensor (keepalived_status) including attributes
+    sensor_payload = {
+        "name": f"{mqtt_name} Keepalived Status",
+        "unique_id": f"{unique_id}_keepalived_status",
+        "state_topic": state_topic,
+        "json_attributes_topic": state_topic,
+        "value_template": "{{ value_json.keepalived_status }}",
+        "icon": "mdi:router-network",
+        "device": device_info
+    }
+    mqtt_client.publish(sensor_config_topic, json.dumps(sensor_payload), retain=True)
+
+    # Single sensors for each attribute
+    attribute_names = ["keepalived_mode", "configured_vip", "vip_assigned", "stdout", "stderr"]
+    for attr in attribute_names:
+        attr_sensor_payload = {
+            "name": f"{attr.replace('_', ' ').title()}",
+            "unique_id": f"{unique_id}_keepalived_{attr}",
+            "state_topic": state_topic,
+            "value_template": f"{{{{ value_json.{attr} }}}}",
+            "device": device_info,
+            "icon": "mdi:information-outline",
+        }
+        # dont enable stdout and stderr by default "enabled_by_default": false
+        if attr in ["stdout", "stderr"]:
+            attr_sensor_payload["enabled_by_default"] = False
+
+        mqtt_client.publish(
+            f"homeassistant/sensor/{unique_id}_keepalived_{attr}/config",
+            json.dumps(attr_sensor_payload),
+            retain=True
+        )
+
+def publish_status_periodic():
+    while True:
+        try:
+            keepalived_status, stdout, stderr = get_keepalived_status()
+            vip_assigned = get_vip_assigned()
+            keepalived_mode = determine_mode(vip_assigned)
+
+            base_topic = f"homeassistant/sensor/{sanitize_topic_name(mqtt_name).lower()}_keepalived_status"
+            payload = {
+                "action": "status",
+                "keepalived_status": keepalived_status,
+                "keepalived_mode": keepalived_mode,
+                "configured_vip": VIRTUAL_IP,
+                "vip_assigned": vip_assigned,
+                "stdout": stdout,
+                "stderr": stderr
+            }
+            mqtt_client.publish(base_topic + "/state", json.dumps(payload), retain=True)
+        except Exception as e:
+            print(f"MQTT publish error: {e}")
+        time.sleep(update_interval)
+
+def on_mqtt_message(client, userdata, msg):
+    topic = msg.topic
+    unique_id = sanitize_topic_name(mqtt_name).lower()
+    base_command_topic = f"homeassistant/button/{unique_id}/set_keepalived/"
+    state_topic = f"homeassistant/sensor/{unique_id}_keepalived_status/state"
+
+    if topic.startswith(base_command_topic):
+        action = topic[len(base_command_topic):]
+        print(f"Received MQTT command: {action}")
+        try:
+            result = subprocess.run(
+                ['systemctl', action, 'keepalived'],
+                capture_output=True, text=True, check=True
+            )
+            keepalived_status, stdout_status, stderr_status = get_keepalived_status()
+            vip_assigned = get_vip_assigned()
+            keepalived_mode = determine_mode(vip_assigned)
+            response_payload = {
+                "action": action,
+                "keepalived_status": keepalived_status,
+                "keepalived_mode": keepalived_mode,
+                "configured_vip": VIRTUAL_IP,
+                "vip_assigned": vip_assigned,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip()
+            }
+            mqtt_client.publish(state_topic, json.dumps(response_payload), retain=True)
+        except subprocess.CalledProcessError as e:
+            mqtt_client.publish(state_topic, json.dumps({"error": str(e)}), retain=True)
+
 if __name__ == '__main__':
+    if mqtt_enabled:
+        mqtt_connect()
+        publish_discovery()
+        mqtt_client.subscribe(f"homeassistant/button/{sanitize_topic_name(mqtt_name).lower()}/set_keepalived/#")
+        mqtt_client.on_message = on_mqtt_message
+        thread = threading.Thread(target=publish_status_periodic, daemon=True)
+        thread.start()
+
     app.run(host='0.0.0.0', port=PORT)
+
 
 ```
 
@@ -296,7 +444,7 @@ password =
 update_interval = 30
 ```
 
-### MQTT Paho client installation
+### MQTT Paho client installation (for Home Assistant MQTT discovery)
 
 ```
 sudo apt update
@@ -304,7 +452,6 @@ sudo apt install -y mosquitto mosquitto-clients python3-paho-mqtt
 sudo systemctl enable mosquitto
 sudo systemctl start mosquitto
 ```
-
 
 
 ### Systemd service
