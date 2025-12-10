@@ -189,34 +189,59 @@ def limit_remote_addr():
     if not is_allowed_ip():
         abort(403)  # Forbidden
 
-@app.route('/keepalived/status', methods=['GET'])
-def status():
+def get_keepalived_status():
     try:
         result = subprocess.run(
             ['systemctl', 'is-active', 'keepalived'],
             capture_output=True, text=True, check=True
         )
-        status_result = result.stdout.strip()
+        status = result.stdout.strip()
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
     except subprocess.CalledProcessError as e:
         if e.returncode == 3:
-            status_result = "inactive"
+            status = "inactive"
+            stdout = ""
+            stderr = ""
         else:
-            return jsonify({"error": str(e)}), 500
+            raise e
+    return status, stdout, stderr
 
+def get_vip_assigned():
     try:
-        vip_result = subprocess.run(
+        result = subprocess.run(
             ['ip', 'addr', 'show', INTERFACE],
             capture_output=True, text=True, check=True
-        ).stdout
+        )
+        vip_assigned = VIRTUAL_IP in result.stdout
+        return vip_assigned
+    except subprocess.CalledProcessError as e:
+        raise e
 
-        vip_assigned = VIRTUAL_IP in vip_result
+def determine_mode(vip_assigned):
+    return "MASTER" if vip_assigned else "BACKUP"
 
-        return jsonify({
-            "keepalived_status": status_result,
-            "vip_assigned": vip_assigned
-        })
+def compose_response(action, keepalived_status, vip_assigned, stdout, stderr):
+    keepalived_mode = determine_mode(vip_assigned)
+    return jsonify({
+        "action": action,
+        "keepalived_status": keepalived_status,
+        "keepalived_mode": keepalived_mode,
+        "configured_vip": VIRTUAL_IP,
+        "vip_assigned": vip_assigned,
+        "stdout": stdout,
+        "stderr": stderr
+    })
+
+@app.route('/keepalived/status', methods=['GET'])
+def status():
+    try:
+        keepalived_status, stdout, stderr = get_keepalived_status()
+        vip_assigned = get_vip_assigned()
     except subprocess.CalledProcessError as e:
         return jsonify({"error": str(e)}), 500
+
+    return compose_response("status", keepalived_status, vip_assigned, stdout, stderr)
 
 @app.route('/keepalived/<action>', methods=['GET', 'POST'])
 def control(action):
@@ -227,11 +252,11 @@ def control(action):
             ['systemctl', action, 'keepalived'],
             capture_output=True, text=True, check=True
         )
-        return jsonify({
-            "action": action,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip()
-        })
+        keepalived_status, stdout_status, stderr_status = get_keepalived_status()
+        vip_assigned = get_vip_assigned()
+        # Für stdout und stderr hier geben wir die systemctl action Ausgabe zurück,
+        # nicht die status Ausgabe.
+        return compose_response(action, keepalived_status, vip_assigned, result.stdout.strip(), result.stderr.strip())
     except subprocess.CalledProcessError as e:
         return jsonify({"error": str(e)}), 500
 
