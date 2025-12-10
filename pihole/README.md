@@ -140,7 +140,118 @@ After changes, you may need to clear the DNS cache or reconnect your network (to
 
 ---
 
+---
 
+---
 
+# Monitoring / Changing via API
 
+Install Flask
+```
+sudo apt update
+sudo apt install python3-flask -y
+```
 
+### Create the API script
+
+```
+sudo nano /usr/local/bin/keepalived_api.py
+```
+
+and use this content
+
+```
+#!/usr/bin/env python3
+
+from flask import Flask, request, jsonify, abort
+import subprocess
+import configparser
+
+app = Flask(__name__)
+
+# Konfigurationsdatei laden
+config = configparser.ConfigParser()
+config.read('/usr/local/bin/keepalived_api.conf')
+
+# Werte aus der Config auslesen
+PORT = int(config['keepalived_api'].get('port', '5000'))
+INTERFACE = config['keepalived_api'].get('interface', 'eth0')
+VIRTUAL_IP = config['keepalived_api'].get('vip', '192.168.178.9')
+
+allowed_ips_str = config['keepalived_api'].get('allowed_ips', '')
+ALLOWED_IPS = [ip.strip() for ip in allowed_ips_str.split(',') if ip.strip()]
+
+def is_allowed_ip():
+    return request.remote_addr in ALLOWED_IPS
+
+@app.before_request
+def limit_remote_addr():
+    if not is_allowed_ip():
+        abort(403)  # Forbidden
+
+@app.route('/keepalived/status', methods=['GET'])
+def status():
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', 'keepalived'],
+            capture_output=True, text=True, check=True
+        )
+        status_result = result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 3:
+            status_result = "inactive"
+        else:
+            return jsonify({"error": str(e)}), 500
+
+    try:
+        vip_result = subprocess.run(
+            ['ip', 'addr', 'show', INTERFACE],
+            capture_output=True, text=True, check=True
+        ).stdout
+
+        vip_assigned = VIRTUAL_IP in vip_result
+
+        return jsonify({
+            "keepalived_status": status_result,
+            "vip_assigned": vip_assigned
+        })
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/keepalived/<action>', methods=['GET', 'POST'])
+def control(action):
+    if action not in ['start', 'stop', 'restart']:
+        return jsonify({"error": "Invalid action"}), 400
+    try:
+        result = subprocess.run(
+            ['systemctl', action, 'keepalived'],
+            capture_output=True, text=True, check=True
+        )
+        return jsonify({
+            "action": action,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip()
+        })
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT)
+
+```
+
+### config file
+
+```
+sudo nano /usr/local/bin/keepalived_api.conf
+```
+
+paste this coontent and addapt to your needs
+
+```
+[keepalived_api]
+port = 5000
+interface = eth0
+vip = 192.168.178.9
+allowed_ips = 192.168.178.87,192.168.178.72
+```
