@@ -149,7 +149,7 @@ After changes, you may need to clear the DNS cache or reconnect your network (to
 Install Flask
 ```
 sudo apt update
-sudo apt install python3-flask -y
+sudo apt install python3 python3-flask -y
 ```
 
 ### Create the API script
@@ -246,7 +246,13 @@ if __name__ == '__main__':
 sudo nano /usr/local/bin/keepalived_api.conf
 ```
 
-paste this coontent and addapt to your needs
+paste this content and addapt to your needs
+
+- `port`: Port for Flask-Server
+- `interface`: Network-Interface, z.B. eth0 oder eth0@if9
+- `vip`: The virtuell IP from Keepalived
+- `allowed_ips`: allowed Client-IP-Addresses, comma-separated
+
 
 ```
 [keepalived_api]
@@ -255,3 +261,56 @@ interface = eth0
 vip = 192.168.178.9
 allowed_ips = 192.168.178.87,192.168.178.72
 ```
+
+### Systemd service
+
+```
+sudo nano /etc/systemd/system/keepalived_api.service
+```
+
+```
+[Unit]
+Description=Keepalived Control API
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/keepalived_api.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Start and check
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable keepalived_api.service
+sudo systemctl start keepalived_api.service
+```
+
+```
+sudo systemctl status keepalived_api.service
+```
+
+### API
+
+Status:
+
+```
+curl http://<your-ip>:5000/keepalived/status
+```
+
+Start:
+
+```
+curl http://<your-pi-ip>:5000/keepalived/start
+```
+
+Stop:
+
+```
+curl http://<your-pi-ip>:5000/keepalived/stop
+```
+
