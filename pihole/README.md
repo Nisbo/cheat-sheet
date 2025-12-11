@@ -430,8 +430,6 @@ paste this content and addapt to your needs
 ```
 [keepalived_api]
 port = 5000
-interface = eth0
-vip = 192.168.178.9
 allowed_ips = 192.168.178.87,192.168.178.72
 
 [mqtt]
