@@ -24,6 +24,7 @@ Download the appropriate configuration or paste the content:
 - For the **MASTER**:
 
 ```bash
+cd /etc/keepalived
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTER/etc/keepalived/keepalived.conf
 ```
 https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTER/etc/keepalived/keepalived.conf
@@ -31,6 +32,7 @@ https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTE
 - For the **BACKUP**:
 
 ```bash
+cd /etc/keepalived
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
 ```
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
@@ -90,7 +92,7 @@ Dec 09 05:27:39 pihole Keepalived_vrrp[1208181]: (VI_1) Entering MASTER STATE
 
 ## Check if VIP is assigned to the Master Pi-hole
 
-On the Master Pi-hole, run:
+On the Master Pi-hole, run: (replace `192.168.178.9` with your `VIP`)
 
 ```bash
 ip addr show eth0 | grep 192.168.178.9
@@ -112,7 +114,7 @@ inet 192.168.178.9/32 scope global eth0
 sudo systemctl stop keepalived
 ```
 
-- Check on the Backup Pi-hole if VIP is taken over:
+- Check on the Backup Pi-hole if VIP is taken over: (replace `192.168.178.9` with your `VIP`)
 
 ```bash
 ip addr show eth0 | grep 192.168.178.9
@@ -130,7 +132,7 @@ sudo systemctl start keepalived
 
 ## Router configuration
 
-Set your router’s DNS server to the virtual IP (`192.168.178.9`), not the static IPs of the individual Pi-holes.
+Set your router’s DNS server to the virtual IP: `192.168.178.9` (replace `192.168.178.9` with your `VIP`).
 
 ---
 
@@ -176,8 +178,6 @@ sudo nano /usr/local/bin/keepalived_api.conf
 paste this content and addapt to your needs
 
 - `port`: Port for Flask-Server
-- `interface`: Network-Interface, z.B. eth0 oder eth0@if9
-- `vip`: The virtuell IP from Keepalived
 - `allowed_ips`: allowed Client-IP-Addresses, comma-separated
 
 
