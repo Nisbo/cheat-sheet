@@ -365,5 +365,21 @@ BackUp took over
 
 <img width="1048" height="859" alt="grafik" src="https://github.com/user-attachments/assets/ef0bd92c-4290-4920-9ae8-10a4bc359cfc" />
 
+## If you have `card_mod` installed you can do something like this
+
+### Normal Conditions
+
+<img width="1061" height="940" alt="grafik" src="https://github.com/user-attachments/assets/5c92e790-0794-45d4-8ac3-2a13245336e0" />
+
+### BackUp took over (if you disable keepalive)
+
+<img width="1056" height="933" alt="grafik" src="https://github.com/user-attachments/assets/e2b6e19a-a6a8-4d10-9391-121c0885ff0f" />
+
+### BackUp took over (if FTL is not alive)
+
+<img width="1057" height="938" alt="grafik" src="https://github.com/user-attachments/assets/dd34a30a-de8a-4c73-bd0e-caae38d12ea4" />
+
+
+
 
 
