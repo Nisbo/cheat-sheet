@@ -326,5 +326,14 @@ So maybe this screenshot is more helpfull.
 
 <img width="606" height="624" alt="grafik" src="https://github.com/user-attachments/assets/c5751c59-827c-4253-b906-5f9fec355eb9" />
 
+If you want to play around with this you can stopp FTL to simulate an outage
+```
+sudo systemctl stop pihole-FTL.service
+```
 
+To start it again
+
+```
+sudo systemctl start pihole-FTL.service
+```
 
