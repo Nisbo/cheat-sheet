@@ -13,50 +13,46 @@ sudo apt install keepalived -y
 
 ## Configuration
 
-### Create or edit the configuration file
+### Create and adjust the configuration file
 
-```bash
-sudo nano /etc/keepalived/keepalived.conf
-```
+> [!TIP]
+> nano commands:
+> - `CTRL + V` → paste the content
+> - `CTRL + O` → save the file (then press `ENTER` to confirm)
+> - `CTRL + X` → exit nano
+
 
 Download the appropriate configuration or paste the content:
+- Replace the virtual IP (`192.168.178.9`) in both files with an IP from your subnet that is **not** in your DHCP range!  
+- Replace `eth0` with the interface your Pi-hole uses (e.g. `eth1` or `ens18`).
 
-nano commands:
-`CTRL + V` → paste the content
-`CTRL + O` → save the file (then press `ENTER` to confirm)
-`CTRL + X` → exit nano
+> [!IMPORTANT] 
+> The virtual IP must not be assigned by your DHCP server to avoid IP conflicts.
 
-- For/On the **MASTER**:
+
+### For/On the **MASTER**:
 
 ```bash
 sudo mkdir -p /etc/keepalived
 cd /etc/keepalived
 sudo nano /etc/keepalived/keepalived.conf
+
 # or use wget instead of using nano and pasting the code
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTER/etc/keepalived/keepalived.conf
 ```
 https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTER/etc/keepalived/keepalived.conf
 
-- For/On the **BACKUP**:
+## For/On the **BACKUP**:
 
 ```bash
 sudo mkdir -p /etc/keepalived
 cd /etc/keepalived
 sudo nano /etc/keepalived/keepalived.conf
+
 # or use wget instead of using nano and pasting the code
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
 ```
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
-
----
-
-### Adjust the configuration
-
-- Replace the virtual IP (`192.168.178.9`) in both files with an IP from your subnet that is **not** in your DHCP range!  
-- Replace `eth0` with the interface your Pi-hole uses (e.g. `eth1` or `ens18`).
-
-> **Important:**  
-> The virtual IP must not be assigned by your DHCP server to avoid IP conflicts.
 
 ---
 
