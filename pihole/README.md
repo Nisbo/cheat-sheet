@@ -382,7 +382,262 @@ BackUp took over
 
 <img width="1057" height="938" alt="grafik" src="https://github.com/user-attachments/assets/dd34a30a-de8a-4c73-bd0e-caae38d12ea4" />
 
+My Code for the MASTER 
 
+```
+type: vertical-stack
+cards:
+  - type: entity
+    entity: sensor.master_pi_hole_master_pi_hole_keepalived_status
+    name: Keepalived Status
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.master_pi_hole_master_pi_hole_keepalived_status') == 'active' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.master_pi_hole_master_pi_hole_keepalived_keepalived_mode
+    name: Keepalived Mode
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.master_pi_hole_master_pi_hole_keepalived_keepalived_mode') == 'MASTER' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.master_pi_hole_keepalived_configured_mode
+    name: Keepalived Mode (configured)
+  - type: entity
+    entity: sensor.master_pi_hole_ftl_service_status
+    name: FTL Status
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.master_pi_hole_ftl_service_status') == 'active' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: binary_sensor.master_pi_hole_dns_query_ok
+    name: DNS Queries OK
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('binary_sensor.master_pi_hole_dns_query_ok') == 'on' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.master_pi_hole_dns_response_time_ms
+    name: DNS Response Time (-1 = no response)
+  - type: entity
+    entity: sensor.master_pi_hole_master_pi_hole_keepalived_vip_assigned
+    name: VIP assigned to MASTER
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.master_pi_hole_master_pi_hole_keepalived_vip_assigned') == 'True' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.master_pi_hole_master_pi_hole_keepalived_configured_vip
+    name: Configured VIP
+  - type: horizontal-stack
+    cards:
+      - type: tile
+        entity: button.master_pi_hole_master_pi_hole_keepalived_start
+        name: Start
+        icon: mdi:play
+        color: green
+        hide_state: true
+        vertical: false
+        features_position: bottom
+      - type: tile
+        entity: button.master_pi_hole_master_pi_hole_keepalived_restart
+        name: Restart
+        icon: mdi:refresh
+        color: accent
+        hide_state: true
+        vertical: false
+        features_position: bottom
+      - type: tile
+        entity: button.master_pi_hole_master_pi_hole_keepalived_stop
+        name: Stop
+        icon: mdi:stop
+        color: red
+        hide_state: true
+        vertical: false
+        features_position: bottom
+
+```
+
+
+May Code for the BACKUP
+
+```
+type: vertical-stack
+cards:
+  - type: entity
+    entity: sensor.backup_pi_hole_backup_pi_hole_keepalived_status
+    name: Keepalived Status
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.backup_pi_hole_backup_pi_hole_keepalived_status') == 'active' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.backup_pi_hole_keepalived_mode
+    name: Keepalived Mode
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.backup_pi_hole_keepalived_mode') == 'BACKUP' %}
+              green
+            {% else %}
+              orange
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.backup_pi_hole_keepalived_configured_mode
+    name: Keepalived Mode (configured)
+  - type: entity
+    entity: sensor.backup_pi_hole_ftl_service_status
+    name: FTL Status
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.backup_pi_hole_ftl_service_status') == 'active' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: binary_sensor.backup_pi_hole_dns_query_ok
+    name: DNS Queries OK
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('binary_sensor.backup_pi_hole_dns_query_ok') == 'on' %}
+              green
+            {% else %}
+              red
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.backup_pi_hole_dns_response_time_ms
+    name: DNS Response Time (-1 = no response)
+  - type: entity
+    entity: sensor.backup_pi_hole_vip_assigned
+    name: VIP assigned to BACKUP
+    card_mod:
+      style: |
+        :host {
+          --state-color:
+            {% if states('sensor.backup_pi_hole_vip_assigned') == 'False' %}
+              green
+            {% else %}
+              orange
+            {% endif %};
+        }
+        .value {
+          color: var(--state-color);
+          font-weight: bold;
+        }
+  - type: entity
+    entity: sensor.backup_pi_hole_configured_vip
+    name: Configured VIP
+  - type: horizontal-stack
+    cards:
+      - type: tile
+        entity: button.backup_pi_hole_backup_pi_hole_keepalived_start
+        name: Start
+        icon: mdi:play
+        color: green
+        hide_state: true
+        vertical: false
+        features_position: bottom
+      - type: tile
+        entity: button.backup_pi_hole_backup_pi_hole_keepalived_restart
+        name: Restart
+        icon: mdi:refresh
+        color: accent
+        hide_state: true
+        vertical: false
+        features_position: bottom
+      - type: tile
+        entity: button.backup_pi_hole_backup_pi_hole_keepalived_stop
+        name: Stop
+        icon: mdi:stop
+        color: red
+        hide_state: true
+        vertical: false
+        features_position: bottom
+
+```
 
 
 
