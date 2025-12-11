@@ -194,18 +194,36 @@ paste this content and addapt to your needs
 
 ```
 [keepalived_api]
-port = 5000                   # Port for the Flask server to listen on
-allowed_ips = 192.168.178.87,192.168.178.72  # Comma-separated list of allowed client IP addresses
+# Port for the Flask server to listen on
+port = 5000
+
+# Comma-separated list of allowed client IP addresses
+allowed_ips = 192.168.178.87,192.168.178.72
 
 [mqtt]
-enabled = true                # Enable MQTT support (true/false)
-name = MASTER Pi-Hole         # MQTT device name used in topics and Home Assistant
-ip = 192.168.178.27           # MQTT broker IP address
-port = 1883                   # MQTT broker port (default 1883)
-username =                    # MQTT username (optional)
-password =                    # MQTT password (optional)
-update_interval = 30          # Interval (in seconds) for periodic MQTT status updates
+# Enable MQTT support (true/false)
+enabled = true
+
+# MQTT device name used in topics and Home Assistant
+name = MASTER Pi-Hole
+
+# MQTT broker IP address
+ip = 192.168.178.27
+
+# MQTT broker port (default 1883)
+port = 1883
+
+# MQTT username (optional)
+username =
+
+# MQTT password (optional)
+password =
+
+# Interval (in seconds) for periodic MQTT status updates
+update_interval = 30
+
 ```
+
 
 ### MQTT Paho client installation (for Home Assistant MQTT discovery)
 
