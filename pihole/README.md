@@ -201,8 +201,8 @@ enabled = true                # Enable MQTT support (true/false)
 name = MASTER Pi-Hole         # MQTT device name used in topics and Home Assistant
 ip = 192.168.178.27           # MQTT broker IP address
 port = 1883                   # MQTT broker port (default 1883)
-username =                   # MQTT username (optional)
-password =                   # MQTT password (optional)
+username =                    # MQTT username (optional)
+password =                    # MQTT password (optional)
 update_interval = 30          # Interval (in seconds) for periodic MQTT status updates
 ```
 
@@ -248,7 +248,7 @@ sudo systemctl start keepalived_api.service
 sudo systemctl status keepalived_api.service
 ```
 
-### API
+### API Commands
 
 Status:
 
