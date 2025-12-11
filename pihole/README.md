@@ -227,6 +227,9 @@ update_interval = 30
 
 ### MQTT Paho client installation (for Home Assistant MQTT discovery)
 
+> [!CAUTION]
+> Make sure that nobody has access to your MQTT server because with MQTT access you can stop the keepalive service and if you stop it on both servers DNS is down because nobody is listening to your VIP
+
 ```
 sudo apt update
 sudo apt install -y mosquitto mosquitto-clients python3-paho-mqtt
