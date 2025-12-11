@@ -178,6 +178,7 @@ https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/keepa
 
 or use wget to download the file
 ```
+cd /usr/local/bin
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/keepalived_api.py
 ```
 
