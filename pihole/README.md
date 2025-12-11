@@ -274,3 +274,57 @@ Stop:
 curl http://<your-pi-ip>:5000/keepalived/stop
 ```
 
+## Usage inside Home Assistant
+
+MQTT auto discovery will create automatically a new sensor for both Pi-Holes
+
+<img width="1000" height="880" alt="grafik" src="https://github.com/user-attachments/assets/4fe832dd-6f56-4ad7-b3d0-eed00663d9f9" />
+
+So you can Start, Stop and Restart from Home Assistant. Additionally the FTL status wil lbe monitored (appart from the other stats)
+In the past (some FTL versions ago) there was an issue with FTL and your Pi Hole was not working anymore. In this case keepalived will not work because both Pi Holes were "available". This script checks the FTL status and is also checking DNS response time and DNS status.
+
+In my case I am using this 2 automations to detect if FTL is working and if not working I turn off keepalived for the master server. And turn is on abain if FTL is available.
+
+```
+alias: MASTER Pi-Hole - DNS OK
+description: ""
+triggers:
+  - type: connected
+    device_id: 2b271f1c2b60a905147d1cf896af682d
+    entity_id: 97857fa13261e92d25f66ec20ed62d83
+    domain: binary_sensor
+    trigger: device
+conditions: []
+actions:
+  - device_id: 2b271f1c2b60a905147d1cf896af682d
+    domain: button
+    entity_id: 2844c459a899b0bf539eddbb0519bfdb
+    type: press
+mode: single
+```
+
+```
+alias: MASTER Pi-Hole - DNS not OK
+description: ""
+triggers:
+  - type: not_connected
+    device_id: 2b271f1c2b60a905147d1cf896af682d
+    entity_id: 97857fa13261e92d25f66ec20ed62d83
+    domain: binary_sensor
+    trigger: device
+conditions: []
+actions:
+  - device_id: 2b271f1c2b60a905147d1cf896af682d
+    domain: button
+    entity_id: 45eee4ffce5a7400023ecfa4693ef49f
+    type: press
+mode: single
+```
+
+Unfortunately Home Assistant is converting the human readable names to the cryptic IDs.  
+So maybe this screenshot is more helpfull.
+
+<img width="606" height="624" alt="grafik" src="https://github.com/user-attachments/assets/c5751c59-827c-4253-b906-5f9fec355eb9" />
+
+
+
