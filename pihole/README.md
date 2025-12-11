@@ -356,3 +356,14 @@ To start it again
 sudo systemctl start pihole-FTL.service
 ```
 
+Normal Conditions
+
+<img width="1047" height="866" alt="grafik" src="https://github.com/user-attachments/assets/4e44f9c2-c92c-4b5a-a91d-674ffa3a80ee" />
+
+
+BackUp took over
+
+<img width="1048" height="859" alt="grafik" src="https://github.com/user-attachments/assets/ef0bd92c-4290-4920-9ae8-10a4bc359cfc" />
+
+
+
