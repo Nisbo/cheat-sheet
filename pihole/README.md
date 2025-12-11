@@ -21,18 +21,29 @@ sudo nano /etc/keepalived/keepalived.conf
 
 Download the appropriate configuration or paste the content:
 
-- For the **MASTER**:
+nano commands:
+`CTRL + V` → paste the content
+`CTRL + O` → save the file (then press `ENTER` to confirm)
+`CTRL + X` → exit nano
+
+- For/On the **MASTER**:
 
 ```bash
+sudo mkdir -p /etc/keepalived
 cd /etc/keepalived
+sudo nano /etc/keepalived/keepalived.conf
+# or use wget instead of using nano and pasting the code
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTER/etc/keepalived/keepalived.conf
 ```
 https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/MASTER/etc/keepalived/keepalived.conf
 
-- For the **BACKUP**:
+- For/On the **BACKUP**:
 
 ```bash
+sudo mkdir -p /etc/keepalived
 cd /etc/keepalived
+sudo nano /etc/keepalived/keepalived.conf
+# or use wget instead of using nano and pasting the code
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
 ```
 wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/pihole/BACKUP/etc/keepalived/keepalived.conf
