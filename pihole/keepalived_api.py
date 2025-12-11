@@ -230,7 +230,7 @@ def publish_discovery():
     # Mainsensor (keepalived_status) including attributes
     sensor_payload = {
         "name": f"{mqtt_name} Keepalived Status",
-        "unique_id": f"_keepalived_status",
+        "unique_id": f"{unique_id}_keepalived_status",
         "state_topic": state_topic,
         "json_attributes_topic": state_topic,
         "value_template": "{{ value_json.keepalived_status }}",
@@ -258,7 +258,7 @@ def publish_discovery():
 
         attr_sensor_payload = {
             "name": f"{attr.replace('_', ' ').title()}",
-            "unique_id": f"_keepalived_{attr}",
+            "unique_id": f"{unique_id}_keepalived_{attr}",
             "state_topic": state_topic,
             "value_template": f"{{{{ value_json.{attr} }}}}",
             "device": device_info,
@@ -271,7 +271,7 @@ def publish_discovery():
         if is_dnsquery:
             attr_sensor_payload = {
                 "name": f"{attr.replace('_', ' ').title()}",
-                "unique_id": f"_keepalived_{attr}",
+                "unique_id": f"{unique_id}_keepalived_{attr}",
                 "state_topic": state_topic,
                 "value_template": f"{{{{ value_json.{attr} }}}}",
                 "device": device_info,
