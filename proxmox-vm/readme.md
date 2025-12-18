@@ -1,5 +1,11 @@
-VM Speicherplatz vergrößern wenn neuer Platz zugewiesen wurde
+Deutsches Layout installieren
 
+```
+sudo apt update
+sudo apt install console-setup
+```
+
+VM Speicherplatz vergrößern wenn neuer Platz zugewiesen wurde und ggf vorher Platz freimachen falls die Partition voll ist.
 
 ```
 # Platz prüfen
@@ -24,6 +30,6 @@ sudo growpart /dev/sda 3
 # Dateisystem vergrößern (ext4)
 sudo resize2fs /dev/sda3
 
-# Reparieren abgebrochener dpkg Vorgänge
+# Falls nötig Reparieren abgebrochener dpkg Vorgänge
 sudo dpkg --configure -a
 ```
