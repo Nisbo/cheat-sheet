@@ -1,3 +1,6 @@
+<img width="843" height="595" alt="image" src="https://github.com/user-attachments/assets/b12487d3-b01d-4bcf-a6d8-c7860359ec01" />
+
+
 Um die Kali Shell z.b. auf Linux Mint zu installieren
 
 
