@@ -7,7 +7,8 @@ ZSH installieren:
 sudo apt update && sudo apt install zsh
 ```
 
-Optional Verzeichnis prüfen:(normalerweise /usr/bin/zsh). 
+
+Optional Verzeichnis prüfen: (normalerweise /usr/bin/zsh). 
 ```
 which zsh
 ```
@@ -20,21 +21,29 @@ chsh -s $(which zsh).
 ```
 
 
-
-Packets
+Packete installieren
 
 ```
 sudo apt install zsh-syntax-highlighting zsh-autosuggestions
 ```
 
-Fonts
+Fonts installieren
 
 ```
 sudo apt install fonts-powerline
 ```
 
-Die Design Datei (.zshrc) selbst laden
+Die Design Datei (.zshrc) selbst laden (ins eigene home Verzeichnis)
+
 ```
+cd ~
 wget -O ~/.zshrc https://gitlab.com/kalilinux/packages/kali-defaults/-/raw/kali/master/etc/skel/.zshrc
 ```
 
+Neu laden
+
+```
+source ~/.zshrc
+```
+
+Oder Shell schließen und neu öffnen
