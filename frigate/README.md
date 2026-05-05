@@ -67,7 +67,7 @@ cd /data/docker/frigate
 nano docker-compose.yml
 ```
 
-Eimnfügen
+Einfügen
 
 ```
 services:
@@ -84,9 +84,9 @@ services:
 
     volumes:
       - /etc/localtime:/etc/localtime:ro
-      - ./config:/config
-      - ./media:/media/frigate
-      - ./db:/db
+      - /data/docker/frigate/config:/config
+      - /data/docker/frigate/media:/media/frigate
+      - /data/docker/frigate/db:/db
       - type: tmpfs
         target: /tmp/cache
         tmpfs:
@@ -97,6 +97,94 @@ services:
       - "8554:8554"
 ```
 
+Config
 
+```
+auth:
+  enabled: false
+
+detectors:
+  coral:
+    type: edgetpu
+    device: usb
+
+mqtt:
+  host: 192.168.178.27
+  port: 1884
+
+ui:
+  # Optional: Set a timezone to use in the UI (default: use browser local time)
+  # timezone: America/Denver
+  # Optional: Set the time format used.
+  # Options are browser, 12hour, or 24hour (default: shown below)
+  time_format: 24hour
+
+cameras:
+  strasse:
+    ffmpeg:
+      inputs:
+        - path: rtsps://192.168.178.1:7441/L91wDlwRXyKP2VLm?enableSrtp
+          roles:
+            - detect
+    objects:
+      track:
+        - car
+        - bus
+    snapshots:
+      enabled: true
+      timestamp: true
+      bounding_box: true
+      retain:
+        default: 1        # Anzahl Tage
+        objects:
+          bus: 30
+
+  arbeitszimmer-regal:
+    ffmpeg:
+      inputs:
+        - path: rtsps://192.168.178.1:7441/XwfeZL2iCgGixkQ0?enableSrtp
+          roles:
+            - detect
+    objects:
+      track:
+        - cat
+        - person
+    snapshots:
+      enabled: true
+      timestamp: true
+      bounding_box: true
+      retain:
+        default: 2        # Anzahl Tage
+        objects:
+          cat: 30
+
+
+  flur:
+    ffmpeg:
+      inputs:
+        - path: rtsps://192.168.178.1:7441/LiklcH7yJHnbdUZy?enableSrtp
+          roles:
+            - detect
+    objects:
+      track:
+        - cat
+        - person
+    snapshots:
+      enabled: true
+      timestamp: true
+      bounding_box: true
+      retain:
+        default: 2        # Anzahl Tage
+        objects:
+          cat: 30
+
+
+logger:
+  default: info
+detect:
+  enabled: true
+version: 0.16-0
+
+```
 
 
