@@ -62,6 +62,41 @@ sudo mkdir -p /data/docker/frigate/db
 sudo chown -R pi:pi /data/docker
 ```
 
+```
+cd /data/docker/frigate
+nano docker-compose.yml
+```
+
+Eimnfügen
+
+```
+services:
+  frigate:
+    container_name: frigate
+    image: ghcr.io/blakeblackshear/frigate:stable
+    restart: unless-stopped
+    privileged: true
+
+    shm_size: "512mb"
+
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./config:/config
+      - ./media:/media/frigate
+      - ./db:/db
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+
+    ports:
+      - "8971:8971"
+      - "8554:8554"
+```
+
 
 
 
