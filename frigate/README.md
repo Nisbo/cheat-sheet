@@ -52,3 +52,16 @@ docker run hello-world
 ```
 
 Wenn das läuft → Docker ist sauber installiert.
+
+📦 7. Verzeichnisstruktur vorbereiten (wie geplant)
+
+```
+sudo mkdir -p /data/docker/frigate/config
+sudo mkdir -p /data/docker/frigate/media
+sudo mkdir -p /data/docker/frigate/db
+sudo chown -R pi:pi /data/docker
+```
+
+
+
+
