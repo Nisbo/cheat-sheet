@@ -97,7 +97,12 @@ services:
       - "8554:8554"
 ```
 
-Config
+Config (meine, wird bei euch nicht gehen)
+
+```
+nano /data/docker/frigate/config/config.yml
+```
+
 
 ```
 auth:
@@ -187,4 +192,18 @@ version: 0.16-0
 
 ```
 
+Docker neu starten
 
+```
+docker compose down
+docker compose up -d
+```
+
+Wenn man ein Passwort nutzen will (meine Config schgaltet das ab), das steht im Log
+
+```
+docker logs -f frigate
+```
+
+Aufrufer der Gui über: (IP andappen an eure)
+https://192.168.178.203:8971/
