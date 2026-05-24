@@ -5,3 +5,9 @@ wget -O proxmox-nag-remove.sh https://raw.githubusercontent.com/Nisbo/cheat-shee
 chmod +x proxmox-nag-remove.sh
 ./proxmox-nag-remove.sh
 ```
+
+oder 
+
+```
+bash <(wget -qO- https://raw.githubusercontent.com/USER/REPO/main/proxmox-nag-remove.sh)
+```
