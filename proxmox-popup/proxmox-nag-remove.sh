@@ -4,7 +4,7 @@ set -e
 
 FILE="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
 
-ORIGINAL="data.status.toLowerCase() !== 'active'"
+ORIGINAL="res.data.status.toLowerCase() !== 'active'"
 PATCHED="42 === 0"
 
 echo
