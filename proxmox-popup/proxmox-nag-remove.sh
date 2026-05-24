@@ -5,7 +5,7 @@ set -e
 FILE="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
 
 ORIGINAL="data.status.toLowerCase() !== 'active'"
-PATCHED="false__PROXMOX_PATCHED__"
+PATCHED="42 === 0"
 
 echo
 echo "== Proxmox No-Subscription Popup Patch =="
@@ -32,29 +32,29 @@ PATCHED_MATCHES=$(grep -nF "$PATCHED" "$FILE" || true)
 # Already patched
 if [[ -z "$MATCHES" && -n "$PATCHED_MATCHES" ]]; then
     echo
-    echo "[INFO] System already appears to be patched."
+    echo "[INFO] Already patched."
     echo
     echo "$PATCHED_MATCHES"
     echo
 
-    read -rp "Do you want to revert the patch? [y/N]: " REVERT_CONFIRM
+    read -rp "Revert patch? [y/N]: " REVERT_CONFIRM
 
     if [[ "$REVERT_CONFIRM" =~ ^[Yy]$ ]]; then
         echo
-        echo "[INFO] Reverting patch..."
+        echo "[INFO] Reverting..."
 
         sed -i "s|$PATCHED|$ORIGINAL|g" "$FILE"
 
         VERIFY=$(grep -nF "$ORIGINAL" "$FILE" || true)
 
         if [[ -n "$VERIFY" ]]; then
-            echo "[SUCCESS] Patch reverted successfully."
+            echo "[SUCCESS] Reverted successfully."
         else
             echo "[ERROR] Revert failed."
             exit 1
         fi
 
-        read -rp "Restart pveproxy now? [Y/n]: " RESTART_CONFIRM
+        read -rp "Restart pveproxy? [Y/n]: " RESTART_CONFIRM
 
         if [[ ! "$RESTART_CONFIRM" =~ ^[Nn]$ ]]; then
             systemctl restart pveproxy
@@ -72,7 +72,6 @@ fi
 if [[ -z "$MATCHES" ]]; then
     echo
     echo "[INFO] No matching pattern found."
-    echo "       Maybe already modified or Proxmox version changed."
     exit 0
 fi
 
@@ -123,7 +122,7 @@ echo
 echo "[INFO] Clearing cache..."
 rm -rf /var/cache/pve-manager/*
 
-read -rp "Restart pveproxy now? [Y/n]: " RESTART_CONFIRM
+read -rp "Restart pveproxy? [Y/n]: " RESTART_CONFIRM
 
 if [[ ! "$RESTART_CONFIRM" =~ ^[Nn]$ ]]; then
     systemctl restart pveproxy
