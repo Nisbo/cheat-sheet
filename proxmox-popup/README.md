@@ -9,5 +9,5 @@ chmod +x proxmox-nag-remove.sh
 oder 
 
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/USER/REPO/main/proxmox-nag-remove.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/Nisbo/cheat-sheet/proxmox-popup/main/proxmox-nag-remove.sh)
 ```
