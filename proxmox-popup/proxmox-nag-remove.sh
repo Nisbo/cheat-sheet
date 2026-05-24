@@ -3,101 +3,170 @@
 set -e
 
 FILE="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
-SEARCH="data.status.toLowerCase() !== 'active'"
-REPLACE="false"
+
+ORIGINAL="data.status.toLowerCase() !== 'active'"
+PATCHED="false /* patched-by-script */"
 
 echo
 echo "== Proxmox No-Subscription Popup Patch =="
 echo
 
-# Root prüfen
+# Check for root
 if [[ $EUID -ne 0 ]]; then
-    echo "[ERROR] Bitte als root ausführen."
+    echo "[ERROR] Please run this script as root."
     exit 1
 fi
 
-# Datei prüfen
+# Check if file exists
 if [[ ! -f "$FILE" ]]; then
-    echo "[ERROR] Datei nicht gefunden:"
+    echo "[ERROR] File not found:"
     echo "        $FILE"
     exit 1
 fi
 
-echo "[INFO] Prüfe auf bekannte Signatur..."
+echo "[INFO] Checking Proxmox library..."
 
-MATCHES=$(grep -nF "$SEARCH" "$FILE" || true)
+# Search for original pattern
+MATCHES=$(grep -nF "$ORIGINAL" "$FILE" || true)
 
-if [[ -z "$MATCHES" ]]; then
+# Search for patched pattern
+PATCHED_MATCHES=$(grep -nF "patched-by-script" "$FILE" || true)
+
+#
+# Already patched
+#
+if [[ -z "$MATCHES" && -n "$PATCHED_MATCHES" ]]; then
+
     echo
-    echo "[INFO] Keine passende Stelle gefunden."
-    echo "        Möglicherweise bereits gepatcht oder andere Proxmox-Version."
+    echo "[INFO] The file already appears to be patched."
+    echo
+    echo "$PATCHED_MATCHES"
+    echo
+
+    read -rp "Would you like to revert the patch? [y/N]: " REVERT_CONFIRM
+
+    if [[ "$REVERT_CONFIRM" =~ ^[Yy]$ ]]; then
+
+        echo
+        echo "[INFO] Reverting patch..."
+
+        sed -i "s|$PATCHED|$ORIGINAL|g" "$FILE"
+
+        VERIFY_RESTORE=$(grep -nF "$ORIGINAL" "$FILE" || true)
+
+        if [[ -n "$VERIFY_RESTORE" ]]; then
+            echo "[SUCCESS] Patch reverted successfully."
+        else
+            echo "[ERROR] Failed to restore original content."
+            exit 1
+        fi
+
+        echo
+        read -rp "Restart pveproxy now? [Y/n]: " RESTART_CONFIRM
+
+        if [[ ! "$RESTART_CONFIRM" =~ ^[Nn]$ ]]; then
+            systemctl restart pveproxy
+
+            echo
+            echo "[OK] pveproxy restarted."
+        else
+            echo
+            echo "[INFO] Restart skipped."
+            echo "       Please restart manually later:"
+            echo "       systemctl restart pveproxy"
+        fi
+
+        echo
+        echo "Done."
+        exit 0
+    fi
+
+    echo
+    echo "Nothing to do."
     exit 0
 fi
 
+#
+# No valid signature found
+#
+if [[ -z "$MATCHES" ]]; then
+    echo
+    echo "[INFO] No matching signature found."
+    echo "       Your Proxmox version may use a different pattern."
+    exit 0
+fi
+
+#
+# Found original pattern
+#
 echo
-echo "[FOUND] Folgende Stelle(n) wurden gefunden:"
+echo "[FOUND] Matching signature(s):"
 echo
 echo "$MATCHES"
 echo
 
-read -rp "Möchtest du den Patch anwenden? [y/N]: " PATCH_CONFIRM
+read -rp "Would you like to apply the patch? [y/N]: " PATCH_CONFIRM
 
 if [[ ! "$PATCH_CONFIRM" =~ ^[Yy]$ ]]; then
     echo
-    echo "[ABORT] Abgebrochen."
+    echo "[ABORT] Operation cancelled."
     exit 0
 fi
 
 echo
 
-read -rp "Backup der Originaldatei erstellen? [Y/n]: " BACKUP_CONFIRM
+read -rp "Create a backup of the original file? [Y/n]: " BACKUP_CONFIRM
 
 if [[ ! "$BACKUP_CONFIRM" =~ ^[Nn]$ ]]; then
+
     BACKUP_FILE="${FILE}.bak.$(date +%Y%m%d-%H%M%S)"
 
     cp "$FILE" "$BACKUP_FILE"
 
-    echo "[OK] Backup erstellt:"
-    echo "     $BACKUP_FILE"
     echo
+    echo "[OK] Backup created:"
+    echo "     $BACKUP_FILE"
 fi
 
-echo "[INFO] Wende Patch an..."
+echo
+echo "[INFO] Applying patch..."
 
-sed -i "s/${SEARCH//\//\\/}/${REPLACE}/g" "$FILE"
+sed -i "s|$ORIGINAL|$PATCHED|g" "$FILE"
 
 echo
-echo "[INFO] Prüfe Patch-Ergebnis..."
+echo "[INFO] Verifying patch..."
 
-VERIFY=$(grep -nF "$SEARCH" "$FILE" || true)
+VERIFY=$(grep -nF "patched-by-script" "$FILE" || true)
 
-if [[ -z "$VERIFY" ]]; then
-    echo "[SUCCESS] Patch erfolgreich angewendet."
-else
-    echo "[ERROR] Patch scheint fehlgeschlagen zu sein."
+if [[ -n "$VERIFY" ]]; then
+    echo "[SUCCESS] Patch applied successfully."
     echo
     echo "$VERIFY"
+else
+    echo "[ERROR] Patch verification failed."
     exit 1
 fi
 
 echo
-echo "[INFO] Cache wird bereinigt..."
+echo "[INFO] Clearing Proxmox cache..."
 
 rm -rf /var/cache/pve-manager/*
 
 echo
-read -rp "pveproxy jetzt neu starten? [Y/n]: " RESTART_CONFIRM
+read -rp "Restart pveproxy now? [Y/n]: " RESTART_CONFIRM
 
 if [[ ! "$RESTART_CONFIRM" =~ ^[Nn]$ ]]; then
+
     systemctl restart pveproxy
+
     echo
-    echo "[OK] pveproxy wurde neu gestartet."
+    echo "[OK] pveproxy restarted successfully."
 else
     echo
-    echo "[INFO] Kein Neustart durchgeführt."
-    echo "       Bitte später manuell ausführen:"
+    echo "[INFO] Restart skipped."
+    echo "       Please restart manually later:"
     echo "       systemctl restart pveproxy"
 fi
 
 echo
-echo "Fertig."
+echo "Done."
