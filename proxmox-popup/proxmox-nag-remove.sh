@@ -41,24 +41,40 @@ if [[ -z "$MATCHES" && -n "$PATCHED_MATCHES" ]]; then
 
     if [[ "$REVERT_CONFIRM" =~ ^[Yy]$ ]]; then
         echo
-        echo "[INFO] Reverting..."
+        echo "[INFO] Reverting patch..."
+
+        read -rp "Create backup before reverting? [Y/n]: " BACKUP_CONFIRM
+
+        if [[ ! "$BACKUP_CONFIRM" =~ ^[Nn]$ ]]; then
+            BACKUP_FILE="${FILE}.revertbak.$(date +%Y%m%d-%H%M%S)"
+            cp "$FILE" "$BACKUP_FILE"
+
+            echo "[OK] Backup created:"
+            echo "     $BACKUP_FILE"
+        fi
 
         sed -i "s|$PATCHED|$ORIGINAL|g" "$FILE"
 
         VERIFY=$(grep -nF "$ORIGINAL" "$FILE" || true)
 
         if [[ -n "$VERIFY" ]]; then
-            echo "[SUCCESS] Reverted successfully."
+            echo "[SUCCESS] Revert successful."
         else
             echo "[ERROR] Revert failed."
             exit 1
         fi
 
-        read -rp "Restart pveproxy? [Y/n]: " RESTART_CONFIRM
+        echo
+        echo "[INFO] Clearing cache..."
+        rm -rf /var/cache/pve-manager/*
+
+        read -rp "Restart pveproxy now? [Y/n]: " RESTART_CONFIRM
 
         if [[ ! "$RESTART_CONFIRM" =~ ^[Nn]$ ]]; then
             systemctl restart pveproxy
             echo "[OK] pveproxy restarted."
+        else
+            echo "[INFO] Restart skipped."
         fi
 
         exit 0
@@ -68,7 +84,7 @@ if [[ -z "$MATCHES" && -n "$PATCHED_MATCHES" ]]; then
     exit 0
 fi
 
-# Nothing found
+# No match found
 if [[ -z "$MATCHES" ]]; then
     echo
     echo "[INFO] No matching pattern found."
@@ -122,7 +138,7 @@ echo
 echo "[INFO] Clearing cache..."
 rm -rf /var/cache/pve-manager/*
 
-read -rp "Restart pveproxy? [Y/n]: " RESTART_CONFIRM
+read -rp "Restart pveproxy now? [Y/n]: " RESTART_CONFIRM
 
 if [[ ! "$RESTART_CONFIRM" =~ ^[Nn]$ ]]; then
     systemctl restart pveproxy
