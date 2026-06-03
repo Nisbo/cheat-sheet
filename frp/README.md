@@ -1,6 +1,6 @@
 # FRP Update Script
 
-A simple interactive Bash script to update **FRPS (server)** or **FRPC (client)** on Linux systems.
+A simple interactive Bash script to update **FRPS (server)** or **FRPC (client)** on Linux (linux_amd64) systems.
 
 It automatically fetches the latest release from GitHub, creates backups, and safely updates your installation.
 
@@ -22,7 +22,8 @@ It automatically fetches the latest release from GitHub, creates backups, and sa
 
 ## ⚙️ Requirements
 
-- Linux system with systemd
+- Linux system (linux_amd64) with systemd
+- FRP installed in `/opt/frp`
 - curl
 - wget
 - tar
