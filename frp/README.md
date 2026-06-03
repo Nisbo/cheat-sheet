@@ -36,6 +36,16 @@ Optional:
 
 ## 📥 Installation
 
+### Quick
+
+Run as one-liner (no manual download required):
+
+```
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/frp/update-frp.sh)
+```
+
+### Normal
+
 Download the script:
 
 ```bash
@@ -46,7 +56,7 @@ wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/frp/upd
 Make it executable:
 
 ```bash
-chmod +x update-frp.sh
+sudo chmod +x update-frp.sh
 ```
 
 ## 🚀 Usage
