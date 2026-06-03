@@ -1,7 +1,107 @@
-Script to Update FRP
+# FRP Update Script
+
+A simple interactive Bash script to update **FRPS (server)** or **FRPC (client)** on Linux systems.
+
+It automatically fetches the latest release from GitHub, creates backups, and safely updates your installation.
+
+---
+
+## 📦 Features
+
+- Supports **frps (server)** and **frpc (client)**
+- Automatically fetches latest version from GitHub
+- Shows installed + latest version
+- Allows manual version override
+- Creates automatic backups before updating
+- Safe restart of systemd services
+- Verifies service health after update
+- Fails safely if service does not start
+- Interactive confirmation before applying changes
+
+---
+
+## ⚙️ Requirements
+
+- Linux system with systemd
+- curl
+- wget
+- tar
+- root privileges
+
+Optional:
+- jq (not required, script works without it)
+
+---
+
+## 📥 Installation
+
+Download the script:
+
+```bash
+cd /opt
+wget https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/frp/update-frp.sh
+```
+
+Make it executable:
+
+```bash
+chmod +x update-frp.sh
+```
+
+## 🚀 Usage
+
+Run the script as root:
+
+```bash
+sudo ./update-frp.sh
+```
+
+## 🧭 Workflow
+
+1. Select component:
+   - `frps` (Server)
+   - `frpc` (Client)
+
+2. Script displays:
+   - Installed version
+   - Latest available version
+
+3. Choose version:
+   - Press **ENTER** → install latest version
+   - Or enter a specific version manually
+
+4. Confirm update
+
+5. Script will:
+   - Create backup of `/opt/frp`
+   - Download selected release
+   - Stop systemd service
+   - Replace binary
+   - Restart service
+   - Verify service health
+
+## 💾 Backup location
+
+Backups are stored in:
+
+```bash
+/opt/frp_backup_YYYY-MM-DD_HH-MM-SS
+```
+
+## 🛑 Safety features
+- Service is checked after restart
+- If service fails, script prints logs and exits
+- Original installation is preserved via backup
+- Update only proceeds after user confirmation
 
 
-Demo Output:
+## 🔗 Script Source
+
+```
+https://raw.githubusercontent.com/Nisbo/cheat-sheet/refs/heads/main/frp/update-frp.sh
+```
+
+## Demo Output:
 
 ```
 root@Debian-93-stretch-64-LAMP /opt/frp # ./update-frp.sh
