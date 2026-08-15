@@ -1,45 +1,70 @@
 #!/usr/bin/env bash
-
 # ==============================================================================
 # UniFi <-> Debian IPsec S2S Manager
-# TEST VERSION - CONFIGURATION / STATE MANAGEMENT ONLY
+# Development / Test Build
 #
-# This script DOES NOT:
-#   - install packages
-#   - modify strongSwan
-#   - modify UFW
-#   - modify routes
-#   - create VTI interfaces
-#   - modify systemd
+# Purpose:
+#   Interactive setup and management of route-based IKEv2/IPsec S2S tunnels
+#   between Debian 13 (strongSwan/swanctl) and UniFi UDM gateways.
 #
-# All test data is stored below:
+# State:
 #   /root/s2s-manager-test/
+#
+# System changes:
+#   - can install required strongSwan packages
+#   - can disable the unused TPM plugin
+#   - can create/remove managed strongSwan tunnel configs
+#   - can create/remove managed VTI scripts and systemd services
+#   - can add/remove managed UFW rules
+#
+# Safety:
+#   - does NOT enable UFW automatically
+#   - shows an installation/change summary before applying
+#   - uses uniquely named managed files
+#   - keeps per-tunnel PSKs in mode 600 files
 # ==============================================================================
 
 set -u
+set -o pipefail
+
+VERSION="0.3-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
 ROUTE_DIR="${STATE_DIR}/routes"
 SECRET_DIR="${STATE_DIR}/secrets"
 
+SWANCTL_DIR="/etc/swanctl/conf.d"
+MANAGED_PREFIX="s2s-manager"
+VTI_SCRIPT_DIR="/usr/local/sbin"
+SYSTEMD_DIR="/etc/systemd/system"
+
+REQUIRED_PACKAGES=(
+    strongswan
+    charon-systemd
+    strongswan-swanctl
+    libstrongswan-standard-plugins
+    libstrongswan-extra-plugins
+)
+
 DEFAULT_NET_PREFIX_A=10
 DEFAULT_NET_PREFIX_B=200
 DEFAULT_NET_START_C=201
+DEFAULT_VTI_KEY=42
 
 # ==============================================================================
 # Colors
 # ==============================================================================
 
 if [[ -t 1 ]]; then
-    C_RESET="\033[0m"
-    C_BOLD="\033[1m"
-    C_DIM="\033[2m"
-    C_RED="\033[31m"
-    C_GREEN="\033[32m"
-    C_YELLOW="\033[33m"
-    C_BLUE="\033[34m"
-    C_CYAN="\033[36m"
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_CYAN=$'\033[36m'
 else
     C_RESET=""
     C_BOLD=""
@@ -52,7 +77,7 @@ else
 fi
 
 # ==============================================================================
-# UI helpers
+# UI
 # ==============================================================================
 
 clear_screen() {
@@ -86,22 +111,15 @@ pause() {
 
 banner() {
     clear_screen
-
     printf '%b' "${C_CYAN}${C_BOLD}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                 UniFi IPsec S2S Manager                    ║"
-    echo "║                Configuration Test Version                  ║"
+    printf '║                 Version %-35s║\n' "${VERSION}"
     echo "╚══════════════════════════════════════════════════════════════╝"
     printf '%b' "${C_RESET}"
-
     echo
-    printf '%b\n' "${C_YELLOW}${C_BOLD}TEST MODE${C_RESET}"
-    echo
-    echo "This version only manages configuration data."
-    echo "It does NOT change networking, strongSwan, UFW or systemd."
-    echo
-    printf 'Test data directory: %b%s%b\n' \
-        "${C_CYAN}" "${STATE_DIR}" "${C_RESET}"
+    printf '%b\n' "${C_YELLOW}${C_BOLD}DEVELOPMENT / TEST BUILD${C_RESET}"
+    printf 'State directory: %b%s%b\n' "${C_CYAN}" "${STATE_DIR}" "${C_RESET}"
     echo
 }
 
@@ -113,13 +131,27 @@ section() {
     echo
 }
 
+confirm_yes_no() {
+    local prompt="$1"
+    local default="${2:-N}"
+    local answer
+
+    if [[ "${default}" == "Y" ]]; then
+        read -r -p "${prompt} [Y/n]: " answer
+        [[ -z "${answer}" || "${answer}" =~ ^[Yy]$ ]]
+    else
+        read -r -p "${prompt} [y/N]: " answer
+        [[ "${answer}" =~ ^[Yy]$ ]]
+    fi
+}
+
 # ==============================================================================
-# Environment
+# Environment / package checks
 # ==============================================================================
 
 ensure_root() {
     if [[ "${EUID}" -ne 0 ]]; then
-        error "This test manager must be run as root."
+        error "This manager must be run as root."
         exit 1
     fi
 }
@@ -129,61 +161,316 @@ init_state_dirs() {
     chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}"
 }
 
-detect_public_ipv4() {
-    local ip=""
+debian_major_version() {
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        if [[ "${ID:-}" == "debian" ]]; then
+            printf '%s' "${VERSION_ID:-unknown}"
+            return
+        fi
+    fi
+    printf 'unknown'
+}
 
-    ip=$(
+package_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
+}
+
+missing_packages() {
+    local pkg
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        package_installed "${pkg}" || printf '%s\n' "${pkg}"
+    done
+}
+
+command_available() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+detect_public_ipv4() {
+    local detected=""
+
+    detected=$(
         ip -4 route get 1.1.1.1 2>/dev/null |
-        awk '
-            {
-                for (i=1; i<=NF; i++) {
-                    if ($i == "src") {
-                        print $(i+1)
-                        exit
-                    }
+        awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i == "src") {
+                    print $(i+1)
+                    exit
                 }
             }
-        '
+        }'
     )
 
-    printf '%s' "${ip}"
+    printf '%s' "${detected}"
+}
+
+tpm_disabled() {
+    grep -Eq '^[[:space:]]*load[[:space:]]*=[[:space:]]*no[[:space:]]*$' \
+        /etc/strongswan.d/charon/tpm.conf 2>/dev/null
+}
+
+route_based_global_ready() {
+    grep -Eq '^[[:space:]]*install_routes[[:space:]]*=[[:space:]]*no[[:space:]]*$' \
+        /etc/strongswan.d/charon/route-based.conf 2>/dev/null
+}
+
+ufw_installed() {
+    command_available ufw
+}
+
+ufw_active() {
+    ufw_installed && ufw status 2>/dev/null | grep -q '^Status: active'
+}
+
+preflight_ready() {
+    [[ "$(debian_major_version)" == "13" ]] || return 1
+    command_available ip || return 1
+    command_available openssl || return 1
+    command_available swanctl || return 1
+
+    local missing
+    missing="$(missing_packages)"
+    [[ -z "${missing}" ]] || return 1
+
+    tpm_disabled || return 1
+    route_based_global_ready || return 1
+
+    return 0
+}
+
+show_preflight() {
+    banner
+    section "SYSTEM PRE-FLIGHT CHECK"
+
+    local ready=1
+    local version
+    version="$(debian_major_version)"
+
+    if [[ "${version}" == "13" ]]; then
+        ok "Debian 13 detected"
+    else
+        error "Debian 13 required (detected: ${version})"
+        ready=0
+    fi
+
+    if [[ "${EUID}" -eq 0 ]]; then
+        ok "Running as root"
+    else
+        error "Root privileges required"
+        ready=0
+    fi
+
+    if command_available ip; then
+        ok "iproute2 / ip command available"
+    else
+        error "ip command missing"
+        ready=0
+    fi
+
+    if command_available openssl; then
+        ok "OpenSSL available"
+    else
+        error "OpenSSL missing"
+        ready=0
+    fi
+
+    echo
+    printf '%b\n' "${C_BOLD}Required packages:${C_RESET}"
+
+    local pkg
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        if package_installed "${pkg}"; then
+            ok "${pkg}"
+        else
+            error "${pkg} - NOT INSTALLED"
+            ready=0
+        fi
+    done
+
+    echo
+    printf '%b\n' "${C_BOLD}strongSwan preparation:${C_RESET}"
+
+    if command_available swanctl; then
+        ok "swanctl available"
+    else
+        error "swanctl missing"
+        ready=0
+    fi
+
+    if tpm_disabled; then
+        ok "Unused TPM plugin disabled"
+    else
+        error "TPM plugin is not disabled by the manager"
+        ready=0
+    fi
+
+    if route_based_global_ready; then
+        ok "Route-based strongSwan mode prepared"
+    else
+        error "Route-based strongSwan setting missing"
+        ready=0
+    fi
+
+    echo
+    printf '%b\n' "${C_BOLD}Firewall:${C_RESET}"
+
+    if ufw_installed; then
+        ok "UFW installed"
+        if ufw_active; then
+            ok "UFW active"
+        else
+            warn "UFW installed but inactive"
+        fi
+    else
+        warn "UFW not installed"
+    fi
+
+    echo
+    printf '%b\n' "${C_BOLD}Detected server IPv4:${C_RESET}"
+    local public_ip
+    public_ip="$(detect_public_ipv4)"
+    if [[ -n "${public_ip}" ]]; then
+        ok "${public_ip}"
+    else
+        warn "Could not determine a local IPv4 automatically"
+    fi
+
+    echo
+    if (( ready == 1 )); then
+        ok "System is READY for S2S tunnel management."
+        return 0
+    fi
+
+    warn "System setup / repair is required before tunnels can be installed."
+    return 1
+}
+
+install_or_repair_prerequisites() {
+    banner
+    section "INSTALL / REPAIR PREREQUISITES"
+
+    echo "The following shared prerequisites will be prepared:"
+    echo
+    echo "Packages:"
+    local pkg
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        if package_installed "${pkg}"; then
+            printf '  = %-38s already installed\n' "${pkg}"
+        else
+            printf '  + %-38s install\n' "${pkg}"
+        fi
+    done
+
+    echo
+    echo "strongSwan:"
+    echo "  + disable unused TPM plugin"
+    echo "  + disable automatic strongSwan route installation"
+    echo "  + restart strongSwan"
+    echo
+    echo "No tunnel will be created by this step."
+    echo "No firewall rule will be added by this step."
+    echo
+
+    confirm_yes_no "Apply prerequisite setup?" "N" || return
+
+    echo
+    section "APPLYING PREREQUISITES"
+
+    local -a missing=()
+    mapfile -t missing < <(missing_packages)
+
+    if (( ${#missing[@]} > 0 )); then
+        printf '[1/4] Installing required packages... '
+        if apt-get update >/tmp/s2s-manager-apt-update.log 2>&1 &&
+           DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" \
+               >/tmp/s2s-manager-apt-install.log 2>&1; then
+            printf '%b\n' "${C_GREEN}OK${C_RESET}"
+        else
+            printf '%b\n' "${C_RED}FAILED${C_RESET}"
+            error "Package installation failed."
+            echo "See:"
+            echo "  /tmp/s2s-manager-apt-update.log"
+            echo "  /tmp/s2s-manager-apt-install.log"
+            pause
+            return 1
+        fi
+    else
+        printf '[1/4] Installing required packages... %b\n' "${C_GREEN}ALREADY OK${C_RESET}"
+    fi
+
+    printf '[2/4] Disabling unused TPM plugin... '
+    mkdir -p /etc/strongswan.d/charon
+    cat > /etc/strongswan.d/charon/tpm.conf <<'EOF'
+tpm {
+    load = no
+}
+EOF
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[3/4] Preparing route-based strongSwan mode... '
+    cat > /etc/strongswan.d/charon/route-based.conf <<'EOF'
+charon {
+    install_routes = no
+}
+EOF
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[4/4] Restarting and validating strongSwan... '
+    if systemctl restart strongswan >/tmp/s2s-manager-strongswan-restart.log 2>&1 &&
+       systemctl is-active --quiet strongswan; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        error "strongSwan did not restart successfully."
+        journalctl -u strongswan -n 30 --no-pager
+        pause
+        return 1
+    fi
+
+    echo
+    if journalctl -u strongswan --since "1 minute ago" --no-pager |
+       grep -qi "failed to load"; then
+        warn "Recent strongSwan plugin load errors were found:"
+        journalctl -u strongswan --since "1 minute ago" --no-pager |
+            grep -i "failed to load"
+    else
+        ok "No recent strongSwan plugin load errors."
+    fi
+
+    echo
+    ok "Prerequisites are prepared."
+    pause
 }
 
 # ==============================================================================
-# IPv4 helpers
+# IPv4 / CIDR helpers
 # ==============================================================================
 
 valid_ipv4() {
     local ip="$1"
     local IFS=.
     local -a octets
-
     read -r -a octets <<< "${ip}"
 
     [[ ${#octets[@]} -eq 4 ]] || return 1
 
     local o
-
     for o in "${octets[@]}"; do
         [[ "${o}" =~ ^[0-9]+$ ]] || return 1
         (( o >= 0 && o <= 255 )) || return 1
     done
-
-    return 0
 }
 
 ipv4_to_int() {
     local ip="$1"
     local a b c d
-
     IFS=. read -r a b c d <<< "${ip}"
-
     printf '%u' "$(( (a << 24) + (b << 16) + (c << 8) + d ))"
 }
 
 int_to_ipv4() {
     local n="$1"
-
     printf '%d.%d.%d.%d' \
         $(( (n >> 24) & 255 )) \
         $(( (n >> 16) & 255 )) \
@@ -193,8 +480,7 @@ int_to_ipv4() {
 
 normalize_30_network() {
     local input="$1"
-    local ip prefix
-    local n network
+    local ip prefix n network
 
     if [[ "${input}" == */* ]]; then
         ip="${input%%/*}"
@@ -205,27 +491,17 @@ normalize_30_network() {
     fi
 
     valid_ipv4 "${ip}" || return 1
-
-    if [[ "${prefix}" != "30" ]]; then
-        return 2
-    fi
+    [[ "${prefix}" == "30" ]] || return 2
 
     n=$(ipv4_to_int "${ip}")
     network=$(( n & 0xFFFFFFFC ))
-
     printf '%s/30' "$(int_to_ipv4 "${network}")"
-}
-
-network_base_ip() {
-    printf '%s' "${1%%/*}"
 }
 
 calculate_30_addresses() {
     local network="$1"
-    local base
+    local base="${network%%/*}"
     local n
-
-    base=$(network_base_ip "${network}")
     n=$(ipv4_to_int "${base}")
 
     CALC_NETWORK="$(int_to_ipv4 "${n}")/30"
@@ -236,12 +512,9 @@ calculate_30_addresses() {
 
 network_is_exact_base() {
     local input="$1"
-    local ip normalized
-
-    ip="${input%%/*}"
+    local normalized
     normalized=$(normalize_30_network "${input}") || return 1
-
-    [[ "${ip}" == "${normalized%%/*}" ]]
+    [[ "${input%%/*}" == "${normalized%%/*}" ]]
 }
 
 valid_cidr() {
@@ -249,20 +522,13 @@ valid_cidr() {
     local ip prefix
 
     [[ "${input}" == */* ]] || return 1
-
     ip="${input%%/*}"
     prefix="${input##*/}"
 
     valid_ipv4 "${ip}" || return 1
     [[ "${prefix}" =~ ^[0-9]+$ ]] || return 1
-    (( prefix >= 0 && prefix <= 32 )) || return 1
-
-    return 0
+    (( prefix >= 0 && prefix <= 32 ))
 }
-
-# ==============================================================================
-# Validation
-# ==============================================================================
 
 valid_tunnel_name() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]
@@ -273,19 +539,27 @@ valid_auth_id() {
 }
 
 # ==============================================================================
-# State helpers
+# State
 # ==============================================================================
 
-tunnel_config_file() {
-    printf '%s/%s.conf' "${TUNNEL_DIR}" "$1"
+tunnel_config_file() { printf '%s/%s.conf' "${TUNNEL_DIR}" "$1"; }
+tunnel_route_file()  { printf '%s/%s.routes' "${ROUTE_DIR}" "$1"; }
+tunnel_secret_file() { printf '%s/%s.psk' "${SECRET_DIR}" "$1"; }
+
+managed_swan_file() {
+    printf '%s/%s-%s.conf' "${SWANCTL_DIR}" "${MANAGED_PREFIX}" "$1"
 }
 
-tunnel_route_file() {
-    printf '%s/%s.routes' "${ROUTE_DIR}" "$1"
+managed_vti_script() {
+    printf '%s/%s-vti-%s.sh' "${VTI_SCRIPT_DIR}" "${MANAGED_PREFIX}" "$1"
 }
 
-tunnel_secret_file() {
-    printf '%s/%s.psk' "${SECRET_DIR}" "$1"
+managed_service_file() {
+    printf '%s/%s-vti-%s.service' "${SYSTEMD_DIR}" "${MANAGED_PREFIX}" "$1"
+}
+
+managed_service_name() {
+    printf '%s-vti-%s.service' "${MANAGED_PREFIX}" "$1"
 }
 
 tunnel_exists() {
@@ -294,120 +568,34 @@ tunnel_exists() {
 
 list_tunnel_names() {
     local file
-
     shopt -s nullglob
-
     for file in "${TUNNEL_DIR}"/*.conf; do
         basename "${file}" .conf
     done
-
     shopt -u nullglob
 }
 
 tunnel_count() {
-    local count=0
-    local name
-
+    local count=0 name
     while read -r name; do
         [[ -n "${name}" ]] && ((count += 1))
     done < <(list_tunnel_names)
-
     printf '%d' "${count}"
 }
 
 load_tunnel() {
     local name="$1"
     local file
-
-    file=$(tunnel_config_file "${name}")
-
+    file="$(tunnel_config_file "${name}")"
     [[ -f "${file}" ]] || return 1
 
     unset NAME PUBLIC_IP AUTH_ID VTI_INTERFACE VTI_KEY
-    unset VTI_NETWORK DEBIAN_VTI_IP UNIFI_VTI_IP CREATED_AT
+    unset VTI_NETWORK DEBIAN_VTI_IP UNIFI_VTI_IP CREATED_AT INSTALLED
 
     # shellcheck disable=SC1090
     source "${file}"
-}
 
-auth_id_in_use() {
-    local wanted="$1"
-    local ignore_name="${2:-}"
-    local name
-
-    while read -r name; do
-        [[ -z "${name}" ]] && continue
-        [[ "${name}" == "${ignore_name}" ]] && continue
-
-        load_tunnel "${name}" || continue
-
-        if [[ "${AUTH_ID}" == "${wanted}" ]]; then
-            return 0
-        fi
-    done < <(list_tunnel_names)
-
-    return 1
-}
-
-network_in_use() {
-    local wanted="$1"
-    local ignore_name="${2:-}"
-    local name
-
-    while read -r name; do
-        [[ -z "${name}" ]] && continue
-        [[ "${name}" == "${ignore_name}" ]] && continue
-
-        load_tunnel "${name}" || continue
-
-        if [[ "${VTI_NETWORK}" == "${wanted}" ]]; then
-            return 0
-        fi
-    done < <(list_tunnel_names)
-
-    return 1
-}
-
-next_interface_index() {
-    local index=0
-
-    while :; do
-        local used=0
-        local name
-
-        while read -r name; do
-            [[ -z "${name}" ]] && continue
-
-            load_tunnel "${name}" || continue
-
-            if [[ "${VTI_INTERFACE}" == "ipsec${index}" ]]; then
-                used=1
-                break
-            fi
-        done < <(list_tunnel_names)
-
-        if (( used == 0 )); then
-            printf '%d' "${index}"
-            return
-        fi
-
-        ((index += 1))
-    done
-}
-
-next_vti_network() {
-    local c
-
-    for (( c=DEFAULT_NET_START_C; c<=250; c++ )); do
-        local candidate="${DEFAULT_NET_PREFIX_A}.${DEFAULT_NET_PREFIX_B}.${c}.0/30"
-
-        if ! network_in_use "${candidate}"; then
-            printf '%s' "${candidate}"
-            return
-        fi
-    done
-
-    printf '10.200.251.0/30'
+    : "${INSTALLED:=0}"
 }
 
 save_tunnel() {
@@ -419,9 +607,10 @@ save_tunnel() {
     local network="$6"
     local debian_ip="$7"
     local unifi_ip="$8"
+    local installed="${9:-0}"
 
     local config
-    config=$(tunnel_config_file "${name}")
+    config="$(tunnel_config_file "${name}")"
 
     {
         printf 'NAME=%q\n' "${name}"
@@ -433,294 +622,203 @@ save_tunnel() {
         printf 'DEBIAN_VTI_IP=%q\n' "${debian_ip}"
         printf 'UNIFI_VTI_IP=%q\n' "${unifi_ip}"
         printf 'CREATED_AT=%q\n' "$(date -Is)"
+        printf 'INSTALLED=%q\n' "${installed}"
     } > "${config}"
 
     chmod 600 "${config}"
 }
 
+read_routes() {
+    local file
+    file="$(tunnel_route_file "$1")"
+    [[ -f "${file}" ]] && cat "${file}"
+}
+
 write_routes() {
     local name="$1"
     shift
-
-    local file
-    file=$(tunnel_route_file "${name}")
-
+    local file route
+    file="$(tunnel_route_file "${name}")"
     : > "${file}"
-
-    local route
-
     for route in "$@"; do
         [[ -n "${route}" ]] && printf '%s\n' "${route}" >> "${file}"
     done
-
     chmod 600 "${file}"
 }
 
-read_routes() {
-    local name="$1"
-    local file
-
-    file=$(tunnel_route_file "${name}")
-
-    [[ -f "${file}" ]] || return 0
-
-    cat "${file}"
-}
-
-generate_psk() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 32 | tr -d '\n'
-        return
-    fi
-
-    return 1
-}
-
 save_psk() {
-    local name="$1"
-    local psk="$2"
     local file
-
-    file=$(tunnel_secret_file "${name}")
-
-    printf '%s\n' "${psk}" > "${file}"
+    file="$(tunnel_secret_file "$1")"
+    printf '%s\n' "$2" > "${file}"
     chmod 600 "${file}"
 }
 
 read_psk() {
-    local name="$1"
     local file
-
-    file=$(tunnel_secret_file "${name}")
-
+    file="$(tunnel_secret_file "$1")"
     [[ -f "${file}" ]] || return 1
-
     cat "${file}"
 }
 
+generate_psk() {
+    openssl rand -base64 32 | tr -d '\n'
+}
+
+auth_id_in_use() {
+    local wanted="$1"
+    local ignore="${2:-}"
+    local name
+
+    while read -r name; do
+        [[ -z "${name}" || "${name}" == "${ignore}" ]] && continue
+        load_tunnel "${name}" || continue
+        [[ "${AUTH_ID}" == "${wanted}" ]] && return 0
+    done < <(list_tunnel_names)
+
+    return 1
+}
+
+network_in_use() {
+    local wanted="$1"
+    local ignore="${2:-}"
+    local name
+
+    while read -r name; do
+        [[ -z "${name}" || "${name}" == "${ignore}" ]] && continue
+        load_tunnel "${name}" || continue
+        [[ "${VTI_NETWORK}" == "${wanted}" ]] && return 0
+    done < <(list_tunnel_names)
+
+    return 1
+}
+
+next_interface_index() {
+    local index=0 name used
+
+    while :; do
+        used=0
+        while read -r name; do
+            [[ -z "${name}" ]] && continue
+            load_tunnel "${name}" || continue
+            if [[ "${VTI_INTERFACE}" == "ipsec${index}" ]]; then
+                used=1
+                break
+            fi
+        done < <(list_tunnel_names)
+
+        (( used == 0 )) && { printf '%d' "${index}"; return; }
+        ((index += 1))
+    done
+}
+
+next_vti_network() {
+    local c candidate
+    for (( c=DEFAULT_NET_START_C; c<=250; c++ )); do
+        candidate="${DEFAULT_NET_PREFIX_A}.${DEFAULT_NET_PREFIX_B}.${c}.0/30"
+        if ! network_in_use "${candidate}"; then
+            printf '%s' "${candidate}"
+            return
+        fi
+    done
+    printf '10.200.251.0/30'
+}
+
 # ==============================================================================
-# Display helpers
+# Tunnel list / selection
 # ==============================================================================
 
 show_existing_tunnels() {
     local count
-    count=$(tunnel_count)
+    count="$(tunnel_count)"
 
     if (( count == 0 )); then
-        info "No existing test tunnels found."
+        info "No tunnels configured."
         return
     fi
 
-    printf '%-4s %-16s %-12s %-20s %-24s\n' \
-        "#" "Name" "Interface" "Tunnel Network" "Authentication ID"
+    printf '%-4s %-16s %-12s %-20s %-12s %-24s\n' \
+        "#" "Name" "Interface" "Tunnel Network" "State" "Authentication ID"
+    printf '%-4s %-16s %-12s %-20s %-12s %-24s\n' \
+        "──" "────────────────" "────────────" "────────────────────" "────────────" "────────────────────────"
 
-    printf '%-4s %-16s %-12s %-20s %-24s\n' \
-        "──" "────────────────" "────────────" "────────────────────" "────────────────────────"
-
-    local index=1
-    local name
-
+    local index=1 name state
     while read -r name; do
         [[ -z "${name}" ]] && continue
-
         load_tunnel "${name}" || continue
+        if [[ "${INSTALLED}" == "1" ]]; then
+            state="INSTALLED"
+        else
+            state="DEFINED"
+        fi
 
-        printf '%-4s %-16s %-12s %-20s %-24s\n' \
-            "${index}" \
-            "${NAME}" \
-            "${VTI_INTERFACE}" \
-            "${VTI_NETWORK}" \
-            "${AUTH_ID}"
-
+        printf '%-4s %-16s %-12s %-20s %-12s %-24s\n' \
+            "${index}" "${NAME}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${state}" "${AUTH_ID}"
         ((index += 1))
     done < <(list_tunnel_names)
 }
 
-show_tunnel_details() {
-    local name="$1"
-
-    load_tunnel "${name}" || {
-        error "Tunnel not found: ${name}"
-        return 1
-    }
-
-    section "Tunnel configuration: ${name}"
-
-    printf '%-28s %s\n' "Name:" "${NAME}"
-    printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
-    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
-    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
-    printf '%-28s %s\n' "VTI key / mark:" "${VTI_KEY}"
-    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
-    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
-    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
-
-    echo
-    echo "Remote networks:"
-
-    local route_count=0
-    local route
-
-    while read -r route; do
-        [[ -z "${route}" ]] && continue
-        printf '  • %s\n' "${route}"
-        ((route_count += 1))
-    done < <(read_routes "${name}")
-
-    if (( route_count == 0 )); then
-        echo "  None"
-    fi
-
-    echo
-    printf '%-28s %s\n' "PSK file:" "$(tunnel_secret_file "${name}")"
-}
-
 select_tunnel() {
     local -a names=()
-    local name
+    local name selection i
 
     while read -r name; do
         [[ -n "${name}" ]] && names+=("${name}")
     done < <(list_tunnel_names)
 
-    if (( ${#names[@]} == 0 )); then
-        warn "No tunnels configured."
-        return 1
-    fi
+    (( ${#names[@]} > 0 )) || { warn "No tunnels configured."; return 1; }
 
     echo
-
-    local i
-
     for i in "${!names[@]}"; do
         printf '  [%d] %s\n' "$((i + 1))" "${names[$i]}"
     done
-
     echo
     echo "Press ENTER, B or 0 to go back."
     echo
-
     read -r -p "Selection: " selection
 
-    case "${selection}" in
-        ""|b|B|0)
-            return 1
-            ;;
-    esac
+    case "${selection}" in ""|b|B|0) return 1 ;; esac
 
     [[ "${selection}" =~ ^[0-9]+$ ]] || return 1
-
-    if (( selection < 1 || selection > ${#names[@]} )); then
-        return 1
-    fi
+    (( selection >= 1 && selection <= ${#names[@]} )) || return 1
 
     SELECTED_TUNNEL="${names[$((selection - 1))]}"
     return 0
 }
 
 # ==============================================================================
-# Prompt helpers
+# Prompts
 # ==============================================================================
 
-prompt_public_ip() {
-    local detected="$1"
-    local value
-
-    while :; do
-        echo
-        echo "This is the public IPv4 address of the Debian server."
-        echo
-        echo "It will later be used as:"
-        echo "  • the local strongSwan endpoint"
-        echo "  • the UniFi remote gateway"
-        echo "  • the Debian IKE authentication identity"
-        echo
-        echo "Press ENTER to accept the suggested value or enter another value."
-        echo
-
-        read -r -p "Debian public IP [${detected}]: " value
-        value="${value:-${detected}}"
-
-        if valid_ipv4 "${value}"; then
-            PROMPT_RESULT="${value}"
-            return
-        fi
-
-        error "Invalid IPv4 address: ${value}"
-    done
-}
-
 prompt_tunnel_name() {
-    local suggested="$1"
-    local value
-
+    local suggested="$1" value
     while :; do
-        echo
-        echo "The tunnel name is used by the S2S Manager to identify this tunnel."
-        echo
-        echo "Examples:"
-        echo "  home"
-        echo "  office"
-        echo "  backup"
-        echo
-        echo "Allowed characters:"
-        echo "  letters, numbers, underscore and dash"
+        echo "The tunnel name is used locally by the S2S Manager."
+        echo "Examples: home, office, backup"
         echo
         echo "Press ENTER to accept the suggested value or enter another value."
         echo
-
         read -r -p "Tunnel name [${suggested}]: " value
         value="${value:-${suggested}}"
 
-        if ! valid_tunnel_name "${value}"; then
-            error "Invalid tunnel name."
-            continue
-        fi
-
-        if tunnel_exists "${value}"; then
-            error "A tunnel named '${value}' already exists."
-            continue
-        fi
+        valid_tunnel_name "${value}" || { error "Invalid tunnel name."; echo; continue; }
+        tunnel_exists "${value}" && { error "Tunnel '${value}' already exists."; echo; continue; }
 
         PROMPT_RESULT="${value}"
         return
     done
 }
 
-prompt_auth_id() {
-    local suggested="$1"
-    local ignore_name="${2:-}"
-    local value
-
+prompt_public_ip() {
+    local suggested="$1" value
     while :; do
-        echo
-        echo "The UniFi gateway identifies itself to Debian using this IKE identity."
-        echo
-        echo "This is NOT an IP address and does not need to resolve in DNS."
-        echo
-        echo "Use a unique Authentication ID for every S2S tunnel."
-        echo
-        echo "Examples:"
-        echo "  unifi-home"
-        echo "  unifi-office"
-        echo "  unifi-backup"
+        echo "This is the public IPv4 address of the Debian server."
+        echo "It will be used as the local IPsec endpoint and UniFi remote gateway."
         echo
         echo "Press ENTER to accept the suggested value or enter another value."
         echo
-
-        read -r -p "UniFi authentication ID [${suggested}]: " value
+        read -r -p "Debian public IP [${suggested}]: " value
         value="${value:-${suggested}}"
-
-        if ! valid_auth_id "${value}"; then
-            error "Invalid authentication ID."
-            continue
-        fi
-
-        if auth_id_in_use "${value}" "${ignore_name}"; then
-            error "Authentication ID '${value}' is already used by another tunnel."
-            continue
-        fi
-
+        valid_ipv4 "${value}" || { error "Invalid IPv4 address."; echo; continue; }
         PROMPT_RESULT="${value}"
         return
     done
@@ -728,19 +826,10 @@ prompt_auth_id() {
 
 prompt_tunnel_network() {
     local suggested="$1"
-    local ignore_name="${2:-}"
-    local value normalized
-    local rc
+    local value normalized rc choice
 
     while :; do
-        echo
-        echo "Every Site-to-Site tunnel needs its own private transfer network."
-        echo
-        echo "This manager always uses a /30 network."
-        echo
-        echo "A /30 provides exactly two usable IP addresses:"
-        echo "  • one for Debian"
-        echo "  • one for the UniFi gateway"
+        echo "Every Site-to-Site tunnel needs its own private /30 transfer network."
         echo
         echo "You may enter either:"
         echo "  10.200.201.0"
@@ -749,118 +838,76 @@ prompt_tunnel_network() {
         echo
         echo "Both formats are accepted."
         echo
-        echo "The network must NOT overlap with any existing:"
-        echo "  • LAN"
-        echo "  • VLAN"
-        echo "  • VPN"
-        echo "  • Teleport network"
-        echo "  • Site-to-Site tunnel"
+        echo "The network must not overlap with LAN, VLAN, VPN, Teleport or other S2S networks."
+        echo
 
-        local count
-        count=$(tunnel_count)
-
-        if (( count > 0 )); then
-            echo
+        if (( $(tunnel_count) > 0 )); then
             echo "Existing S2S networks:"
-
-            local name
-
-            while read -r name; do
-                [[ -z "${name}" ]] && continue
-                load_tunnel "${name}" || continue
-
-                [[ "${name}" == "${ignore_name}" ]] && continue
-
-                printf '  • %s  (%s)\n' "${VTI_NETWORK}" "${NAME}"
+            local n
+            while read -r n; do
+                [[ -z "${n}" ]] && continue
+                load_tunnel "${n}" || continue
+                printf '  • %s (%s)\n' "${VTI_NETWORK}" "${NAME}"
             done < <(list_tunnel_names)
+            echo
         fi
 
-        echo
         echo "Press ENTER to accept the suggested value or enter another network."
         echo
-
         read -r -p "Tunnel network [${suggested%%/*}]: " value
         value="${value:-${suggested}}"
 
-        normalized=$(normalize_30_network "${value}")
+        normalized="$(normalize_30_network "${value}")"
         rc=$?
 
         if (( rc == 1 )); then
             error "Invalid IPv4 network."
+            echo
             continue
-        fi
-
-        if (( rc == 2 )); then
-            local entered_ip="${value%%/*}"
-
-            warn "This manager uses /30 networks for S2S tunnel addressing."
-            echo
+        elif (( rc == 2 )); then
+            warn "This manager uses /30 networks."
             echo "You entered: ${value}"
-            echo "Suggested:   ${entered_ip}/30"
+            echo "Suggested:   ${value%%/*}/30"
             echo
-            echo "  [1] Use ${entered_ip}/30"
+            echo "  [1] Use ${value%%/*}/30"
             echo "  [2] Enter another network"
             echo "  [0] Cancel"
             echo
-
             read -r -p "Selection: " choice
-
             case "${choice}" in
-                1)
-                    value="${entered_ip}/30"
-                    normalized=$(normalize_30_network "${value}") || continue
-                    ;;
-                0)
-                    return 1
-                    ;;
-                *)
-                    continue
-                    ;;
+                1) value="${value%%/*}/30"; normalized="$(normalize_30_network "${value}")" || continue ;;
+                0) return 1 ;;
+                *) continue ;;
             esac
         fi
 
         if ! network_is_exact_base "${value}"; then
-            local original_ip="${value%%/*}"
-
             calculate_30_addresses "${normalized}"
-
-            warn "${original_ip} is not the network address of a /30 subnet."
-            echo
-            echo "Matching /30 network: ${CALC_NETWORK}"
-            echo
+            warn "${value%%/*} is not a /30 network address."
+            printf '%-14s %s\n' "Network:" "${CALC_NETWORK}"
             printf '%-14s %s\n' "Debian IP:" "${CALC_DEBIAN}"
             printf '%-14s %s\n' "UniFi IP:" "${CALC_UNIFI}"
             printf '%-14s %s\n' "Broadcast:" "${CALC_BROADCAST}"
             echo
-
-            read -r -p "Use this network? [y/N]: " use_it
-
-            if [[ ! "${use_it}" =~ ^[Yy]$ ]]; then
-                continue
-            fi
+            confirm_yes_no "Use this calculated /30 network?" "N" || continue
         fi
 
-        if network_in_use "${normalized}" "${ignore_name}"; then
-            error "Network ${normalized} is already used by another S2S tunnel."
+        network_in_use "${normalized}" && {
+            error "Network ${normalized} is already used by another tunnel."
+            echo
             continue
-        fi
+        }
 
         calculate_30_addresses "${normalized}"
 
-        echo
         ok "Valid /30 network"
-        echo
         printf '%-14s %s\n' "Network:" "${CALC_NETWORK}"
         printf '%-14s %s\n' "Debian IP:" "${CALC_DEBIAN}"
         printf '%-14s %s\n' "UniFi IP:" "${CALC_UNIFI}"
         printf '%-14s %s\n' "Broadcast:" "${CALC_BROADCAST}"
         echo
 
-        read -r -p "Use these addresses? [Y/n]: " confirm
-
-        if [[ "${confirm}" =~ ^[Nn]$ ]]; then
-            continue
-        fi
+        confirm_yes_no "Use these addresses?" "Y" || continue
 
         PROMPT_NETWORK="${CALC_NETWORK}"
         PROMPT_DEBIAN_IP="${CALC_DEBIAN}"
@@ -869,52 +916,50 @@ prompt_tunnel_network() {
     done
 }
 
+prompt_auth_id() {
+    local suggested="$1" value
+    while :; do
+        echo "The UniFi gateway identifies itself to Debian using this IKE identity."
+        echo "This is not an IP address and does not need to resolve in DNS."
+        echo "Use a unique Authentication ID for every S2S tunnel."
+        echo
+        echo "Press ENTER to accept the suggested value or enter another value."
+        echo
+        read -r -p "UniFi authentication ID [${suggested}]: " value
+        value="${value:-${suggested}}"
+
+        valid_auth_id "${value}" || { error "Invalid Authentication ID."; echo; continue; }
+        auth_id_in_use "${value}" && { error "Authentication ID already in use."; echo; continue; }
+
+        PROMPT_RESULT="${value}"
+        return
+    done
+}
+
 prompt_remote_networks() {
     PROMPT_ROUTES=()
-
-    echo
-    echo "Enter the UniFi networks that Debian must be able to reach through"
-    echo "the Site-to-Site tunnel."
-    echo
-    echo "These will later be used as return routes."
+    echo "Enter UniFi-side networks that Debian must return through the S2S tunnel."
     echo
     echo "Examples:"
-    echo "  192.168.178.0/23    Main LAN"
-    echo "  192.168.4.0/24      UniFi Teleport"
+    echo "  192.168.178.0/23   Main LAN"
+    echo "  192.168.4.0/24     UniFi Teleport"
     echo
     echo "Enter one network per line."
     echo "Press ENTER on an empty line when finished."
     echo
 
-    local index=1
-
+    local index=1 route existing duplicate
     while :; do
-        local route
         read -r -p "Remote network #${index}: " route
+        [[ -z "${route}" ]] && break
 
-        if [[ -z "${route}" ]]; then
-            break
-        fi
+        valid_cidr "${route}" || { error "Invalid CIDR network."; echo; continue; }
 
-        if ! valid_cidr "${route}"; then
-            error "Invalid CIDR network: ${route}"
-            continue
-        fi
-
-        local duplicate=0
-        local existing
-
+        duplicate=0
         for existing in "${PROMPT_ROUTES[@]:-}"; do
-            if [[ "${existing}" == "${route}" ]]; then
-                duplicate=1
-                break
-            fi
+            [[ "${existing}" == "${route}" ]] && duplicate=1
         done
-
-        if (( duplicate == 1 )); then
-            warn "Network already added."
-            continue
-        fi
+        (( duplicate == 1 )) && { warn "Network already added."; continue; }
 
         PROMPT_ROUTES+=("${route}")
         ((index += 1))
@@ -922,12 +967,8 @@ prompt_remote_networks() {
 }
 
 prompt_psk() {
-    local generated
-
-    echo
-    echo "The Pre-Shared Key must later be entered in UniFi."
-    echo
-    echo "Choose:"
+    local choice value
+    echo "The same Pre-Shared Key must later be entered in UniFi."
     echo
     echo "  [1] Generate a secure random PSK"
     echo "  [2] Enter my own PSK"
@@ -938,62 +979,406 @@ prompt_psk() {
     while :; do
         read -r -p "Selection [1]: " choice
         choice="${choice:-1}"
-
         case "${choice}" in
             1)
-                if generated=$(generate_psk); then
-                    PROMPT_PSK="${generated}"
-                    ok "Secure random PSK generated."
-                    return
-                fi
-
-                error "OpenSSL is not available. Please enter the PSK manually."
-                ;;
-            2)
-                echo
-                read -r -s -p "Pre-Shared Key: " PROMPT_PSK
-                echo
-
-                if [[ -z "${PROMPT_PSK}" ]]; then
-                    error "PSK must not be empty."
-                    continue
-                fi
-
+                PROMPT_PSK="$(generate_psk)"
+                ok "Secure random PSK generated."
                 return
                 ;;
-            *)
-                error "Invalid selection."
+            2)
+                read -r -s -p "Pre-Shared Key: " value
+                echo
+                [[ -n "${value}" ]] || { error "PSK must not be empty."; continue; }
+                PROMPT_PSK="${value}"
+                return
                 ;;
+            *) error "Invalid selection." ;;
         esac
     done
 }
 
 # ==============================================================================
-# Add tunnel
+# Firewall management
 # ==============================================================================
 
-add_tunnel() {
+ufw_comment_exists() {
+    local comment="$1"
+    ufw status 2>/dev/null | grep -Fq "${comment}"
+}
+
+ensure_shared_firewall_rules() {
+    local public_ip="$1"
+
+    if ! ufw_installed; then
+        warn "UFW is not installed."
+        echo
+        echo "Choose:"
+        echo "  [1] Install UFW (do NOT enable it automatically)"
+        echo "  [2] Continue without firewall changes"
+        echo "  [0] Cancel"
+        echo
+        local choice
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1)
+                apt-get update &&
+                DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
+                ;;
+            2) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    if ! ufw_active; then
+        warn "UFW is installed but inactive."
+        echo "The manager will NOT enable UFW automatically."
+        echo
+        echo "  [1] Add managed IPsec rules and keep UFW disabled"
+        echo "  [2] Skip firewall changes"
+        echo "  [0] Cancel"
+        echo
+        local choice
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1) ;;
+            2) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    ufw_comment_exists "S2S Manager IKE" ||
+        ufw allow 500/udp comment 'S2S Manager IKE' >/dev/null
+
+    ufw_comment_exists "S2S Manager NAT-T" ||
+        ufw allow 4500/udp comment 'S2S Manager NAT-T' >/dev/null
+
+    ufw_comment_exists "S2S Manager ESP" ||
+        ufw allow to "${public_ip}" proto esp comment 'S2S Manager ESP' >/dev/null
+
+    ok "Managed IPsec firewall rules are present."
+}
+
+remove_managed_ufw_rules() {
+    ufw_installed || return 0
+
+    local numbers
+    numbers=$(
+        ufw status numbered 2>/dev/null |
+        awk '/S2S Manager (IKE|NAT-T|ESP)/ {
+            gsub(/\[|\]/,"",$1)
+            print $1
+        }' |
+        sort -rn
+    )
+
+    local n
+    while read -r n; do
+        [[ -n "${n}" ]] && yes | ufw delete "${n}" >/dev/null 2>&1 || true
+    done <<< "${numbers}"
+}
+
+# ==============================================================================
+# Generated system configuration
+# ==============================================================================
+
+render_strongswan_config() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    local psk
+    psk="$(read_psk "${name}")" || return 1
+
+    mkdir -p "${SWANCTL_DIR}"
+
+    cat > "$(managed_swan_file "${name}")" <<EOF
+connections {
+    ${MANAGED_PREFIX}-${NAME} {
+        version = 2
+        local_addrs = ${PUBLIC_IP}
+        remote_addrs = %any
+
+        proposals = aes256-sha256-modp2048
+
+        local {
+            auth = psk
+            id = ${PUBLIC_IP}
+        }
+
+        remote {
+            auth = psk
+            id = ${AUTH_ID}
+        }
+
+        children {
+            ${MANAGED_PREFIX}-${NAME} {
+                local_ts = 0.0.0.0/0
+                remote_ts = 0.0.0.0/0
+
+                esp_proposals = aes256-sha256-modp2048
+
+                mark_in = ${VTI_KEY}
+                mark_out = ${VTI_KEY}
+
+                start_action = none
+                dpd_action = restart
+            }
+        }
+
+        dpd_delay = 30s
+        reauth_time = 0s
+    }
+}
+
+secrets {
+    ike-${MANAGED_PREFIX}-${NAME} {
+        id-local = ${PUBLIC_IP}
+        id-remote = ${AUTH_ID}
+        secret = "${psk}"
+    }
+}
+EOF
+
+    chmod 600 "$(managed_swan_file "${name}")"
+}
+
+render_vti_script() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    local script
+    script="$(managed_vti_script "${name}")"
+
+    cat > "${script}" <<EOF
+#!/usr/bin/env bash
+set -e
+
+ip link show ${VTI_INTERFACE} >/dev/null 2>&1 || \\
+ip tunnel add ${VTI_INTERFACE} \\
+    local ${PUBLIC_IP} \\
+    remote 0.0.0.0 \\
+    mode vti \\
+    key ${VTI_KEY}
+
+ip link set ${VTI_INTERFACE} up
+
+ip addr show dev ${VTI_INTERFACE} | grep -q '${DEBIAN_VTI_IP}/30' || \\
+ip addr add ${DEBIAN_VTI_IP}/30 dev ${VTI_INTERFACE}
+
+ip route replace ${VTI_NETWORK} dev ${VTI_INTERFACE} table 220
+EOF
+
+    local route
+    while read -r route; do
+        [[ -n "${route}" ]] &&
+            printf 'ip route replace %s dev %s table 220\n' "${route}" "${VTI_INTERFACE}" >> "${script}"
+    done < <(read_routes "${name}")
+
+    cat >> "${script}" <<EOF
+
+sysctl -w net.ipv4.conf.${VTI_INTERFACE}.disable_policy=1 >/dev/null
+sysctl -w net.ipv4.conf.${VTI_INTERFACE}.rp_filter=0 >/dev/null
+EOF
+
+    chmod 755 "${script}"
+}
+
+render_systemd_service() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    cat > "$(managed_service_file "${name}")" <<EOF
+[Unit]
+Description=UniFi IPsec S2S VTI - ${NAME}
+After=network-online.target
+Wants=network-online.target
+Before=strongswan.service
+
+[Service]
+Type=oneshot
+ExecStart=$(managed_vti_script "${name}")
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+mark_tunnel_installed() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    save_tunnel \
+        "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"
+}
+
+mark_tunnel_defined() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    save_tunnel \
+        "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0"
+}
+
+install_tunnel_system_config() {
+    local name="$1"
+
+    preflight_ready || {
+        error "System prerequisites are not ready."
+        pause
+        return 1
+    }
+
+    load_tunnel "${name}" || return 1
+
+    section "INSTALLATION PLAN"
+
+    printf '%-28s %s\n' "Tunnel:" "${NAME}"
+    printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-28s %s\n' "VTI network:" "${VTI_NETWORK}"
+    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
+    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+
+    echo
+    echo "System changes:"
+    echo "  + managed strongSwan connection"
+    echo "  + managed VTI startup script"
+    echo "  + managed systemd VTI service"
+    echo "  + table 220 return routes"
+    echo "  + shared UFW IPsec rules (if UFW management is selected)"
+    echo
+
+    confirm_yes_no "Install this tunnel on the Debian system?" "N" || return
+
+    ensure_shared_firewall_rules "${PUBLIC_IP}" || {
+        error "Firewall step cancelled or failed."
+        pause
+        return 1
+    }
+
+    echo
+    section "INSTALLING TUNNEL"
+
+    printf '[1/6] Writing strongSwan configuration... '
+    render_strongswan_config "${name}" &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+
+    printf '[2/6] Writing VTI script... '
+    render_vti_script "${name}" &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+
+    printf '[3/6] Writing systemd service... '
+    render_systemd_service "${name}" &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+
+    printf '[4/6] Reloading systemd... '
+    systemctl daemon-reload &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+
+    printf '[5/6] Enabling / starting VTI service... '
+    if systemctl enable --now "$(managed_service_name "${name}")" >/tmp/s2s-manager-vti.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-vti.log
+        pause
+        return 1
+    fi
+
+    printf '[6/6] Loading strongSwan configuration... '
+    if swanctl --load-all >/tmp/s2s-manager-swanctl.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-swanctl.log
+        pause
+        return 1
+    fi
+
+    mark_tunnel_installed "${name}"
+
+    echo
+    ok "Tunnel '${name}' is installed on Debian."
+    info "The IPsec SA will remain waiting until the UniFi side is configured."
+    pause
+}
+
+remove_tunnel_system_config() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    warn "This will remove the managed system configuration for tunnel '${name}'."
+    echo
+    echo "It will remove:"
+    echo "  - $(managed_swan_file "${name}")"
+    echo "  - $(managed_vti_script "${name}")"
+    echo "  - $(managed_service_file "${name}")"
+    echo "  - ${VTI_INTERFACE} (if present)"
+    echo
+    echo "State / PSK files will be kept unless you delete the tunnel definition separately."
+    echo
+
+    confirm_yes_no "Remove installed tunnel configuration?" "N" || return
+
+    systemctl disable --now "$(managed_service_name "${name}")" >/dev/null 2>&1 || true
+    ip link del "${VTI_INTERFACE}" >/dev/null 2>&1 || true
+
+    rm -f \
+        "$(managed_swan_file "${name}")" \
+        "$(managed_vti_script "${name}")" \
+        "$(managed_service_file "${name}")"
+
+    systemctl daemon-reload
+    swanctl --load-all >/dev/null 2>&1 || true
+
+    mark_tunnel_defined "${name}"
+
+    if (( $(installed_tunnel_count) == 0 )) && ufw_installed; then
+        echo
+        warn "No other managed S2S tunnels are installed."
+        if confirm_yes_no "Remove shared S2S Manager UFW rules?" "Y"; then
+            remove_managed_ufw_rules
+            ok "Managed UFW rules removed."
+        fi
+    fi
+
+    ok "Installed system configuration removed."
+    pause
+}
+
+installed_tunnel_count() {
+    local count=0 name
+    while read -r name; do
+        [[ -z "${name}" ]] && continue
+        load_tunnel "${name}" || continue
+        [[ "${INSTALLED}" == "1" ]] && ((count += 1))
+    done < <(list_tunnel_names)
+    printf '%d' "${count}"
+}
+
+# ==============================================================================
+# Create / edit state
+# ==============================================================================
+
+add_tunnel_definition() {
     banner
     section "ADD SITE-TO-SITE TUNNEL"
 
     local detected_ip
-    detected_ip=$(detect_public_ipv4)
+    detected_ip="$(detect_public_ipv4)"
+    [[ -n "${detected_ip}" ]] || detected_ip="0.0.0.0"
 
-    if [[ -n "${detected_ip}" ]]; then
-        ok "Detected Debian IPv4 address: ${detected_ip}"
-    else
-        warn "Could not automatically detect the Debian IPv4 address."
-        detected_ip="0.0.0.0"
-    fi
-
-    local tunnel_number
+    local tunnel_number suggested_name
     tunnel_number=$(( $(tunnel_count) + 1 ))
-
-    local suggested_name="home"
-
-    if (( tunnel_number > 1 )); then
-        suggested_name="s2s-${tunnel_number}"
-    fi
+    suggested_name="home"
+    (( tunnel_number > 1 )) && suggested_name="s2s-${tunnel_number}"
 
     section "STEP 1/6  Tunnel Name"
     prompt_tunnel_name "${suggested_name}"
@@ -1004,37 +1389,30 @@ add_tunnel() {
     local public_ip="${PROMPT_RESULT}"
 
     section "STEP 3/6  Site-to-Site Tunnel Network"
-
     local suggested_network
-    suggested_network=$(next_vti_network)
-
+    suggested_network="$(next_vti_network)"
     prompt_tunnel_network "${suggested_network}" || return
 
-    local vti_network="${PROMPT_NETWORK}"
-    local debian_vti_ip="${PROMPT_DEBIAN_IP}"
-    local unifi_vti_ip="${PROMPT_UNIFI_IP}"
+    local network="${PROMPT_NETWORK}"
+    local debian_ip="${PROMPT_DEBIAN_IP}"
+    local unifi_ip="${PROMPT_UNIFI_IP}"
 
     section "STEP 4/6  UniFi Authentication ID"
-
-    local suggested_auth="unifi-${name}"
-    prompt_auth_id "${suggested_auth}"
+    prompt_auth_id "unifi-${name}"
     local auth_id="${PROMPT_RESULT}"
 
     section "STEP 5/6  Remote Networks"
-
     prompt_remote_networks
-    local -a remote_networks=("${PROMPT_ROUTES[@]:-}")
+    local -a routes=("${PROMPT_ROUTES[@]:-}")
 
     section "STEP 6/6  Pre-Shared Key"
-
     prompt_psk
     local psk="${PROMPT_PSK}"
 
-    local interface_index
-    interface_index=$(next_interface_index)
-
-    local interface="ipsec${interface_index}"
-    local key=$((42 + interface_index))
+    local idx interface key
+    idx="$(next_interface_index)"
+    interface="ipsec${idx}"
+    key=$((DEFAULT_VTI_KEY + idx))
 
     section "CONFIGURATION SUMMARY"
 
@@ -1043,149 +1421,84 @@ add_tunnel() {
     printf '%-28s %s\n' "Authentication ID:" "${auth_id}"
     printf '%-28s %s\n' "VTI interface:" "${interface}"
     printf '%-28s %s\n' "VTI key / mark:" "${key}"
-    printf '%-28s %s\n' "Tunnel network:" "${vti_network}"
-    printf '%-28s %s\n' "Debian VTI IP:" "${debian_vti_ip}"
-    printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_vti_ip}"
+    printf '%-28s %s\n' "Tunnel network:" "${network}"
+    printf '%-28s %s\n' "Debian VTI IP:" "${debian_ip}"
+    printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_ip}"
 
     echo
     echo "Remote networks:"
-
-    if (( ${#remote_networks[@]} == 0 )); then
+    if (( ${#routes[@]} == 0 )); then
         echo "  None"
     else
-        local route
-
-        for route in "${remote_networks[@]}"; do
-            printf '  • %s\n' "${route}"
-        done
+        local r
+        for r in "${routes[@]}"; do printf '  • %s\n' "${r}"; done
     fi
 
     echo
-    echo "No system configuration will be changed."
-    echo "Only test state files will be written."
-    printf 'State directory: %s\n' "${STATE_DIR}"
+    confirm_yes_no "Save tunnel definition?" "N" || return
+
+    save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}" \
+        "${network}" "${debian_ip}" "${unifi_ip}" "0"
+    write_routes "${name}" "${routes[@]:-}"
+    save_psk "${name}" "${psk}"
+
+    ok "Tunnel definition saved."
+
     echo
+    if preflight_ready; then
+        if confirm_yes_no "Install this tunnel on Debian now?" "N"; then
+            install_tunnel_system_config "${name}"
+            return
+        fi
+    else
+        warn "System prerequisites are not ready, so the tunnel definition was saved only."
+    fi
 
-    while :; do
-        echo "  [y] Save this configuration"
-        echo "  [n] Cancel"
-        echo
-
-        read -r -p "Save configuration? [y/N]: " confirm
-
-        case "${confirm}" in
-            y|Y)
-                save_tunnel \
-                    "${name}" \
-                    "${public_ip}" \
-                    "${auth_id}" \
-                    "${interface}" \
-                    "${key}" \
-                    "${vti_network}" \
-                    "${debian_vti_ip}" \
-                    "${unifi_vti_ip}"
-
-                write_routes "${name}" "${remote_networks[@]:-}"
-                save_psk "${name}" "${psk}"
-
-                echo
-                ok "Configuration saved."
-                echo
-                echo "Files:"
-                echo "  $(tunnel_config_file "${name}")"
-                echo "  $(tunnel_route_file "${name}")"
-                echo "  $(tunnel_secret_file "${name}")"
-
-                pause
-                return
-                ;;
-            n|N|"")
-                warn "Configuration was not saved."
-                pause
-                return
-                ;;
-            *)
-                error "Invalid selection."
-                ;;
-        esac
-    done
+    pause
 }
-
-# ==============================================================================
-# Remote networks
-# ==============================================================================
 
 add_remote_network() {
     banner
     section "ADD REMOTE NETWORK"
-
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
 
-    echo
+    if [[ "${INSTALLED}" == "1" ]]; then
+        warn "Tunnel is currently installed."
+        info "In this test build, remove/reinstall the system tunnel after changing routes."
+        echo
+    fi
+
     echo "Current remote networks:"
-
-    local existing_count=0
-    local route
-
+    local route count=0
     while read -r route; do
         [[ -z "${route}" ]] && continue
         printf '  • %s\n' "${route}"
-        ((existing_count += 1))
+        ((count += 1))
     done < <(read_routes "${name}")
-
-    if (( existing_count == 0 )); then
-        echo "  None"
-    fi
+    (( count == 0 )) && echo "  None"
 
     echo
-    echo "Enter a network in CIDR notation."
-    echo
-    echo "Example:"
-    echo "  192.168.50.0/24"
-    echo
+    echo "Enter a CIDR network, e.g. 192.168.50.0/24"
     echo "Press ENTER or type B to go back."
     echo
 
+    local new_route
     while :; do
-        local new_route
-
         read -r -p "New remote network: " new_route
+        case "${new_route}" in ""|b|B) return ;; esac
 
-        case "${new_route}" in
-            ""|b|B)
-                return
-                ;;
-        esac
+        valid_cidr "${new_route}" || { error "Invalid CIDR network."; echo; continue; }
+        read_routes "${name}" | grep -Fxq "${new_route}" &&
+            { warn "Network already configured."; echo; continue; }
 
-        if ! valid_cidr "${new_route}"; then
-            error "Invalid CIDR network."
-            echo
-            continue
-        fi
-
-        if read_routes "${name}" | grep -Fxq "${new_route}"; then
-            warn "This route already exists."
-            echo
-            continue
-        fi
-
-        echo
-        echo "Changes to apply:"
-        printf '  + %s\n' "${new_route}"
-        echo
-        echo "TEST MODE: only the state file will be updated."
-        echo
-
-        read -r -p "Apply change? [y/N]: " confirm
-
-        if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-            printf '%s\n' "${new_route}" >> "$(tunnel_route_file "${name}")"
-            ok "Remote network added."
-            pause
-        fi
-
+        confirm_yes_no "Add ${new_route}?" "N" || return
+        printf '%s\n' "${new_route}" >> "$(tunnel_route_file "${name}")"
+        chmod 600 "$(tunnel_route_file "${name}")"
+        ok "Remote network added."
+        pause
         return
     done
 }
@@ -1193,68 +1506,42 @@ add_remote_network() {
 remove_remote_network() {
     banner
     section "REMOVE REMOTE NETWORK"
-
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+
+    if [[ "${INSTALLED}" == "1" ]]; then
+        warn "Tunnel is currently installed."
+        info "In this test build, remove/reinstall the system tunnel after changing routes."
+        echo
+    fi
+
     local -a routes=()
     local route
-
     while read -r route; do
         [[ -n "${route}" ]] && routes+=("${route}")
     done < <(read_routes "${name}")
 
-    if (( ${#routes[@]} == 0 )); then
-        warn "This tunnel has no remote networks."
-        pause
-        return
-    fi
+    (( ${#routes[@]} > 0 )) || { warn "No remote networks configured."; pause; return; }
 
-    echo
-
-    local i
-
+    local i selection
     for i in "${!routes[@]}"; do
         printf '  [%d] %s\n' "$((i + 1))" "${routes[$i]}"
     done
-
     echo
     echo "Press ENTER, B or 0 to go back."
-    echo
-
     read -r -p "Select network to remove: " selection
 
-    case "${selection}" in
-        ""|b|B|0)
-            return
-            ;;
-    esac
-
-    if [[ ! "${selection}" =~ ^[0-9]+$ ]] \
-        || (( selection < 1 || selection > ${#routes[@]} )); then
-        error "Invalid selection."
-        pause
-        return
-    fi
+    case "${selection}" in ""|b|B|0) return ;; esac
+    [[ "${selection}" =~ ^[0-9]+$ ]] || return
+    (( selection >= 1 && selection <= ${#routes[@]} )) || return
 
     local remove="${routes[$((selection - 1))]}"
-
-    echo
-    echo "Changes to apply:"
-    printf '  - %s\n' "${remove}"
-    echo
-    echo "TEST MODE: only the state file will be updated."
-    echo
-
-    read -r -p "Apply change? [y/N]: " confirm
-
-    if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
-        return
-    fi
+    confirm_yes_no "Remove ${remove}?" "N" || return
 
     local file
-    file=$(tunnel_route_file "${name}")
-
+    file="$(tunnel_route_file "${name}")"
     grep -Fxv "${remove}" "${file}" > "${file}.tmp" || true
     mv "${file}.tmp" "${file}"
     chmod 600 "${file}"
@@ -1263,249 +1550,88 @@ remove_remote_network() {
     pause
 }
 
-# ==============================================================================
-# Edit tunnel
-# ==============================================================================
-
-edit_tunnel() {
-    banner
-    section "EDIT TUNNEL"
-
-    select_tunnel || return
-
-    local tunnel="${SELECTED_TUNNEL}"
-
-    while :; do
-        load_tunnel "${tunnel}"
-
-        banner
-        show_tunnel_details "${tunnel}"
-
-        section "EDIT OPTIONS"
-
-        echo "  [1] Debian public IP"
-        echo "  [2] UniFi authentication ID"
-        echo "  [3] Tunnel network"
-        echo "  [4] Add remote network"
-        echo "  [5] Remove remote network"
-        echo "  [6] Generate new PSK"
-        echo "  [0] Back"
-        echo
-
-        read -r -p "Selection: " choice
-
-        case "${choice}" in
-            1)
-                section "EDIT DEBIAN PUBLIC IP"
-
-                prompt_public_ip "${PUBLIC_IP}"
-                local new_ip="${PROMPT_RESULT}"
-
-                echo
-                printf 'Current: %s\n' "${PUBLIC_IP}"
-                printf 'New:     %s\n' "${new_ip}"
-                echo
-
-                read -r -p "Apply change? [y/N]: " confirm
-
-                if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-                    save_tunnel \
-                        "${NAME}" \
-                        "${new_ip}" \
-                        "${AUTH_ID}" \
-                        "${VTI_INTERFACE}" \
-                        "${VTI_KEY}" \
-                        "${VTI_NETWORK}" \
-                        "${DEBIAN_VTI_IP}" \
-                        "${UNIFI_VTI_IP}"
-
-                    ok "Public IP updated."
-                    pause
-                fi
-                ;;
-            2)
-                section "EDIT AUTHENTICATION ID"
-
-                prompt_auth_id "${AUTH_ID}" "${NAME}"
-                local new_auth="${PROMPT_RESULT}"
-
-                echo
-                printf 'Current: %s\n' "${AUTH_ID}"
-                printf 'New:     %s\n' "${new_auth}"
-                echo
-
-                read -r -p "Apply change? [y/N]: " confirm
-
-                if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-                    save_tunnel \
-                        "${NAME}" \
-                        "${PUBLIC_IP}" \
-                        "${new_auth}" \
-                        "${VTI_INTERFACE}" \
-                        "${VTI_KEY}" \
-                        "${VTI_NETWORK}" \
-                        "${DEBIAN_VTI_IP}" \
-                        "${UNIFI_VTI_IP}"
-
-                    ok "Authentication ID updated."
-                    pause
-                fi
-                ;;
-            3)
-                section "EDIT TUNNEL NETWORK"
-
-                prompt_tunnel_network "${VTI_NETWORK}" "${NAME}" || continue
-
-                local new_net="${PROMPT_NETWORK}"
-                local new_debian="${PROMPT_DEBIAN_IP}"
-                local new_unifi="${PROMPT_UNIFI_IP}"
-
-                echo
-                printf '%-12s %-20s -> %s\n' \
-                    "Network:" "${VTI_NETWORK}" "${new_net}"
-                printf '%-12s %-20s -> %s\n' \
-                    "Debian:" "${DEBIAN_VTI_IP}" "${new_debian}"
-                printf '%-12s %-20s -> %s\n' \
-                    "UniFi:" "${UNIFI_VTI_IP}" "${new_unifi}"
-                echo
-
-                read -r -p "Apply change? [y/N]: " confirm
-
-                if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-                    save_tunnel \
-                        "${NAME}" \
-                        "${PUBLIC_IP}" \
-                        "${AUTH_ID}" \
-                        "${VTI_INTERFACE}" \
-                        "${VTI_KEY}" \
-                        "${new_net}" \
-                        "${new_debian}" \
-                        "${new_unifi}"
-
-                    ok "Tunnel network updated."
-                    pause
-                fi
-                ;;
-            4)
-                add_remote_network
-                ;;
-            5)
-                remove_remote_network
-                ;;
-            6)
-                section "GENERATE NEW PSK"
-
-                local new_psk
-
-                if ! new_psk=$(generate_psk); then
-                    error "OpenSSL is not available."
-                    pause
-                    continue
-                fi
-
-                warn "This will replace the stored PSK for tunnel '${NAME}'."
-                echo
-
-                read -r -p "Generate and save a new PSK? [y/N]: " confirm
-
-                if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-                    save_psk "${NAME}" "${new_psk}"
-                    ok "New PSK generated and stored."
-                    pause
-                fi
-                ;;
-            0|"")
-                return
-                ;;
-            *)
-                error "Invalid selection."
-                pause
-                ;;
-        esac
-    done
-}
-
-# ==============================================================================
-# Delete tunnel
-# ==============================================================================
-
-delete_tunnel() {
+delete_tunnel_definition() {
     banner
     section "DELETE TUNNEL"
-
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
 
-    show_tunnel_details "${name}"
-
-    echo
-    printf '%b\n' "${C_RED}${C_BOLD}This deletes only TEST STATE FILES.${C_RESET}"
-    echo
-    echo "No networking or system configuration will be changed."
-    echo
-    echo "Files to delete:"
-    echo "  $(tunnel_config_file "${name}")"
-    echo "  $(tunnel_route_file "${name}")"
-    echo "  $(tunnel_secret_file "${name}")"
-    echo
-
-    read -r -p "Delete tunnel '${name}'? Type DELETE to confirm: " confirm
-
-    if [[ "${confirm}" != "DELETE" ]]; then
+    if [[ "${INSTALLED}" == "1" ]]; then
+        error "Tunnel is currently installed."
+        echo "Remove its installed system configuration first."
+        pause
         return
     fi
+
+    echo "Tunnel: ${name}"
+    echo
+    echo "This removes its state and PSK files."
+    echo
+    read -r -p "Type DELETE to confirm: " confirm
+    [[ "${confirm}" == "DELETE" ]] || return
 
     rm -f \
         "$(tunnel_config_file "${name}")" \
         "$(tunnel_route_file "${name}")" \
         "$(tunnel_secret_file "${name}")"
 
-    ok "Tunnel '${name}' deleted from test state."
+    ok "Tunnel definition deleted."
     pause
 }
 
 # ==============================================================================
-# Standard configuration view
+# Configuration views
 # ==============================================================================
 
-show_configuration_menu() {
-    banner
-    section "SHOW CONFIGURATION"
+show_tunnel_details() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
 
-    select_tunnel || return
+    section "Tunnel configuration: ${name}"
 
-    show_tunnel_details "${SELECTED_TUNNEL}"
+    printf '%-28s %s\n' "Name:" "${NAME}"
+    printf '%-28s %s\n' "State:" "$([[ "${INSTALLED}" == "1" ]] && echo INSTALLED || echo DEFINED)"
+    printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
+    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-28s %s\n' "VTI key / mark:" "${VTI_KEY}"
+    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
+    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
 
     echo
-    echo "Stored test files:"
-    echo "  $(tunnel_config_file "${SELECTED_TUNNEL}")"
-    echo "  $(tunnel_route_file "${SELECTED_TUNNEL}")"
-    echo "  $(tunnel_secret_file "${SELECTED_TUNNEL}")"
-
-    pause
+    echo "Remote networks:"
+    local r count=0
+    while read -r r; do
+        [[ -z "${r}" ]] && continue
+        printf '  • %s\n' "${r}"
+        ((count += 1))
+    done < <(read_routes "${name}")
+    (( count == 0 )) && echo "  None"
 }
 
-# ==============================================================================
-# UniFi configuration view
-# ==============================================================================
+show_configuration() {
+    banner
+    section "SHOW TUNNEL CONFIGURATION"
+    select_tunnel || return
+    show_tunnel_details "${SELECTED_TUNNEL}"
+    pause
+}
 
 print_unifi_config() {
     local name="$1"
     local show_psk="${2:-0}"
-    local psk_display="••••••••••••••••••••••••••••••••••••••••"
-
     load_tunnel "${name}" || return 1
 
+    local psk_display="••••••••••••••••••••••••••••••••••••••••"
     if (( show_psk == 1 )); then
-        if ! psk_display=$(read_psk "${name}"); then
-            psk_display="[PSK file not found]"
-        fi
+        psk_display="$(read_psk "${name}" 2>/dev/null || echo '[PSK file not found]')"
     fi
 
     banner
-
-    printf '%b\n' "${C_CYAN}${C_BOLD}"
+    printf '%b' "${C_CYAN}${C_BOLD}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     printf '║  %-58s║\n' "UniFi Site-to-Site Configuration"
     printf '║  %-58s║\n' "${NAME}"
@@ -1513,18 +1639,15 @@ print_unifi_config() {
     printf '%b' "${C_RESET}"
 
     section "VPN"
-
     printf '%-32s %s\n' "VPN Type:" "IPsec"
     printf '%-32s %s\n' "Name:" "${NAME}"
     printf '%-32s %s\n' "Pre-Shared Key:" "${psk_display}"
 
     section "CONNECTION"
-
     printf '%-32s %s\n' "Local IP:" "Select UniFi WAN interface"
     printf '%-32s %s\n' "Remote IP / Hostname:" "${PUBLIC_IP}"
 
     section "NETWORK CONFIGURATION"
-
     printf '%-32s %s\n' "VPN Method:" "Route Based"
     printf '%-32s %s\n' "Tunnel IP:" "Enabled"
     printf '%-32s %s\n' "IPv4 Address:" "${UNIFI_VTI_IP}"
@@ -1532,33 +1655,18 @@ print_unifi_config() {
     printf '%-32s %s\n' "Remote Subnets:" "None"
 
     section "ADVANCED"
-
     printf '%-32s %s\n' "Mode:" "Manual"
     printf '%-32s %s\n' "Key Exchange Version:" "IKEv2"
 
     echo
     printf '%b\n' "${C_BOLD}IKE${C_RESET}"
-    echo
-
-    printf '%-28s %-20s %-28s %s\n' \
-        "Encryption:" "AES-256" \
-        "Hash:" "SHA256"
-
-    printf '%-28s %-20s %-28s %s\n' \
-        "DH Group:" "14" \
-        "Lifetime:" "28800"
+    printf '%-24s %-18s %-24s %s\n' "Encryption:" "AES-256" "Hash:" "SHA256"
+    printf '%-24s %-18s %-24s %s\n' "DH Group:" "14" "Lifetime:" "28800"
 
     echo
     printf '%b\n' "${C_BOLD}ESP${C_RESET}"
-    echo
-
-    printf '%-28s %-20s %-28s %s\n' \
-        "Encryption:" "AES-256" \
-        "Hash:" "SHA256"
-
-    printf '%-28s %-20s %-28s %s\n' \
-        "DH Group:" "14" \
-        "Lifetime:" "3600"
+    printf '%-24s %-18s %-24s %s\n' "Encryption:" "AES-256" "Hash:" "SHA256"
+    printf '%-24s %-18s %-24s %s\n' "DH Group:" "14" "Lifetime:" "3600"
 
     echo
     printf '%-32s %s\n' "Perfect Forward Secrecy:" "Enabled"
@@ -1566,22 +1674,19 @@ print_unifi_config() {
     printf '%-32s %s\n' "Remote Authentication ID:" "${PUBLIC_IP}"
     printf '%-32s %s\n' "Maximum Transmission Unit:" "Auto"
     printf '%-32s %s\n' "Maximum Segment Size:" "Auto"
-
     echo
 }
 
 show_unifi_configuration() {
     banner
     section "SHOW UNIFI CONFIGURATION"
-
     select_tunnel || return
 
     local tunnel="${SELECTED_TUNNEL}"
-    local show_psk=0
+    local show_psk=0 choice
 
     while :; do
         print_unifi_config "${tunnel}" "${show_psk}"
-
         line
 
         if (( show_psk == 0 )); then
@@ -1589,42 +1694,119 @@ show_unifi_configuration() {
         else
             echo "  [1] Hide Pre-Shared Key"
         fi
-
         echo "  [0] Back"
         echo
 
         read -r -p "Selection: " choice
-
         case "${choice}" in
             1)
                 if (( show_psk == 0 )); then
-                    echo
                     warn "The Pre-Shared Key is sensitive information."
-                    echo
-
-                    read -r -p "Show PSK? [y/N]: " confirm
-
-                    if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-                        show_psk=1
-                    fi
+                    confirm_yes_no "Show PSK?" "N" && show_psk=1
                 else
                     show_psk=0
                 fi
                 ;;
-            0|""|b|B)
-                return
-                ;;
-            *)
-                error "Invalid selection."
-                sleep 1
-                ;;
+            0|""|b|B) return ;;
+            *) error "Invalid selection."; sleep 1 ;;
         esac
     done
 }
 
 # ==============================================================================
-# Main menu
+# Tunnel install/remove menu
 # ==============================================================================
+
+install_defined_tunnel() {
+    banner
+    section "INSTALL TUNNEL ON DEBIAN"
+    select_tunnel || return
+
+    load_tunnel "${SELECTED_TUNNEL}" || return
+    if [[ "${INSTALLED}" == "1" ]]; then
+        warn "This tunnel is already marked as installed."
+        pause
+        return
+    fi
+
+    install_tunnel_system_config "${SELECTED_TUNNEL}"
+}
+
+remove_installed_tunnel() {
+    banner
+    section "REMOVE INSTALLED TUNNEL"
+    select_tunnel || return
+
+    load_tunnel "${SELECTED_TUNNEL}" || return
+    if [[ "${INSTALLED}" != "1" ]]; then
+        warn "This tunnel is not installed."
+        pause
+        return
+    fi
+
+    remove_tunnel_system_config "${SELECTED_TUNNEL}"
+}
+
+show_system_status() {
+    banner
+    section "SYSTEM STATUS"
+
+    show_preflight || true
+
+    echo
+    section "MANAGED TUNNELS"
+    show_existing_tunnels
+
+    echo
+    section "STRONGSWAN"
+    if systemctl is-active --quiet strongswan 2>/dev/null; then
+        ok "strongSwan active"
+    else
+        warn "strongSwan not active"
+    fi
+
+    if command_available swanctl; then
+        echo
+        swanctl --list-sas 2>/dev/null || true
+    fi
+
+    echo
+    section "FIREWALL"
+    if ufw_installed; then
+        ufw status | grep -E 'S2S Manager|500/udp|4500/udp|esp' || true
+    else
+        warn "UFW not installed"
+    fi
+
+    pause
+}
+
+# ==============================================================================
+# Menus
+# ==============================================================================
+
+setup_required_menu() {
+    while ! preflight_ready; do
+        banner
+        show_preflight || true
+
+        section "SETUP REQUIRED"
+        echo "  [1] Install / repair prerequisites"
+        echo "  [2] Run pre-flight check again"
+        echo "  [0] Exit"
+        echo
+
+        local choice
+        read -r -p "Selection: " choice
+
+        case "${choice}" in
+            1) install_or_repair_prerequisites ;;
+            2) ;;
+            0) exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
 
 main_menu() {
     while :; do
@@ -1634,66 +1816,33 @@ main_menu() {
         show_existing_tunnels
 
         section "MENU"
-
         echo "  [1] Show tunnel configuration"
-        echo "  [2] Edit tunnel"
+        echo "  [2] Add S2S tunnel definition"
         echo "  [3] Add remote network"
         echo "  [4] Remove remote network"
-        echo "  [5] Add another S2S tunnel"
-        echo "  [6] Delete tunnel"
-        echo "  [7] Show test state directory"
+        echo "  [5] Install defined tunnel on Debian"
+        echo "  [6] Remove installed tunnel from Debian"
+        echo "  [7] Delete tunnel definition"
         echo "  [8] Show UniFi configuration"
+        echo "  [9] Show system status"
         echo "  [0] Exit"
         echo
 
+        local choice
         read -r -p "Selection: " choice
 
         case "${choice}" in
-            1)
-                show_configuration_menu
-                ;;
-            2)
-                edit_tunnel
-                ;;
-            3)
-                add_remote_network
-                ;;
-            4)
-                remove_remote_network
-                ;;
-            5)
-                add_tunnel
-                ;;
-            6)
-                delete_tunnel
-                ;;
-            7)
-                banner
-                section "TEST STATE DIRECTORY"
-
-                echo "${STATE_DIR}"
-                echo
-
-                find "${STATE_DIR}" \
-                    -maxdepth 3 \
-                    -type f \
-                    -printf '%p\n' |
-                    sort
-
-                pause
-                ;;
-            8)
-                show_unifi_configuration
-                ;;
-            0)
-                clear_screen
-                echo "Bye."
-                exit 0
-                ;;
-            *)
-                error "Invalid selection."
-                sleep 1
-                ;;
+            1) show_configuration ;;
+            2) add_tunnel_definition ;;
+            3) add_remote_network ;;
+            4) remove_remote_network ;;
+            5) install_defined_tunnel ;;
+            6) remove_installed_tunnel ;;
+            7) delete_tunnel_definition ;;
+            8) show_unifi_configuration ;;
+            9) show_system_status ;;
+            0) clear_screen; echo "Bye."; exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
         esac
     done
 }
@@ -1705,28 +1854,5 @@ main_menu() {
 ensure_root
 init_state_dirs
 
-if (( $(tunnel_count) == 0 )); then
-    banner
-
-    ok "Running as root"
-
-    detected_ip=$(detect_public_ipv4)
-
-    if [[ -n "${detected_ip}" ]]; then
-        ok "Detected Debian IPv4 address: ${detected_ip}"
-    else
-        warn "Could not detect Debian IPv4 address."
-    fi
-
-    echo
-    info "No existing S2S test configuration found."
-    echo
-    echo "The setup wizard will now create the first TEST configuration."
-    echo
-
-    read -r -p "Press ENTER to start..." _
-
-    add_tunnel
-fi
-
+setup_required_menu
 main_menu
