@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.3-test"
+VERSION="0.4-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -210,6 +210,11 @@ tpm_disabled() {
         /etc/strongswan.d/charon/tpm.conf 2>/dev/null
 }
 
+agent_disabled() {
+    grep -Eq '^[[:space:]]*load[[:space:]]*=[[:space:]]*no[[:space:]]*$' \
+        /etc/strongswan.d/charon/agent.conf 2>/dev/null
+}
+
 route_based_global_ready() {
     grep -Eq '^[[:space:]]*install_routes[[:space:]]*=[[:space:]]*no[[:space:]]*$' \
         /etc/strongswan.d/charon/route-based.conf 2>/dev/null
@@ -234,6 +239,7 @@ preflight_ready() {
     [[ -z "${missing}" ]] || return 1
 
     tpm_disabled || return 1
+    agent_disabled || return 1
     route_based_global_ready || return 1
 
     return 0
@@ -305,6 +311,13 @@ show_preflight() {
         ready=0
     fi
 
+    if agent_disabled; then
+        ok "Unused agent plugin disabled"
+    else
+        error "Agent plugin is not disabled by the manager"
+        ready=0
+    fi
+
     if route_based_global_ready; then
         ok "Route-based strongSwan mode prepared"
     else
@@ -365,6 +378,7 @@ install_or_repair_prerequisites() {
     echo
     echo "strongSwan:"
     echo "  + disable unused TPM plugin"
+    echo "  + disable unused agent plugin"
     echo "  + disable automatic strongSwan route installation"
     echo "  + restart strongSwan"
     echo
@@ -381,7 +395,7 @@ install_or_repair_prerequisites() {
     mapfile -t missing < <(missing_packages)
 
     if (( ${#missing[@]} > 0 )); then
-        printf '[1/4] Installing required packages... '
+        printf '[1/5] Installing required packages... '
         if apt-get update >/tmp/s2s-manager-apt-update.log 2>&1 &&
            DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" \
                >/tmp/s2s-manager-apt-install.log 2>&1; then
@@ -396,10 +410,10 @@ install_or_repair_prerequisites() {
             return 1
         fi
     else
-        printf '[1/4] Installing required packages... %b\n' "${C_GREEN}ALREADY OK${C_RESET}"
+        printf '[1/5] Installing required packages... %b\n' "${C_GREEN}ALREADY OK${C_RESET}"
     fi
 
-    printf '[2/4] Disabling unused TPM plugin... '
+    printf '[2/5] Disabling unused TPM plugin... '
     mkdir -p /etc/strongswan.d/charon
     cat > /etc/strongswan.d/charon/tpm.conf <<'EOF'
 tpm {
@@ -408,7 +422,15 @@ tpm {
 EOF
     printf '%b\n' "${C_GREEN}OK${C_RESET}"
 
-    printf '[3/4] Preparing route-based strongSwan mode... '
+    printf '[3/5] Disabling unused agent plugin... '
+    cat > /etc/strongswan.d/charon/agent.conf <<'EOF'
+agent {
+    load = no
+}
+EOF
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[4/5] Preparing route-based strongSwan mode... '
     cat > /etc/strongswan.d/charon/route-based.conf <<'EOF'
 charon {
     install_routes = no
@@ -416,7 +438,7 @@ charon {
 EOF
     printf '%b\n' "${C_GREEN}OK${C_RESET}"
 
-    printf '[4/4] Restarting and validating strongSwan... '
+    printf '[5/5] Restarting and validating strongSwan... '
     if systemctl restart strongswan >/tmp/s2s-manager-strongswan-restart.log 2>&1 &&
        systemctl is-active --quiet strongswan; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
@@ -1012,19 +1034,22 @@ ensure_shared_firewall_rules() {
     if ! ufw_installed; then
         warn "UFW is not installed."
         echo
-        echo "Choose:"
-        echo "  [1] Install UFW (do NOT enable it automatically)"
-        echo "  [2] Continue without firewall changes"
+        echo "The S2S Manager will NOT install or enable a firewall automatically."
+        echo
+        echo "Make sure your existing firewall or provider firewall allows:"
+        echo "  UDP 500    IKE"
+        echo "  UDP 4500   IPsec NAT-T"
+        echo
+        echo "This manager uses forced UDP encapsulation (ESP-in-UDP) for compatibility"
+        echo "with provider firewalls that cannot allow native ESP separately."
+        echo
+        echo "  [1] Continue without firewall management"
         echo "  [0] Cancel"
         echo
         local choice
         read -r -p "Selection: " choice
         case "${choice}" in
-            1)
-                apt-get update &&
-                DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
-                ;;
-            2) return 0 ;;
+            1) return 0 ;;
             *) return 1 ;;
         esac
     fi
@@ -1052,10 +1077,7 @@ ensure_shared_firewall_rules() {
     ufw_comment_exists "S2S Manager NAT-T" ||
         ufw allow 4500/udp comment 'S2S Manager NAT-T' >/dev/null
 
-    ufw_comment_exists "S2S Manager ESP" ||
-        ufw allow to "${public_ip}" proto esp comment 'S2S Manager ESP' >/dev/null
-
-    ok "Managed IPsec firewall rules are present."
+    ok "Managed IPsec firewall rules are present (UDP 500 / 4500)."
 }
 
 remove_managed_ufw_rules() {
@@ -1064,7 +1086,7 @@ remove_managed_ufw_rules() {
     local numbers
     numbers=$(
         ufw status numbered 2>/dev/null |
-        awk '/S2S Manager (IKE|NAT-T|ESP)/ {
+        awk '/S2S Manager (IKE|NAT-T)/ {
             gsub(/\[|\]/,"",$1)
             print $1
         }' |
@@ -1096,6 +1118,7 @@ connections {
         version = 2
         local_addrs = ${PUBLIC_IP}
         remote_addrs = %any
+        encap = yes
 
         proposals = aes256-sha256-modp2048
 
@@ -1248,7 +1271,7 @@ install_tunnel_system_config() {
     echo "  + managed VTI startup script"
     echo "  + managed systemd VTI service"
     echo "  + table 220 return routes"
-    echo "  + shared UFW IPsec rules (if UFW management is selected)"
+    echo "  + shared UFW IPsec rules for UDP 500 / 4500 (if UFW is available)"
     echo
 
     confirm_yes_no "Install this tunnel on the Debian system?" "N" || return
