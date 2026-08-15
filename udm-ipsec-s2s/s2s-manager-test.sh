@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.6-test"
+VERSION="0.7-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1508,6 +1508,30 @@ installed_tunnel_count() {
 }
 
 
+tunnel_is_installed() {
+    local name="$1"
+
+    # Primary source: manager state.
+    if load_tunnel "${name}" 2>/dev/null && [[ "${INSTALLED:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    # Fallbacks: detect an actually installed manager-owned tunnel even if
+    # the state flag is stale or was unexpectedly overwritten in memory.
+    if [[ -f "$(managed_swan_file "${name}")" ]] ||
+       [[ -f "$(managed_vti_script "${name}")" ]] ||
+       [[ -f "$(managed_service_file "${name}")" ]]; then
+        return 0
+    fi
+
+    if systemctl list-unit-files "$(managed_service_name "${name}")" 2>/dev/null |
+       grep -Fq "$(managed_service_name "${name}")"; then
+        return 0
+    fi
+
+    return 1
+}
+
 # ==============================================================================
 # Re-apply installed tunnel from saved state
 # ==============================================================================
@@ -1516,10 +1540,6 @@ reapply_installed_tunnel() {
     local name="$1"
 
     load_tunnel "${name}" || return 1
-
-    if [[ "${INSTALLED}" != "1" ]]; then
-        return 0
-    fi
 
     echo
     info "Tunnel '${name}' is currently installed."
@@ -1712,13 +1732,17 @@ add_remote_network() {
         chmod 600 "$(tunnel_route_file "${name}")"
 
         ok "Remote network added to manager state."
+        printf '  State file: %s\n' "$(tunnel_route_file "${name}")"
 
-        if [[ "${INSTALLED}" == "1" ]]; then
+        if tunnel_is_installed "${name}"; then
+            echo
             reapply_installed_tunnel "${name}" || {
                 error "State was updated, but re-applying the installed tunnel failed."
                 pause
                 return 1
             }
+        else
+            info "Tunnel is only defined, so no live system configuration needs updating."
         fi
 
         pause
@@ -1764,16 +1788,23 @@ remove_remote_network() {
     chmod 600 "${file}"
 
     ok "Remote network removed from manager state."
+    printf '  State file: %s\n' "$(tunnel_route_file "${name}")"
 
-    if [[ "${INSTALLED}" == "1" ]]; then
+    if tunnel_is_installed "${name}"; then
+        # Reload the tunnel state because tunnel_is_installed() may source it.
+        load_tunnel "${name}" || return 1
+
         # Remove the live route immediately if present, then regenerate from state.
         ip route del "${remove}" dev "${VTI_INTERFACE}" table 220 >/dev/null 2>&1 || true
 
+        echo
         reapply_installed_tunnel "${name}" || {
             error "State was updated, but re-applying the installed tunnel failed."
             pause
             return 1
         }
+    else
+        info "Tunnel is only defined, so no live system configuration needs updating."
     fi
 
     pause
