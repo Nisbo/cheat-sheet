@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.5-test"
+VERSION="0.6-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1507,6 +1507,80 @@ installed_tunnel_count() {
     printf '%d' "${count}"
 }
 
+
+# ==============================================================================
+# Re-apply installed tunnel from saved state
+# ==============================================================================
+
+reapply_installed_tunnel() {
+    local name="$1"
+
+    load_tunnel "${name}" || return 1
+
+    if [[ "${INSTALLED}" != "1" ]]; then
+        return 0
+    fi
+
+    echo
+    info "Tunnel '${name}' is currently installed."
+    echo "The saved configuration has changed."
+    echo
+    echo "The manager can re-apply the Debian-side configuration now."
+    echo "The existing PSK is kept unchanged."
+    echo "No UniFi-side settings need to be changed."
+    echo
+
+    confirm_yes_no "Apply the updated configuration now?" "Y" || {
+        warn "Change saved in manager state only."
+        info "The installed tunnel still uses the previous generated configuration."
+        return 0
+    }
+
+    section "RE-APPLYING TUNNEL"
+
+    printf '[1/6] Rewriting strongSwan configuration... '
+    render_strongswan_config "${name}" &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; return 1; }
+
+    printf '[2/6] Rewriting VTI script... '
+    render_vti_script "${name}" &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; return 1; }
+
+    printf '[3/6] Rewriting systemd service... '
+    render_systemd_service "${name}" &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; return 1; }
+
+    printf '[4/6] Reloading systemd... '
+    systemctl daemon-reload &&
+        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
+        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; return 1; }
+
+    printf '[5/6] Re-applying VTI and routes... '
+    if "$(managed_vti_script "${name}")" >/tmp/s2s-manager-reapply-vti.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-reapply-vti.log
+        return 1
+    fi
+
+    printf '[6/6] Reloading strongSwan configuration... '
+    if swanctl --load-all >/tmp/s2s-manager-reapply-swanctl.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-reapply-swanctl.log
+        return 1
+    fi
+
+    echo
+    ok "Updated configuration applied."
+    return 0
+}
+
 # ==============================================================================
 # Create / edit state
 # ==============================================================================
@@ -1609,12 +1683,6 @@ add_remote_network() {
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
 
-    if [[ "${INSTALLED}" == "1" ]]; then
-        warn "Tunnel is currently installed."
-        info "In this test build, remove/reinstall the system tunnel after changing routes."
-        echo
-    fi
-
     echo "Current remote networks:"
     local route count=0
     while read -r route; do
@@ -1639,9 +1707,20 @@ add_remote_network() {
             { warn "Network already configured."; echo; continue; }
 
         confirm_yes_no "Add ${new_route}?" "N" || return
+
         printf '%s\n' "${new_route}" >> "$(tunnel_route_file "${name}")"
         chmod 600 "$(tunnel_route_file "${name}")"
-        ok "Remote network added."
+
+        ok "Remote network added to manager state."
+
+        if [[ "${INSTALLED}" == "1" ]]; then
+            reapply_installed_tunnel "${name}" || {
+                error "State was updated, but re-applying the installed tunnel failed."
+                pause
+                return 1
+            }
+        fi
+
         pause
         return
     done
@@ -1654,12 +1733,6 @@ remove_remote_network() {
 
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
-
-    if [[ "${INSTALLED}" == "1" ]]; then
-        warn "Tunnel is currently installed."
-        info "In this test build, remove/reinstall the system tunnel after changing routes."
-        echo
-    fi
 
     local -a routes=()
     local route
@@ -1690,7 +1763,19 @@ remove_remote_network() {
     mv "${file}.tmp" "${file}"
     chmod 600 "${file}"
 
-    ok "Remote network removed."
+    ok "Remote network removed from manager state."
+
+    if [[ "${INSTALLED}" == "1" ]]; then
+        # Remove the live route immediately if present, then regenerate from state.
+        ip route del "${remove}" dev "${VTI_INTERFACE}" table 220 >/dev/null 2>&1 || true
+
+        reapply_installed_tunnel "${name}" || {
+            error "State was updated, but re-applying the installed tunnel failed."
+            pause
+            return 1
+        }
+    fi
+
     pause
 }
 
