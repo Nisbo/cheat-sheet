@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.4-test"
+VERSION="0.5-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -336,7 +336,9 @@ show_preflight() {
             warn "UFW installed but inactive"
         fi
     else
-        warn "UFW not installed"
+        info "Local UFW not installed (optional)"
+        echo "    External/provider firewall can be used instead."
+        echo "    Required for IPsec: UDP 500 and UDP 4500"
     fi
 
     echo
@@ -1030,39 +1032,159 @@ ufw_comment_exists() {
 
 ensure_shared_firewall_rules() {
     local public_ip="$1"
+    local choice ssh_port action proto port desc
 
     if ! ufw_installed; then
-        warn "UFW is not installed."
+        clear
+        banner
+        section "OPTIONAL UFW FIREWALL SETUP"
+
+        cat <<'EOF'
+UFW is currently not installed.
+
+UFW is NOT required for the S2S Manager.
+An external/provider firewall can be used instead.
+
+If UFW is installed and enabled, incoming connections that are not
+explicitly allowed may be blocked.
+
+IMPORTANT:
+Before enabling UFW, make sure every service you still need is allowed.
+
+Examples:
+  SSH             TCP 22
+  HTTP            TCP 80
+  HTTPS           TCP 443
+  IKE             UDP 500
+  IPsec NAT-T     UDP 4500
+
+Web servers, mail servers, VPN servers and other custom services are
+NOT opened automatically.
+EOF
+
+        ssh_port=""
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}")"
+        fi
+        if [[ -z "${ssh_port}" ]] && command_available sshd; then
+            ssh_port="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+        fi
+        [[ -n "${ssh_port}" ]] || ssh_port="22"
+
         echo
-        echo "The S2S Manager will NOT install or enable a firewall automatically."
+        echo "Detected SSH port: TCP ${ssh_port}"
         echo
-        echo "Make sure your existing firewall or provider firewall allows:"
-        echo "  UDP 500    IKE"
-        echo "  UDP 4500   IPsec NAT-T"
-        echo
-        echo "This manager uses forced UDP encapsulation (ESP-in-UDP) for compatibility"
-        echo "with provider firewalls that cannot allow native ESP separately."
-        echo
-        echo "  [1] Continue without firewall management"
+        echo "  [1] Install UFW and configure it safely"
+        echo "  [2] Continue without UFW"
         echo "  [0] Cancel"
         echo
-        local choice
         read -r -p "Selection: " choice
+
         case "${choice}" in
-            1) return 0 ;;
+            1)
+                apt-get update || return 1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
+
+                # SSH first: never offer ufw enable without protecting remote access.
+                ufw allow "${ssh_port}/tcp" comment 'S2S Manager SSH safety' >/dev/null || return 1
+                ufw allow 500/udp comment 'S2S Manager IKE' >/dev/null || return 1
+                ufw allow 4500/udp comment 'S2S Manager NAT-T' >/dev/null || return 1
+
+                while true; do
+                    clear
+                    banner
+                    section "UFW CONFIGURATION SUMMARY"
+                    echo "Mandatory rules prepared by the manager:"
+                    echo
+                    printf "  TCP %-8s SSH / current remote access\n" "${ssh_port}"
+                    printf "  UDP %-8s IPsec IKE\n" "500"
+                    printf "  UDP %-8s IPsec NAT-T\n" "4500"
+                    echo
+                    echo "Existing UFW rules are preserved."
+                    echo
+                    echo "WARNING:"
+                    echo "Other incoming ports may be blocked after UFW is enabled unless"
+                    echo "matching allow rules already exist or are added now."
+                    echo
+                    echo "  [1] Add additional firewall rule"
+                    echo "  [2] Review and continue"
+                    echo "  [0] Cancel (UFW remains disabled)"
+                    echo
+                    read -r -p "Selection: " action
+
+                    case "${action}" in
+                        1)
+                            echo
+                            read -r -p "Protocol [tcp]: " proto
+                            proto="${proto:-tcp}"
+                            proto="${proto,,}"
+                            if [[ "${proto}" != "tcp" && "${proto}" != "udp" ]]; then
+                                error "Protocol must be tcp or udp."
+                                pause
+                                continue
+                            fi
+                            read -r -p "Port: " port
+                            if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                                error "Port must be between 1 and 65535."
+                                pause
+                                continue
+                            fi
+                            read -r -p "Description [Additional service]: " desc
+                            desc="${desc:-Additional service}"
+                            ufw allow "${port}/${proto}" comment "S2S Manager ${desc}" >/dev/null || return 1
+                            ok "Added ${proto^^} ${port} (${desc})"
+                            pause
+                            ;;
+                        2) break ;;
+                        0) return 0 ;;
+                    esac
+                done
+
+                clear
+                banner
+                section "FINAL UFW SAFETY CHECK"
+                ufw status numbered || true
+                echo
+                echo "Current SSH access detected on TCP port ${ssh_port}."
+
+                if ufw status | grep -Eq "(^|[[:space:]])${ssh_port}/tcp[[:space:]]+ALLOW"; then
+                    ok "Matching SSH allow rule is present."
+                else
+                    error "No matching SSH allow rule found."
+                    echo "UFW will NOT be enabled."
+                    pause
+                    return 0
+                fi
+
+                echo
+                echo "Default incoming policy will be DENY when UFW is enabled."
+                echo "Review ALL required service ports above before continuing."
+                echo
+                read -r -p "Enable UFW now? [y/N]: " choice
+                if [[ "${choice,,}" == "y" ]]; then
+                    ufw default deny incoming >/dev/null
+                    ufw default allow outgoing >/dev/null
+                    ufw --force enable >/dev/null || return 1
+                    ok "UFW enabled."
+                else
+                    info "UFW installed and rules prepared, but UFW was NOT enabled."
+                fi
+                return 0
+                ;;
+            2) return 0 ;;
             *) return 1 ;;
         esac
     fi
 
+    # UFW already exists. Add only the IPsec rules; never change its enabled state.
     if ! ufw_active; then
-        warn "UFW is installed but inactive."
-        echo "The manager will NOT enable UFW automatically."
+        info "UFW is installed but inactive."
+        echo "The manager will not enable it automatically in this path."
         echo
         echo "  [1] Add managed IPsec rules and keep UFW disabled"
         echo "  [2] Skip firewall changes"
         echo "  [0] Cancel"
         echo
-        local choice
         read -r -p "Selection: " choice
         case "${choice}" in
             1) ;;
@@ -1073,7 +1195,6 @@ ensure_shared_firewall_rules() {
 
     ufw_comment_exists "S2S Manager IKE" ||
         ufw allow 500/udp comment 'S2S Manager IKE' >/dev/null
-
     ufw_comment_exists "S2S Manager NAT-T" ||
         ufw allow 4500/udp comment 'S2S Manager NAT-T' >/dev/null
 
@@ -1798,7 +1919,9 @@ show_system_status() {
     if ufw_installed; then
         ufw status | grep -E 'S2S Manager|500/udp|4500/udp|esp' || true
     else
-        warn "UFW not installed"
+        info "Local UFW not installed (optional)"
+        echo "External/provider firewall can be used instead."
+        echo "Required for IPsec: UDP 500 and UDP 4500"
     fi
 
     pause
