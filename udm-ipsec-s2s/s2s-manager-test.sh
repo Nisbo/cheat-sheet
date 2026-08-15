@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.7-test"
+VERSION="0.8-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -148,6 +148,18 @@ confirm_yes_no() {
 # ==============================================================================
 # Environment / package checks
 # ==============================================================================
+
+
+swanctl_clean() {
+    # Hide the known harmless swanctl agent-plugin warning on Debian 13.
+    # Keep all other stdout/stderr output intact.
+    "$@" 2>&1 | sed \
+        -e '/^agent plugin requires CAP_SETUID\/CAP_SETGID capability$/d' \
+        -e "/^plugin 'agent': failed to load - agent_plugin_create returned NULL$/d"
+    local rc=${PIPESTATUS[0]}
+    return "${rc}"
+}
+
 
 ensure_root() {
     if [[ "${EUID}" -ne 0 ]]; then
@@ -312,9 +324,9 @@ show_preflight() {
     fi
 
     if agent_disabled; then
-        ok "Unused agent plugin disabled"
+        ok "Unused agent plugin disabled for charon"
     else
-        error "Agent plugin is not disabled by the manager"
+        error "Agent plugin is not disabled for charon"
         ready=0
     fi
 
@@ -2027,7 +2039,7 @@ show_system_status() {
 
     if command_available swanctl; then
         echo
-        swanctl --list-sas 2>/dev/null || true
+        swanctl_clean swanctl --list-sas || true
     fi
 
     echo
@@ -2041,6 +2053,181 @@ show_system_status() {
     fi
 
     pause
+}
+
+
+# ==============================================================================
+# Tunnel diagnostics
+# ==============================================================================
+
+human_bytes() {
+    local bytes="${1:-0}"
+
+    if ! [[ "${bytes}" =~ ^[0-9]+$ ]]; then
+        printf '%s' "${bytes}"
+        return
+    fi
+
+    if (( bytes >= 1073741824 )); then
+        awk -v b="${bytes}" 'BEGIN { printf "%.2f GiB", b/1073741824 }'
+    elif (( bytes >= 1048576 )); then
+        awk -v b="${bytes}" 'BEGIN { printf "%.2f MiB", b/1048576 }'
+    elif (( bytes >= 1024 )); then
+        awk -v b="${bytes}" 'BEGIN { printf "%.2f KiB", b/1024 }'
+    else
+        printf '%s B' "${bytes}"
+    fi
+}
+
+get_tunnel_sa_output() {
+    local name="$1"
+    local conn="${MANAGED_PREFIX}-${name}"
+
+    swanctl_clean swanctl --list-sas 2>/dev/null | \
+        awk -v c="${conn}:" '
+            $0 ~ "^" c {show=1}
+            show {print}
+            show && /^[^[:space:]]/ && $0 !~ "^" c {exit}
+        '
+}
+
+show_tunnel_diagnostics() {
+    banner
+    section "TUNNEL DIAGNOSTICS"
+
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+
+    local service
+    service="$(managed_service_name "${name}")"
+
+    printf '%-28s %s\n' "Tunnel:" "${NAME}"
+    printf '%-28s %s\n' "Manager state:" "$([[ "${INSTALLED}" == "1" ]] && echo INSTALLED || echo DEFINED)"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
+    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+
+    echo
+    section "SERVICE / INTERFACE"
+
+    if systemctl is-active --quiet strongswan 2>/dev/null; then
+        ok "strongSwan: active"
+    else
+        error "strongSwan: inactive"
+    fi
+
+    if systemctl is-active --quiet "${service}" 2>/dev/null; then
+        ok "${service}: active"
+    else
+        warn "${service}: not active"
+    fi
+
+    if ip link show "${VTI_INTERFACE}" >/dev/null 2>&1; then
+        ok "${VTI_INTERFACE}: present"
+        local current_addr
+        current_addr="$(ip -4 -o addr show dev "${VTI_INTERFACE}" 2>/dev/null | awk '{print $4}' | head -1)"
+        printf '%-28s %s\n' "Current VTI address:" "${current_addr:-none}"
+    else
+        error "${VTI_INTERFACE}: missing"
+    fi
+
+    echo
+    section "ROUTING"
+
+    local route
+    printf '%-28s %s\n' "Table:" "220"
+    while read -r route; do
+        [[ -z "${route}" ]] && continue
+        if ip route show table 220 | grep -Fq "${route} dev ${VTI_INTERFACE}"; then
+            ok "${route} -> ${VTI_INTERFACE}"
+        else
+            error "${route} is missing from table 220"
+        fi
+    done < <(printf '%s\n' "${VTI_NETWORK}"; read_routes "${name}")
+
+    echo
+    section "IPSEC STATUS"
+
+    local sa
+    sa="$(get_tunnel_sa_output "${name}")"
+
+    if [[ -z "${sa}" ]]; then
+        warn "No active IKE/CHILD SA found."
+        printf '%-28s %s\n' "Connection:" "NOT CONNECTED"
+    else
+        if grep -q 'ESTABLISHED' <<< "${sa}"; then
+            ok "IKE: ESTABLISHED"
+        else
+            warn "IKE: not established"
+        fi
+
+        if grep -q 'INSTALLED' <<< "${sa}"; then
+            ok "CHILD_SA: INSTALLED"
+        else
+            warn "CHILD_SA: not installed"
+        fi
+
+        if grep -q 'TUNNEL-in-UDP' <<< "${sa}"; then
+            ok "Transport: ESP-in-UDP / NAT-T"
+        elif grep -q 'TUNNEL' <<< "${sa}"; then
+            info "Transport: native ESP tunnel"
+        fi
+
+        local established
+        established="$(grep -m1 -oE 'established [0-9]+s ago' <<< "${sa}" || true)"
+        [[ -n "${established}" ]] && printf '%-28s %s\n' "Uptime:" "${established#established }"
+
+        local in_bytes out_bytes in_packets out_packets
+        in_bytes="$(awk '/^[[:space:]]+in[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="bytes,"){print $(i-1); exit}}' <<< "${sa}")"
+        out_bytes="$(awk '/^[[:space:]]+out[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="bytes,"){print $(i-1); exit}}' <<< "${sa}")"
+        in_packets="$(awk '/^[[:space:]]+in[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="packets"){print $(i-1); exit}}' <<< "${sa}")"
+        out_packets="$(awk '/^[[:space:]]+out[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="packets"){print $(i-1); exit}}' <<< "${sa}")"
+
+        [[ -n "${in_bytes}" ]] && printf '%-28s %s (%s packets)\n' "Traffic IN:" "$(human_bytes "${in_bytes}")" "${in_packets:-0}"
+        [[ -n "${out_bytes}" ]] && printf '%-28s %s (%s packets)\n' "Traffic OUT:" "$(human_bytes "${out_bytes}")" "${out_packets:-0}"
+    fi
+
+    echo
+    section "CONNECTIVITY TEST"
+
+    echo "The manager can ping the UniFi VTI address:"
+    echo "  ${UNIFI_VTI_IP}"
+    echo
+    echo "This does not test every remote LAN/VLAN host, but it verifies"
+    echo "basic traffic through the route-based IPsec tunnel."
+    echo
+
+    if confirm_yes_no "Run VTI ping test now?" "Y"; then
+        if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-diag-ping.log 2>&1; then
+            ok "Ping to ${UNIFI_VTI_IP}: SUCCESS"
+            tail -2 /tmp/s2s-manager-diag-ping.log
+        else
+            error "Ping to ${UNIFI_VTI_IP}: FAILED"
+            cat /tmp/s2s-manager-diag-ping.log
+        fi
+    fi
+
+    echo
+    section "RECENT STRONGSWAN LOGS"
+
+    echo "  [1] Show last 30 strongSwan log lines"
+    echo "  [0] Back"
+    echo
+    local choice
+    read -r -p "Selection: " choice
+
+    if [[ "${choice}" == "1" ]]; then
+        echo
+        journalctl -u strongswan -n 30 --no-pager |
+            sed \
+                -e '/agent plugin requires CAP_SETUID\/CAP_SETGID capability/d' \
+                -e "/plugin 'agent': failed to load - agent_plugin_create returned NULL/d"
+        pause
+    fi
 }
 
 # ==============================================================================
@@ -2086,7 +2273,8 @@ main_menu() {
         echo "  [6] Remove installed tunnel from Debian"
         echo "  [7] Delete tunnel definition"
         echo "  [8] Show UniFi configuration"
-        echo "  [9] Show system status"
+        echo "  [9] Tunnel diagnostics"
+        echo "  [10] Show system status"
         echo "  [0] Exit"
         echo
 
@@ -2102,7 +2290,8 @@ main_menu() {
             6) remove_installed_tunnel ;;
             7) delete_tunnel_definition ;;
             8) show_unifi_configuration ;;
-            9) show_system_status ;;
+            9) show_tunnel_diagnostics ;;
+            10) show_system_status ;;
             0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
