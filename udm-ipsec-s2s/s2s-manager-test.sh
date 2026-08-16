@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.11-test"
+VERSION="0.12-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -863,7 +863,8 @@ select_tunnel() {
         printf '  [%d] %s\n' "$((i + 1))" "${names[$i]}"
     done
     echo
-    echo "Press ENTER, B or 0 to go back."
+    echo "Enter tunnel number and press ENTER."
+    echo "B = Back    E = Exit"
     echo
     read -r -p "Selection: " selection
 
@@ -967,7 +968,8 @@ prompt_tunnel_network() {
             read -r -p "Selection: " choice
             case "${choice}" in
                 1) value="${value%%/*}/30"; normalized="$(normalize_30_network "${value}")" || continue ;;
-                0) return 1 ;;
+                [bB]|0) return 1 ;;
+            [eE]) clear_screen; echo "Bye."; exit 0 ;;
                 *) continue ;;
             esac
         fi
@@ -1203,7 +1205,8 @@ EOF
                             pause
                             ;;
                         2) break ;;
-                        0) return 0 ;;
+                        [bB]|0) return 0 ;;
+            [eE]) clear_screen; echo "Bye."; exit 0 ;;
                     esac
                 done
 
@@ -1838,7 +1841,8 @@ remove_remote_network() {
         printf '  [%d] %s\n' "$((i + 1))" "${routes[$i]}"
     done
     echo
-    echo "Press ENTER, B or 0 to go back."
+    echo "Enter tunnel number and press ENTER."
+    echo "B = Back    E = Exit"
     read -r -p "Select network to remove: " selection
 
     case "${selection}" in ""|b|B|0) return ;; esac
@@ -2021,7 +2025,8 @@ show_unifi_configuration() {
         else
             echo "  [1] Hide Pre-Shared Key"
         fi
-        echo "  [0] Back"
+        echo "  [B] Back"
+        echo "  [E] Exit"
         echo
 
         read -r -p "Selection: " choice
@@ -2371,7 +2376,6 @@ show_tunnel_diagnostics() {
         echo
         echo "  [B] Back"
         echo "  [E] Exit"
-        echo "  [0] Back"
         echo
 
         local choice connected_since_epoch now_epoch connected_for_seconds
@@ -2451,7 +2455,7 @@ setup_required_menu() {
         section "SETUP REQUIRED"
         echo "  [1] Install / repair prerequisites"
         echo "  [2] Run pre-flight check again"
-        echo "  [0] Exit"
+        echo "  [E] Exit"
         echo
 
         local choice
@@ -2484,7 +2488,7 @@ main_menu() {
         echo "  [8] Show UniFi configuration"
         echo "  [9] Tunnel diagnostics"
         echo "  [10] Show system status"
-        echo "  [0] Exit"
+        echo "  [E] Exit"
         echo
 
         local choice
@@ -2501,7 +2505,7 @@ main_menu() {
             8) show_unifi_configuration ;;
             9) show_tunnel_diagnostics ;;
             10) show_system_status ;;
-            0) clear_screen; echo "Bye."; exit 0 ;;
+            [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
     done
