@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.21-test"
+VERSION="0.22-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -897,6 +897,19 @@ tunnel_connection_state() {
 # Tunnel list / selection
 # ==============================================================================
 
+truncate_table_value() {
+    local value="$1"
+    local width="$2"
+
+    if (( ${#value} <= width )); then
+        printf '%s' "${value}"
+    elif (( width > 3 )); then
+        printf '%s...' "${value:0:$((width - 3))}"
+    else
+        printf '%.*s' "${width}" "${value}"
+    fi
+}
+
 show_existing_tunnels() {
     local count
     count="$(tunnel_count)"
@@ -906,12 +919,15 @@ show_existing_tunnels() {
         return
     fi
 
-    printf '%-4s %-16s %-10s %-20s %-22s %-14s %-24s\n' \
-        "#" "Name" "Interface" "Tunnel Network" "Management" "Connection" "Authentication ID"
-    printf '%-4s %-16s %-10s %-20s %-22s %-14s %-24s\n' \
-        "──" "────────────────" "──────────" "────────────────────" "──────────────────────" "──────────────" "────────────────────────"
+    local name_width=20
+    local auth_width=24
 
-    local index=1 name management connection
+    printf '%-4s %-20s %-10s %-20s %-22s %-14s %-24s\n' \
+        "#" "Name" "Interface" "Tunnel Network" "Management" "Connection" "Authentication ID"
+    printf '%-4s %-20s %-10s %-20s %-22s %-14s %-24s\n' \
+        "──" "────────────────────" "──────────" "────────────────────" "──────────────────────" "──────────────" "────────────────────────"
+
+    local index=1 name management connection display_name display_auth
     while read -r name; do
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
@@ -927,8 +943,11 @@ show_existing_tunnels() {
             connection="-"
         fi
 
-        printf '%-4s %-16s %-10s %-20s %-22s ' \
-            "${index}" "${NAME}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${management}"
+        display_name="$(truncate_table_value "${NAME}" "${name_width}")"
+        display_auth="$(truncate_table_value "${AUTH_ID}" "${auth_width}")"
+
+        printf '%-4s %-20s %-10s %-20s %-22s ' \
+            "${index}" "${display_name}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${management}"
 
         case "${connection}" in
             CONNECTED)
@@ -942,7 +961,7 @@ show_existing_tunnels() {
                 ;;
         esac
 
-        printf '%-24s\n' "${AUTH_ID}"
+        printf '%-24s\n' "${display_auth}"
         ((index += 1))
     done < <(list_tunnel_names)
 }
@@ -988,6 +1007,9 @@ prompt_tunnel_name() {
     while :; do
         echo "The tunnel name is used locally by the S2S Manager."
         echo "Examples: home, office, backup"
+        echo
+        echo "Long names are allowed. Overview tables shorten long values for display only."
+        echo "The complete tunnel name is always stored and used internally."
         echo
         echo "Press ENTER to accept the suggested value or enter another value."
         echo
