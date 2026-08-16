@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.16-test"
+VERSION="0.17-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -879,29 +879,29 @@ show_existing_tunnels() {
         return
     fi
 
-    printf '%-4s %-16s %-10s %-20s %-12s %-14s %-24s\n' \
-        "#" "Name" "Interface" "Tunnel Network" "State" "Connection" "Authentication ID"
-    printf '%-4s %-16s %-10s %-20s %-12s %-14s %-24s\n' \
-        "──" "────────────────" "──────────" "────────────────────" "────────────" "──────────────" "────────────────────────"
+    printf '%-4s %-16s %-10s %-20s %-22s %-14s %-24s\n' \
+        "#" "Name" "Interface" "Tunnel Network" "Management" "Connection" "Authentication ID"
+    printf '%-4s %-16s %-10s %-20s %-22s %-14s %-24s\n' \
+        "──" "────────────────" "──────────" "────────────────────" "──────────────────────" "──────────────" "────────────────────────"
 
-    local index=1 name state connection
+    local index=1 name management connection
     while read -r name; do
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
 
         if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
-            state="IMPORTED"
+            management="IMPORTED / READ-ONLY"
             connection="$(tunnel_connection_state "${NAME}")"
         elif [[ "${INSTALLED}" == "1" ]]; then
-            state="INSTALLED"
+            management="MANAGED"
             connection="$(tunnel_connection_state "${NAME}")"
         else
-            state="DEFINED"
+            management="DEFINED / MANAGED"
             connection="-"
         fi
 
-        printf '%-4s %-16s %-10s %-20s %-12s ' \
-            "${index}" "${NAME}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${state}"
+        printf '%-4s %-16s %-10s %-20s %-22s ' \
+            "${index}" "${NAME}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${management}"
 
         case "${connection}" in
             CONNECTED)
@@ -2661,7 +2661,7 @@ delete_tunnel_definition() {
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
 
-    if [[ "${INSTALLED}" == "1" ]]; then
+    if [[ "${MANAGEMENT}" != "IMPORTED" && "${INSTALLED}" == "1" ]]; then
         error "Tunnel is currently installed."
         echo "Remove its installed system configuration first."
         pause
@@ -2670,7 +2670,12 @@ delete_tunnel_definition() {
 
     echo "Tunnel: ${name}"
     echo
-    echo "This removes its state and PSK files."
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        echo "This removes ONLY the imported S2S Manager state and copied PSK."
+        echo "The external strongSwan, VTI and systemd configuration is NOT changed."
+    else
+        echo "This removes its state and PSK files."
+    fi
     echo
     read -r -p "Type DELETE to confirm: " confirm
     [[ "${confirm}" == "DELETE" ]] || return
@@ -2695,7 +2700,14 @@ show_tunnel_details() {
     section "Tunnel configuration: ${name}"
 
     printf '%-28s %s\n' "Name:" "${NAME}"
-    printf '%-28s %s\n' "State:" "$([[ "${INSTALLED}" == "1" ]] && echo INSTALLED || echo DEFINED)"
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        printf '%-28s %s\n' "Management:" "IMPORTED / READ-ONLY"
+        printf '%-28s %s\n' "Connection:" "$(tunnel_connection_state "${NAME}")"
+        printf '%-28s %s\n' "Source connection:" "${SOURCE_CONN_NAME}"
+    else
+        printf '%-28s %s\n' "Management:" "$([[ "${INSTALLED}" == "1" ]] && echo MANAGED || echo 'DEFINED / MANAGED')"
+        printf '%-28s %s\n' "Connection:" "$([[ "${INSTALLED}" == "1" ]] && tunnel_connection_state "${NAME}" || echo '-')"
+    fi
     printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
@@ -3053,8 +3065,7 @@ show_tunnel_diagnostics() {
     fi
 
     printf '%-28s %s\n' "Tunnel:" "${NAME}"
-    printf '%-28s %s\n' "Manager state:" "$([[ "${MANAGEMENT}" == "IMPORTED" ]] && echo IMPORTED || { [[ "${INSTALLED}" == "1" ]] && echo INSTALLED || echo DEFINED; })"
-    printf '%-28s %s\n' "Management:" "${MANAGEMENT}"
+    printf '%-28s %s\n' "Management:" "$([[ "${MANAGEMENT}" == "IMPORTED" ]] && echo 'IMPORTED / READ-ONLY' || { [[ "${INSTALLED}" == "1" ]] && echo MANAGED || echo 'DEFINED / MANAGED'; })"
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
     printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
