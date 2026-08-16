@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.18-test"
+VERSION="0.19-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -778,6 +778,32 @@ read_psk() {
     cat "${file}"
 }
 
+extract_psk_from_swan_file() {
+    local file="$1"
+    [[ -f "${file}" ]] || return 1
+
+    awk '
+        /^[[:space:]]*secret[[:space:]]*=/ {
+            v=$0
+            sub(/^[^=]*=[[:space:]]*/, "", v)
+            sub(/[[:space:]]*$/, "", v)
+            if (v ~ /^".*"$/) {
+                sub(/^"/, "", v)
+                sub(/"$/, "", v)
+            }
+            print v
+            exit
+        }
+    ' "${file}"
+}
+
+strongswan_escape_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "${value}"
+}
+
 generate_psk() {
     openssl rand -base64 32 | tr -d '\n'
 }
@@ -1382,16 +1408,18 @@ remove_managed_ufw_rules() {
 # Generated system configuration
 # ==============================================================================
 
-render_strongswan_config() {
+render_strongswan_config_to_file() {
     local name="$1"
+    local target="$2"
     load_tunnel "${name}" || return 1
 
-    local psk
+    local psk escaped_psk
     psk="$(read_psk "${name}")" || return 1
+    escaped_psk="$(strongswan_escape_string "${psk}")"
 
-    mkdir -p "${SWANCTL_DIR}"
+    mkdir -p "$(dirname "${target}")"
 
-    cat > "$(managed_swan_file "${name}")" <<EOF
+    cat > "${target}" <<EOF
 connections {
     ${MANAGED_PREFIX}-${NAME} {
         version = 2
@@ -1447,14 +1475,19 @@ secrets {
     ike-${MANAGED_PREFIX}-${NAME} {
         id-local = ${PUBLIC_IP}
         id-remote = ${AUTH_ID}
-        secret = "${psk}"
+        secret = "${escaped_psk}"
     }
 }
 EOF
 
-    chmod 600 "$(managed_swan_file "${name}")"
+    chmod 600 "${target}"
 }
 
+render_strongswan_config() {
+    local name="$1"
+    mkdir -p "${SWANCTL_DIR}"
+    render_strongswan_config_to_file "${name}" "$(managed_swan_file "${name}")"
+}
 render_vti_script() {
     local name="$1"
     load_tunnel "${name}" || return 1
@@ -2079,10 +2112,10 @@ parse_source_connection() {
     )"
 
     DISC_PSK="$(
-        awk -F= '
+        awk '
             /^[[:space:]]*secret[[:space:]]*=/ {
-                v=$2
-                sub(/^[[:space:]]*/, "", v)
+                v=$0
+                sub(/^[^=]*=[[:space:]]*/, "", v)
                 sub(/[[:space:]]*$/, "", v)
                 if (v ~ /^".*"$/) {
                     sub(/^"/, "", v)
@@ -2562,11 +2595,11 @@ takeover_imported_tunnel() {
     local old_vti_script="${SOURCE_VTI_SCRIPT}"
     local old_service="${SOURCE_SERVICE}"
     local old_forced_natt="${SOURCE_FORCED_NATT:-0}"
-    local psk
+    local source_psk
 
-    psk="$(read_psk "${name}" 2>/dev/null || true)"
-    if [[ -z "${psk}" ]]; then
-        error "The imported PSK is missing from the manager secret store."
+    source_psk="$(extract_psk_from_swan_file "${old_swan}" 2>/dev/null || true)"
+    if [[ -z "${source_psk}" ]]; then
+        error "The PSK could not be read from the original strongSwan configuration."
         echo "Take Over has been cancelled."
         pause
         return
@@ -2581,7 +2614,7 @@ takeover_imported_tunnel() {
     printf '%-30s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-30s %s\n' "Tunnel network:" "${VTI_NETWORK}"
     printf '%-30s %s\n' "Authentication ID:" "${AUTH_ID}"
-    printf '%-30s %s\n' "PSK:" "reuse existing imported PSK"
+    printf '%-30s %s\n' "PSK:" "reuse existing PSK from source config"
     echo
 
     echo "Existing external files:"
@@ -2609,32 +2642,41 @@ takeover_imported_tunnel() {
         echo
     fi
 
-    echo "Take Over will:"
-    echo "  1. Back up the detected external files."
-    echo "  2. Generate manager-owned strongSwan/VTI/systemd files."
-    echo "  3. Disable the old VTI systemd service."
-    echo "  4. Remove the old external files from their active locations."
-    echo "  5. Load the manager configuration."
-    echo "  6. Terminate the old IKE/CHILD SAs."
-    echo "  7. Wait up to 60 seconds for UniFi to reconnect."
-    echo "  8. Test VTI connectivity."
+    echo "Take Over will perform these exact 12 steps:"
+    echo "  1. Back up the original files."
+    echo "  2. Refresh the manager PSK from the original strongSwan config."
+    echo "  3. Build a staged manager strongSwan config."
+    echo "  4. Validate the staged manager connection while the old tunnel stays up."
+    echo "  5. Write the manager VTI script."
+    echo "  6. Write the manager systemd service."
+    echo "  7. Disable the old VTI service."
+    echo "  8. Activate manager files and retire the old external files."
+    echo "  9. Reload and verify the manager strongSwan connection."
+    echo " 10. Enable the manager VTI service."
+    echo " 11. Terminate the old SA and wait up to 60 seconds for UniFi to reconnect."
+    echo " 12. Test VTI connectivity."
     echo
-    echo "If the manager connection does not come back, an automatic rollback"
-    echo "restores the original files and imported READ-ONLY state."
+    echo "IMPORTANT:"
+    echo "The old working IPsec SA is NOT terminated unless the new manager"
+    echo "connection has first been successfully loaded and verified."
     echo
-    warn "Traffic through this tunnel will be interrupted briefly."
+    echo "If a later step fails, automatic rollback restores the original files"
+    echo "and the imported READ-ONLY manager state."
+    echo
+    warn "Traffic is only interrupted during step 11."
     echo
 
     read -r -p "Type TAKEOVER to continue: " confirm
-    [[ "${confirm}" == "TAKEOVER" ]] || return
+    [[ "${confirm^^}" == "TAKEOVER" ]] || return
 
-    local timestamp backup_root
+    local timestamp backup_root stage_file
     timestamp="$(date +%Y%m%d-%H%M%S)"
     backup_root="${BACKUP_DIR}/${name}-${timestamp}"
+    stage_file="${backup_root}/manager-staged.conf"
 
     section "TAKING OVER TUNNEL"
 
-    printf '[1/10] Backing up original files... '
+    printf '[1/12] Backing up original files... '
     mkdir -p "${backup_root}"
     chmod 700 "${backup_root}"
     takeover_backup_file "${old_swan}" "${backup_root}" "strongswan.conf"
@@ -2644,43 +2686,81 @@ takeover_imported_tunnel() {
     fi
     printf '%b\n' "${C_GREEN}OK${C_RESET}"
 
-    printf '[2/10] Writing manager strongSwan configuration... '
-    if render_strongswan_config "${name}"; then
+    printf '[2/12] Refreshing imported PSK from source... '
+    save_psk "${name}" "${source_psk}"
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[3/12] Building staged manager strongSwan config... '
+    if render_strongswan_config_to_file "${name}" "${stage_file}"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
-        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        error "Could not render the staged manager configuration."
         pause
         return 1
     fi
 
-    printf '[3/10] Writing manager VTI script... '
+    printf '[4/12] Validating staged manager connection... '
+    if swanctl_clean swanctl --load-conns --file "${stage_file}" \
+        >/tmp/s2s-manager-takeover-stage-load.log 2>&1; then
+        :
+    fi
+
+    if swanctl_clean swanctl --list-conns 2>/dev/null |
+       grep -qE "^${MANAGED_PREFIX}-${name}:"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        error "The staged manager connection was not loaded."
+        echo
+        cat /tmp/s2s-manager-takeover-stage-load.log 2>/dev/null || true
+        echo
+        info "The current working tunnel has NOT been terminated."
+        info "The staged file was preserved for analysis:"
+        echo "  ${stage_file}"
+        # Restore the normal loaded connection set. Established SAs are left intact.
+        swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-stage-restore.log 2>&1 || true
+        pause
+        return 1
+    fi
+
+    # Restore the normal active configuration set before changing any files.
+    swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-stage-restore.log 2>&1 || true
+    if ! swanctl_clean swanctl --list-conns 2>/dev/null | grep -qE "^${old_conn}:"; then
+        error "Could not restore the original loaded connection after staged validation."
+        echo "The active IKE SA was not intentionally terminated."
+        pause
+        return 1
+    fi
+
+    printf '[5/12] Writing manager VTI script... '
     if render_vti_script "${name}"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
-        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
         pause
         return 1
     fi
 
-    printf '[4/10] Writing manager systemd service... '
+    printf '[6/12] Writing manager systemd service... '
     if render_systemd_service "${name}"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
-        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        rm -f "$(managed_vti_script "${name}")"
         pause
         return 1
     fi
 
-    printf '[5/10] Disabling old VTI service... '
+    printf '[7/12] Disabling old VTI service... '
     if [[ -n "${old_service}" ]]; then
         systemctl disable "${old_service}" >/tmp/s2s-manager-takeover-disable-old.log 2>&1 || true
     fi
     printf '%b\n' "${C_GREEN}OK${C_RESET}"
 
-    printf '[6/10] Retiring old external files... '
+    printf '[8/12] Activating manager files / retiring old files... '
+    cp -a "${stage_file}" "$(managed_swan_file "${name}")"
+    chmod 600 "$(managed_swan_file "${name}")"
     [[ -n "${old_swan}" ]] && rm -f "${old_swan}"
     [[ -n "${old_vti_script}" ]] && rm -f "${old_vti_script}"
     if [[ -n "${old_service}" ]]; then
@@ -2689,7 +2769,23 @@ takeover_imported_tunnel() {
     systemctl daemon-reload
     printf '%b\n' "${C_GREEN}OK${C_RESET}"
 
-    printf '[7/10] Enabling manager VTI service... '
+    printf '[9/12] Reloading / verifying manager strongSwan connection... '
+    swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-load.log 2>&1 || true
+
+    if swanctl_clean swanctl --list-conns 2>/dev/null |
+       grep -qE "^${MANAGED_PREFIX}-${name}:"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        error "The manager connection is not loaded. The working SA has NOT been terminated."
+        echo
+        cat /tmp/s2s-manager-takeover-load.log 2>/dev/null || true
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    printf '[10/12] Enabling manager VTI service... '
     if systemctl enable --now "$(managed_service_name "${name}")" \
         >/tmp/s2s-manager-takeover-manager-service.log 2>&1; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
@@ -2701,18 +2797,7 @@ takeover_imported_tunnel() {
         return 1
     fi
 
-    printf '[8/10] Loading manager strongSwan configuration... '
-    if swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-load.log 2>&1; then
-        printf '%b\n' "${C_GREEN}OK${C_RESET}"
-    else
-        printf '%b\n' "${C_RED}FAILED${C_RESET}"
-        cat /tmp/s2s-manager-takeover-load.log
-        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
-        pause
-        return 1
-    fi
-
-    printf '[9/10] Switching IPsec connection... '
+    printf '[11/12] Switching IPsec connection... '
     swanctl_clean swanctl --terminate --ike "${old_conn}" \
         >/tmp/s2s-manager-takeover-terminate-old.log 2>&1 || true
 
@@ -2729,7 +2814,7 @@ takeover_imported_tunnel() {
 
     sleep 2
 
-    printf '[10/10] Testing VTI connectivity... '
+    printf '[12/12] Testing VTI connectivity... '
     if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-takeover-ping.log 2>&1; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     elif grep -Eq '[1-9][0-9]* received' /tmp/s2s-manager-takeover-ping.log; then
@@ -2743,7 +2828,6 @@ takeover_imported_tunnel() {
         return 1
     fi
 
-    # Only now change the manager state from IMPORTED to MANAGED.
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
         "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"
@@ -2760,10 +2844,11 @@ EOF
     printf '%-30s %s\n' "Reconnect time:" "${TAKEOVER_RECONNECT_SECONDS}s"
     printf '%-30s %s\n' "Backup:" "${backup_root}"
     echo
-    info "The existing PSK was retained."
+    info "The original PSK was retained."
     info "The original files are preserved in the Take Over backup."
     pause
 }
+
 
 # ==============================================================================
 # Create / edit state
