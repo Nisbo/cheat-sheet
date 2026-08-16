@@ -27,12 +27,13 @@
 set -u
 set -o pipefail
 
-VERSION="0.17-test"
+VERSION="0.18-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
 ROUTE_DIR="${STATE_DIR}/routes"
 SECRET_DIR="${STATE_DIR}/secrets"
+BACKUP_DIR="${STATE_DIR}/backups"
 
 SWANCTL_DIR="/etc/swanctl/conf.d"
 MANAGED_PREFIX="s2s-manager"
@@ -182,8 +183,8 @@ ensure_root() {
 }
 
 init_state_dirs() {
-    mkdir -p "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}"
-    chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}"
+    mkdir -p "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}"
+    chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}"
 }
 
 debian_major_version() {
@@ -2423,6 +2424,348 @@ discover_existing_tunnels() {
 }
 
 # ==============================================================================
+# Take Over imported tunnels
+# ==============================================================================
+
+takeover_wait_for_connection() {
+    local name="$1"
+    local timeout="${2:-60}"
+    local conn="${MANAGED_PREFIX}-${name}"
+    local sa=""
+    local start end elapsed i
+
+    start="$(date +%s)"
+
+    for i in $(seq 1 "${timeout}"); do
+        sa="$(swanctl_clean swanctl --list-sas 2>/dev/null || true)"
+
+        if grep -qE "^${conn}: .*ESTABLISHED" <<< "${sa}" &&
+           awk -v c="${conn}:" '
+               $0 ~ "^" c {show=1; next}
+               show && /^[^[:space:]]/ {exit}
+               show && /INSTALLED/ {found=1; exit}
+               END {exit found ? 0 : 1}
+           ' <<< "${sa}"; then
+            end="$(date +%s)"
+            elapsed=$((end - start))
+            TAKEOVER_RECONNECT_SECONDS="${elapsed}"
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    return 1
+}
+
+takeover_backup_file() {
+    local source="$1"
+    local backup_root="$2"
+    local label="$3"
+
+    [[ -n "${source}" && -f "${source}" ]] || return 0
+
+    mkdir -p "${backup_root}"
+    cp -a "${source}" "${backup_root}/${label}"
+}
+
+takeover_restore_file() {
+    local backup="$1"
+    local target="$2"
+
+    [[ -f "${backup}" ]] || return 0
+    mkdir -p "$(dirname "${target}")"
+    cp -a "${backup}" "${target}"
+}
+
+takeover_rollback() {
+    local name="$1"
+    local old_conn="$2"
+    local old_swan="$3"
+    local old_vti_script="$4"
+    local old_service="$5"
+    local backup_root="$6"
+
+    echo
+    section "ROLLING BACK TAKE OVER"
+
+    printf '[1/7] Terminating manager IPsec SA... '
+    swanctl_clean swanctl --terminate --ike "${MANAGED_PREFIX}-${name}" \
+        >/tmp/s2s-manager-takeover-rollback-terminate.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[2/7] Removing manager system files... '
+    systemctl disable --now "$(managed_service_name "${name}")" >/dev/null 2>&1 || true
+    rm -f "$(managed_swan_file "${name}")" \
+          "$(managed_vti_script "${name}")" \
+          "$(managed_service_file "${name}")"
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[3/7] Restoring original files... '
+    [[ -n "${old_swan}" ]] &&
+        takeover_restore_file "${backup_root}/strongswan.conf" "${old_swan}"
+    [[ -n "${old_vti_script}" ]] &&
+        takeover_restore_file "${backup_root}/vti-script" "${old_vti_script}"
+    if [[ -n "${old_service}" ]]; then
+        takeover_restore_file "${backup_root}/systemd-service" "${SYSTEMD_DIR}/${old_service}"
+    fi
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[4/7] Reloading systemd... '
+    systemctl daemon-reload
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[5/7] Re-enabling original VTI service... '
+    if [[ -n "${old_service}" && -f "${SYSTEMD_DIR}/${old_service}" ]]; then
+        systemctl enable --now "${old_service}" >/tmp/s2s-manager-takeover-rollback-service.log 2>&1 || true
+    fi
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[6/7] Reloading original strongSwan configuration... '
+    swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-rollback-swan.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[7/7] Restoring imported manager state... '
+    load_tunnel "${name}" || true
+    save_imported_tunnel \
+        "${name}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" \
+        "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${SOURCE_FORCED_NATT:-0}"
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    echo
+    warn "Take Over was rolled back."
+    echo "The original configuration files were restored from:"
+    echo "  ${backup_root}"
+    echo
+    echo "UniFi should reconnect to the restored external configuration automatically."
+}
+
+takeover_imported_tunnel() {
+    banner
+    section "TAKE OVER IMPORTED TUNNEL"
+
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+
+    if [[ "${MANAGEMENT}" != "IMPORTED" ]]; then
+        warn "Tunnel '${name}' is already manager-owned or only defined."
+        echo "Take Over is only available for IMPORTED / READ-ONLY tunnels."
+        pause
+        return
+    fi
+
+    local old_conn="${SOURCE_CONN_NAME}"
+    local old_swan="${SOURCE_SWAN_FILE}"
+    local old_vti_script="${SOURCE_VTI_SCRIPT}"
+    local old_service="${SOURCE_SERVICE}"
+    local old_forced_natt="${SOURCE_FORCED_NATT:-0}"
+    local psk
+
+    psk="$(read_psk "${name}" 2>/dev/null || true)"
+    if [[ -z "${psk}" ]]; then
+        error "The imported PSK is missing from the manager secret store."
+        echo "Take Over has been cancelled."
+        pause
+        return
+    fi
+
+    section "TAKE OVER PREVIEW"
+
+    printf '%-30s %s\n' "Tunnel:" "${NAME}"
+    printf '%-30s %s\n' "Current management:" "IMPORTED / READ-ONLY"
+    printf '%-30s %s\n' "Current connection:" "${old_conn}"
+    printf '%-30s %s\n' "New manager connection:" "${MANAGED_PREFIX}-${NAME}"
+    printf '%-30s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-30s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+    printf '%-30s %s\n' "Authentication ID:" "${AUTH_ID}"
+    printf '%-30s %s\n' "PSK:" "reuse existing imported PSK"
+    echo
+
+    echo "Existing external files:"
+    printf '  strongSwan:  %s\n' "${old_swan:-not detected}"
+    printf '  VTI script:  %s\n' "${old_vti_script:-not detected}"
+    printf '  systemd:     %s\n' "${old_service:-not detected}"
+    echo
+
+    echo "Manager files that will replace them:"
+    printf '  strongSwan:  %s\n' "$(managed_swan_file "${name}")"
+    printf '  VTI script:  %s\n' "$(managed_vti_script "${name}")"
+    printf '  systemd:     %s\n' "$(managed_service_file "${name}")"
+    echo
+
+    echo "Manager IPsec defaults that will become active:"
+    echo "  • Forced NAT-T / ESP-in-UDP: Enabled"
+    echo "  • IKE hard lifetime:         28800s (8h)"
+    echo "  • ESP hard lifetime:         3600s (1h)"
+    echo
+
+    if [[ "${old_forced_natt}" != "1" ]]; then
+        warn "The current imported tunnel uses native ESP."
+        echo "Take Over will switch this tunnel to forced NAT-T / UDP 4500."
+        echo "The UniFi configuration itself does not need to be changed."
+        echo
+    fi
+
+    echo "Take Over will:"
+    echo "  1. Back up the detected external files."
+    echo "  2. Generate manager-owned strongSwan/VTI/systemd files."
+    echo "  3. Disable the old VTI systemd service."
+    echo "  4. Remove the old external files from their active locations."
+    echo "  5. Load the manager configuration."
+    echo "  6. Terminate the old IKE/CHILD SAs."
+    echo "  7. Wait up to 60 seconds for UniFi to reconnect."
+    echo "  8. Test VTI connectivity."
+    echo
+    echo "If the manager connection does not come back, an automatic rollback"
+    echo "restores the original files and imported READ-ONLY state."
+    echo
+    warn "Traffic through this tunnel will be interrupted briefly."
+    echo
+
+    read -r -p "Type TAKEOVER to continue: " confirm
+    [[ "${confirm}" == "TAKEOVER" ]] || return
+
+    local timestamp backup_root
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_root="${BACKUP_DIR}/${name}-${timestamp}"
+
+    section "TAKING OVER TUNNEL"
+
+    printf '[1/10] Backing up original files... '
+    mkdir -p "${backup_root}"
+    chmod 700 "${backup_root}"
+    takeover_backup_file "${old_swan}" "${backup_root}" "strongswan.conf"
+    takeover_backup_file "${old_vti_script}" "${backup_root}" "vti-script"
+    if [[ -n "${old_service}" ]]; then
+        takeover_backup_file "${SYSTEMD_DIR}/${old_service}" "${backup_root}" "systemd-service"
+    fi
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[2/10] Writing manager strongSwan configuration... '
+    if render_strongswan_config "${name}"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    printf '[3/10] Writing manager VTI script... '
+    if render_vti_script "${name}"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    printf '[4/10] Writing manager systemd service... '
+    if render_systemd_service "${name}"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    printf '[5/10] Disabling old VTI service... '
+    if [[ -n "${old_service}" ]]; then
+        systemctl disable "${old_service}" >/tmp/s2s-manager-takeover-disable-old.log 2>&1 || true
+    fi
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[6/10] Retiring old external files... '
+    [[ -n "${old_swan}" ]] && rm -f "${old_swan}"
+    [[ -n "${old_vti_script}" ]] && rm -f "${old_vti_script}"
+    if [[ -n "${old_service}" ]]; then
+        rm -f "${SYSTEMD_DIR}/${old_service}"
+    fi
+    systemctl daemon-reload
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[7/10] Enabling manager VTI service... '
+    if systemctl enable --now "$(managed_service_name "${name}")" \
+        >/tmp/s2s-manager-takeover-manager-service.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-takeover-manager-service.log
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    printf '[8/10] Loading manager strongSwan configuration... '
+    if swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-load.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-takeover-load.log
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    printf '[9/10] Switching IPsec connection... '
+    swanctl_clean swanctl --terminate --ike "${old_conn}" \
+        >/tmp/s2s-manager-takeover-terminate-old.log 2>&1 || true
+
+    TAKEOVER_RECONNECT_SECONDS=""
+    if takeover_wait_for_connection "${name}" 60; then
+        printf '%bOK%b (%ss)\n' "${C_GREEN}" "${C_RESET}" "${TAKEOVER_RECONNECT_SECONDS}"
+    else
+        printf '%bFAILED%b\n' "${C_RED}" "${C_RESET}"
+        error "UniFi did not reconnect to the manager-owned connection within 60 seconds."
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    sleep 2
+
+    printf '[10/10] Testing VTI connectivity... '
+    if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-takeover-ping.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    elif grep -Eq '[1-9][0-9]* received' /tmp/s2s-manager-takeover-ping.log; then
+        printf '%b\n' "${C_YELLOW}PARTIAL${C_RESET}"
+        warn "The tunnel is established but the immediate VTI ping had packet loss."
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        error "The manager-owned IPsec SA is established, but VTI connectivity failed."
+        takeover_rollback "${name}" "${old_conn}" "${old_swan}" "${old_vti_script}" "${old_service}" "${backup_root}"
+        pause
+        return 1
+    fi
+
+    # Only now change the manager state from IMPORTED to MANAGED.
+    save_tunnel \
+        "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"
+
+    cat >> "$(tunnel_config_file "${name}")" <<EOF
+TAKEOVER_BACKUP_DIR=$(printf '%q' "${backup_root}")
+EOF
+    chmod 600 "$(tunnel_config_file "${name}")"
+
+    echo
+    ok "Take Over completed successfully."
+    printf '%-30s %s\n' "Management:" "MANAGED"
+    printf '%-30s %s\n' "Connection:" "CONNECTED"
+    printf '%-30s %s\n' "Reconnect time:" "${TAKEOVER_RECONNECT_SECONDS}s"
+    printf '%-30s %s\n' "Backup:" "${backup_root}"
+    echo
+    info "The existing PSK was retained."
+    info "The original files are preserved in the Take Over backup."
+    pause
+}
+
+# ==============================================================================
 # Create / edit state
 # ==============================================================================
 
@@ -3305,6 +3648,7 @@ main_menu() {
         echo "  [11] Re-apply installed tunnel"
         echo "  [12] Reconnect tunnel"
         echo "  [13] Discover / import existing tunnels"
+        echo "  [14] Take over imported tunnel"
         echo "  [E] Exit"
         echo
 
@@ -3325,6 +3669,7 @@ main_menu() {
             11) manual_reapply_tunnel ;;
             12) manual_reconnect_tunnel ;;
             13) discover_existing_tunnels ;;
+            14) takeover_imported_tunnel ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
