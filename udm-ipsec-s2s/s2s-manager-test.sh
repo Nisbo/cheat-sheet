@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.10-test"
+VERSION="0.11-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -2333,20 +2333,6 @@ show_tunnel_diagnostics() {
         fi
 
         local established ike_age_seconds child_installed child_age_seconds
-        local connected_since_epoch now_epoch connected_for_seconds
-
-        connected_since_epoch="$(get_tunnel_connected_since_epoch "${name}" 2>/dev/null || true)"
-        if [[ -n "${connected_since_epoch}" ]]; then
-            now_epoch="$(date +%s)"
-            connected_for_seconds=$((now_epoch - connected_since_epoch))
-            if (( connected_for_seconds >= 0 )); then
-                printf '%-28s %s\n' "Connected for:" "$(human_duration "${connected_for_seconds}")"
-            else
-                printf '%-28s %s\n' "Connected for:" "Cannot be determined from logs"
-            fi
-        else
-            printf '%-28s %s\n' "Connected for:" "Cannot be determined from logs"
-        fi
 
         established="$(grep -m1 -oE 'established [0-9]+s ago' <<< "${sa}" || true)"
         if [[ -n "${established}" ]]; then
@@ -2370,43 +2356,87 @@ show_tunnel_diagnostics() {
         [[ -n "${out_bytes}" ]] && printf '%-28s %s (%s packets)\n' "Traffic OUT:" "$(human_bytes "${out_bytes}")" "${out_packets:-0}"
     fi
 
-    echo
-    section "CONNECTIVITY TEST"
-
-    echo "The manager can ping the UniFi VTI address:"
-    echo "  ${UNIFI_VTI_IP}"
-    echo
-    echo "This does not test every remote LAN/VLAN host, but it verifies"
-    echo "basic traffic through the route-based IPsec tunnel."
-    echo
-
-    if confirm_yes_no "Run VTI ping test now?" "Y"; then
-        if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-diag-ping.log 2>&1; then
-            ok "Ping to ${UNIFI_VTI_IP}: SUCCESS"
-            tail -2 /tmp/s2s-manager-diag-ping.log
-        else
-            error "Ping to ${UNIFI_VTI_IP}: FAILED"
-            cat /tmp/s2s-manager-diag-ping.log
-        fi
-    fi
-
-    echo
-    section "RECENT STRONGSWAN LOGS"
-
-    echo "  [1] Show last 30 strongSwan log lines"
-    echo "  [0] Back"
-    echo
-    local choice
-    read -r -p "Selection: " choice
-
-    if [[ "${choice}" == "1" ]]; then
+    while :; do
         echo
-        journalctl -u strongswan -n 30 --no-pager |
-            sed \
-                -e '/agent plugin requires CAP_SETUID\/CAP_SETGID capability/d' \
-                -e "/plugin 'agent': failed to load - agent_plugin_create returned NULL/d"
-        pause
-    fi
+        section "OPTIONAL TESTS"
+
+        echo "  [1] Ping UniFi VTI address"
+        echo "      Test connectivity to ${UNIFI_VTI_IP}"
+        echo
+        echo "  [2] Analyze connection uptime"
+        echo "      Determine continuous connection time from strongSwan logs."
+        echo "      This may take several seconds."
+        echo
+        echo "  [3] Show recent strongSwan logs"
+        echo
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo "  [0] Back"
+        echo
+
+        local choice connected_since_epoch now_epoch connected_for_seconds
+        read -r -p "Selection: " choice
+
+        case "${choice}" in
+            1)
+                echo
+                section "CONNECTIVITY TEST"
+                echo "Pinging UniFi VTI address ${UNIFI_VTI_IP}..."
+                echo
+
+                if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-diag-ping.log 2>&1; then
+                    ok "Ping to ${UNIFI_VTI_IP}: SUCCESS"
+                    tail -2 /tmp/s2s-manager-diag-ping.log
+                else
+                    error "Ping to ${UNIFI_VTI_IP}: FAILED"
+                    cat /tmp/s2s-manager-diag-ping.log
+                fi
+                pause
+                ;;
+            2)
+                echo
+                section "CONNECTION UPTIME"
+                echo "Analyzing strongSwan connection history..."
+                echo "This may take several seconds."
+                echo
+
+                connected_since_epoch="$(get_tunnel_connected_since_epoch "${name}" 2>/dev/null || true)"
+                if [[ -n "${connected_since_epoch}" ]]; then
+                    now_epoch="$(date +%s)"
+                    connected_for_seconds=$((now_epoch - connected_since_epoch))
+                    if (( connected_for_seconds >= 0 )); then
+                        printf '%-28s %s\n' "Connected for:" "$(human_duration "${connected_for_seconds}")"
+                    else
+                        printf '%-28s %s\n' "Connected for:" "Cannot be determined from available logs"
+                    fi
+                else
+                    printf '%-28s %s\n' "Connected for:" "Cannot be determined from available logs"
+                fi
+                pause
+                ;;
+            3)
+                echo
+                section "RECENT STRONGSWAN LOGS"
+                journalctl -u strongswan -n 30 --no-pager |
+                    sed \
+                        -e '/agent plugin requires CAP_SETUID\/CAP_SETGID capability/d' \
+                        -e "/plugin 'agent': failed to load - agent_plugin_create returned NULL/d"
+                pause
+                ;;
+            [bB]|0)
+                return
+                ;;
+            [eE])
+                clear_screen
+                echo "Bye."
+                exit 0
+                ;;
+            *)
+                error "Invalid selection."
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ==============================================================================
