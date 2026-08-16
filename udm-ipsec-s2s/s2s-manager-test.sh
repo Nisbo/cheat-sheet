@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.15-test"
+VERSION="0.16-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -264,7 +264,9 @@ preflight_ready() {
     [[ -z "${missing}" ]] || return 1
 
     tpm_disabled || return 1
-    agent_disabled || return 1
+    # The agent plugin is optional for this manager. If it is not disabled,
+    # show a warning in pre-flight but do not block read-only/import or tunnel
+    # management on an otherwise working system.
     route_based_global_ready || return 1
 
     return 0
@@ -339,8 +341,9 @@ show_preflight() {
     if agent_disabled; then
         ok "Unused agent plugin disabled for charon"
     else
-        error "Agent plugin is not disabled for charon"
-        ready=0
+        warn "Agent plugin is not disabled for charon (optional)"
+        echo "    Existing strongSwan tunnels can still be discovered and managed."
+        echo "    The manager filters the known harmless swanctl agent warning."
     fi
 
     if route_based_global_ready; then
@@ -640,11 +643,19 @@ load_tunnel() {
 
     unset NAME PUBLIC_IP AUTH_ID VTI_INTERFACE VTI_KEY
     unset VTI_NETWORK DEBIAN_VTI_IP UNIFI_VTI_IP CREATED_AT INSTALLED
+    unset MANAGEMENT SOURCE_CONN_NAME SOURCE_SWAN_FILE SOURCE_VTI_SCRIPT
+    unset SOURCE_SERVICE SOURCE_FORCED_NATT
 
     # shellcheck disable=SC1090
     source "${file}"
 
     : "${INSTALLED:=0}"
+    : "${MANAGEMENT:=MANAGED}"
+    : "${SOURCE_CONN_NAME:=${MANAGED_PREFIX}-${NAME}}"
+    : "${SOURCE_SWAN_FILE:=}"
+    : "${SOURCE_VTI_SCRIPT:=}"
+    : "${SOURCE_SERVICE:=}"
+    : "${SOURCE_FORCED_NATT:=1}"
 }
 
 save_tunnel() {
@@ -675,6 +686,63 @@ save_tunnel() {
     } > "${config}"
 
     chmod 600 "${config}"
+}
+
+save_imported_tunnel() {
+    local name="$1"
+    local public_ip="$2"
+    local auth_id="$3"
+    local interface="$4"
+    local key="$5"
+    local network="$6"
+    local debian_ip="$7"
+    local unifi_ip="$8"
+    local source_conn="$9"
+    local source_swan="${10}"
+    local source_vti="${11}"
+    local source_service="${12}"
+    local forced_natt="${13:-0}"
+
+    save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}"         "${network}" "${debian_ip}" "${unifi_ip}" "1"
+
+    cat >> "$(tunnel_config_file "${name}")" <<EOF
+MANAGEMENT=IMPORTED
+SOURCE_CONN_NAME=$(printf '%q' "${source_conn}")
+SOURCE_SWAN_FILE=$(printf '%q' "${source_swan}")
+SOURCE_VTI_SCRIPT=$(printf '%q' "${source_vti}")
+SOURCE_SERVICE=$(printf '%q' "${source_service}")
+SOURCE_FORCED_NATT=$(printf '%q' "${forced_natt}")
+EOF
+
+    chmod 600 "$(tunnel_config_file "${name}")"
+}
+
+tunnel_connection_name() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+    if [[ "${MANAGEMENT}" == "IMPORTED" && -n "${SOURCE_CONN_NAME}" ]]; then
+        printf '%s' "${SOURCE_CONN_NAME}"
+    else
+        printf '%s-%s' "${MANAGED_PREFIX}" "${NAME}"
+    fi
+}
+
+tunnel_is_imported() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+    [[ "${MANAGEMENT}" == "IMPORTED" ]]
+}
+
+imported_readonly_notice() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    warn "Tunnel '${NAME}' was imported from an existing external configuration."
+    echo "It is currently READ-ONLY in S2S Manager."
+    echo
+    echo "The original strongSwan/VTI/systemd files are still authoritative."
+    echo "Use diagnostics or reconnect safely, but do not change manager-owned"
+    echo "configuration until a future Take Over step converts this tunnel."
 }
 
 read_routes() {
@@ -774,7 +842,8 @@ next_vti_network() {
 
 tunnel_connection_state() {
     local name="$1"
-    local conn="${MANAGED_PREFIX}-${name}"
+    local conn
+    conn="$(tunnel_connection_name "${name}")" || { printf 'UNKNOWN'; return; }
     local sa
 
     if ! command_available swanctl; then
@@ -820,7 +889,10 @@ show_existing_tunnels() {
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
 
-        if [[ "${INSTALLED}" == "1" ]]; then
+        if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+            state="IMPORTED"
+            connection="$(tunnel_connection_state "${NAME}")"
+        elif [[ "${INSTALLED}" == "1" ]]; then
             state="INSTALLED"
             connection="$(tunnel_connection_state "${NAME}")"
         else
@@ -1720,6 +1792,13 @@ manual_reapply_tunnel() {
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
 
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${name}"
+        pause
+        return
+    fi
+
+
     if [[ "${INSTALLED}" != "1" ]]; then
         warn "Tunnel '${name}' is not installed on Debian."
         echo "Use 'Install defined tunnel on Debian' first."
@@ -1793,7 +1872,8 @@ reconnect_tunnel_by_name() {
 
     load_tunnel "${name}" || return 1
 
-    local conn="${MANAGED_PREFIX}-${name}"
+    local conn
+    conn="$(tunnel_connection_name "${name}")" || return 1
     local timeout=60
     local start end elapsed
     local sa=""
@@ -1927,6 +2007,422 @@ manual_reconnect_tunnel() {
 }
 
 # ==============================================================================
+# Existing tunnel discovery / read-only import
+# ==============================================================================
+
+source_file_already_imported() {
+    local wanted="$1"
+    local name
+
+    while read -r name; do
+        [[ -z "${name}" ]] && continue
+        load_tunnel "${name}" || continue
+        if [[ "${MANAGEMENT}" == "IMPORTED" && "${SOURCE_SWAN_FILE}" == "${wanted}" ]]; then
+            return 0
+        fi
+    done < <(list_tunnel_names)
+
+    return 1
+}
+
+parse_source_connection() {
+    local file="$1"
+
+    DISC_CONN_NAME=""
+    DISC_PUBLIC_IP=""
+    DISC_AUTH_ID=""
+    DISC_MARK=""
+    DISC_PSK=""
+    DISC_FORCED_NATT=0
+
+    DISC_CONN_NAME="$(
+        awk '
+            /^[[:space:]]*connections[[:space:]]*\{/ {inside=1; next}
+            inside && /^[[:space:]]*[A-Za-z0-9_.:-]+[[:space:]]*\{/ {
+                line=$0
+                gsub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]*\{.*/, "", line)
+                print line
+                exit
+            }
+        ' "${file}"
+    )"
+
+    DISC_PUBLIC_IP="$(
+        awk -F= '
+            /^[[:space:]]*local_addrs[[:space:]]*=/ {
+                v=$2; gsub(/[[:space:]]/, "", v); print v; exit
+            }
+        ' "${file}"
+    )"
+
+    DISC_AUTH_ID="$(
+        awk -F= '
+            /^[[:space:]]*remote[[:space:]]*\{/ {remote=1; next}
+            remote && /^[[:space:]]*id[[:space:]]*=/ {
+                v=$2
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                print v
+                exit
+            }
+            remote && /^[[:space:]]*\}/ {remote=0}
+        ' "${file}"
+    )"
+
+    DISC_MARK="$(
+        awk -F= '
+            /^[[:space:]]*mark_in[[:space:]]*=/ {
+                v=$2; gsub(/[[:space:]]/, "", v); print v; exit
+            }
+        ' "${file}"
+    )"
+
+    DISC_PSK="$(
+        awk -F= '
+            /^[[:space:]]*secret[[:space:]]*=/ {
+                v=$2
+                sub(/^[[:space:]]*/, "", v)
+                sub(/[[:space:]]*$/, "", v)
+                if (v ~ /^".*"$/) {
+                    sub(/^"/, "", v)
+                    sub(/"$/, "", v)
+                }
+                print v
+                exit
+            }
+        ' "${file}"
+    )"
+
+    if grep -Eq '^[[:space:]]*encap[[:space:]]*=[[:space:]]*yes([[:space:]]|$)' "${file}"; then
+        DISC_FORCED_NATT=1
+    fi
+
+    [[ -n "${DISC_CONN_NAME}" && -n "${DISC_PUBLIC_IP}" && -n "${DISC_AUTH_ID}" && -n "${DISC_MARK}" ]]
+}
+
+find_vti_for_mark() {
+    local mark="$1"
+    local iface details
+
+    DISC_VTI_INTERFACE=""
+    DISC_VTI_CIDR=""
+
+    while read -r iface; do
+        [[ -z "${iface}" ]] && continue
+        details="$(ip -d link show "${iface}" 2>/dev/null || true)"
+        if grep -Eq "vti .*ikey (0\\.0\\.0\\.)?${mark}([[:space:]]|$)" <<< "${details}" || \
+           grep -Eq "vti .*okey (0\\.0\\.0\\.)?${mark}([[:space:]]|$)" <<< "${details}"; then
+            DISC_VTI_INTERFACE="${iface}"
+            DISC_VTI_CIDR="$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print $4}' | head -1)"
+            return 0
+        fi
+    done < <(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//')
+
+    return 1
+}
+
+derive_import_network() {
+    local cidr="$1"
+    local ip prefix n base local_n
+
+    [[ "${cidr}" == */* ]] || return 1
+    ip="${cidr%%/*}"
+    prefix="${cidr##*/}"
+    [[ "${prefix}" == "30" ]] || return 1
+    valid_ipv4 "${ip}" || return 1
+
+    local_n="$(ipv4_to_int "${ip}")"
+    base=$(( local_n & 0xFFFFFFFC ))
+
+    DISC_VTI_NETWORK="$(int_to_ipv4 "${base}")/30"
+    DISC_DEBIAN_VTI_IP="${ip}"
+
+    if (( local_n == base + 1 )); then
+        DISC_UNIFI_VTI_IP="$(int_to_ipv4 "$((base + 2))")"
+    elif (( local_n == base + 2 )); then
+        DISC_UNIFI_VTI_IP="$(int_to_ipv4 "$((base + 1))")"
+    else
+        return 1
+    fi
+}
+
+find_source_vti_script() {
+    local iface="$1"
+    local mark="$2"
+    local f
+
+    DISC_VTI_SCRIPT=""
+
+    while IFS= read -r f; do
+        [[ -f "${f}" ]] || continue
+        if grep -Fq "ip tunnel add ${iface}" "${f}" 2>/dev/null && \
+           grep -Eq "key[[:space:]]+${mark}([[:space:]]|$)" "${f}" 2>/dev/null; then
+            DISC_VTI_SCRIPT="${f}"
+            return 0
+        fi
+    done < <(find /usr/local/sbin /usr/local/bin /root -maxdepth 3 -type f 2>/dev/null)
+
+    return 1
+}
+
+find_source_service() {
+    local script="$1"
+    local f
+
+    DISC_SERVICE=""
+    [[ -n "${script}" ]] || return 1
+
+    while IFS= read -r f; do
+        [[ -f "${f}" ]] || continue
+        if grep -Fq "ExecStart=${script}" "${f}" 2>/dev/null; then
+            DISC_SERVICE="$(basename "${f}")"
+            return 0
+        fi
+    done < <(find /etc/systemd/system /usr/lib/systemd/system -maxdepth 2 -type f -name '*.service' 2>/dev/null)
+
+    return 1
+}
+
+discover_source_routes() {
+    local iface="$1"
+    local tunnel_net="$2"
+    local script="$3"
+    local route
+
+    DISC_ROUTES=()
+
+    if [[ -n "${script}" && -f "${script}" ]]; then
+        while read -r route; do
+            [[ -z "${route}" || "${route}" == "${tunnel_net}" ]] && continue
+            valid_cidr "${route}" && DISC_ROUTES+=("${route}")
+        done < <(
+            awk -v dev="${iface}" '
+                $1=="ip" && $2=="route" && $3=="replace" {
+                    for (i=1; i<=NF; i++) {
+                        if ($i=="dev" && $(i+1)==dev) {
+                            print $4
+                            break
+                        }
+                    }
+                }
+            ' "${script}"
+        )
+    else
+        while read -r route; do
+            [[ -z "${route}" || "${route}" == "${tunnel_net}" ]] && continue
+            valid_cidr "${route}" && DISC_ROUTES+=("${route}")
+        done < <(ip route show table 220 dev "${iface}" 2>/dev/null | awk '{print $1}')
+    fi
+}
+
+source_connection_state() {
+    local conn="$1"
+    local sa
+    sa="$(swanctl_clean swanctl --list-sas 2>/dev/null || true)"
+
+    if grep -qE "^${conn}: .*ESTABLISHED" <<< "${sa}" && \
+       awk -v c="${conn}:" '
+           $0 ~ "^" c {show=1; next}
+           show && /^[^[:space:]]/ {exit}
+           show && /INSTALLED/ {found=1; exit}
+           END {exit found ? 0 : 1}
+       ' <<< "${sa}"; then
+        printf 'CONNECTED'
+    else
+        printf 'DISCONNECTED'
+    fi
+}
+
+discover_existing_tunnels() {
+    banner
+    section "DISCOVER EXISTING IPSEC TUNNELS"
+
+    echo "This scan is read-only."
+    echo "It does NOT modify strongSwan, VTI interfaces, routing or systemd."
+    echo
+
+    local -a files=()
+    local -a labels=()
+    local f base conn
+    local managed_count=0 imported_count=0
+
+    shopt -s nullglob
+    for f in "${SWANCTL_DIR}"/*.conf; do
+        base="$(basename "${f}")"
+
+        if [[ "${base}" == "${MANAGED_PREFIX}-"* ]]; then
+            ((managed_count += 1))
+            continue
+        fi
+
+        if source_file_already_imported "${f}"; then
+            ((imported_count += 1))
+            continue
+        fi
+
+        if parse_source_connection "${f}"; then
+            files+=("${f}")
+            labels+=("${DISC_CONN_NAME}")
+        fi
+    done
+    shopt -u nullglob
+
+    printf '%-32s %s\n' "Manager-owned configs skipped:" "${managed_count}"
+    printf '%-32s %s\n' "Already imported configs skipped:" "${imported_count}"
+    printf '%-32s %s\n' "Importable configs found:" "${#files[@]}"
+    echo
+
+    if (( ${#files[@]} == 0 )); then
+        info "No unmanaged importable strongSwan tunnels were found."
+        pause
+        return
+    fi
+
+    local i selection
+    for i in "${!files[@]}"; do
+        printf '  [%d] %s\n' "$((i + 1))" "${labels[$i]}"
+        printf '      %s\n' "${files[$i]}"
+    done
+
+    echo
+    echo "Enter tunnel number and press ENTER."
+    echo "B = Back    E = Exit"
+    echo
+    read -r -p "Selection: " selection
+
+    case "${selection}" in
+        ""|b|B|0) return ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
+
+    [[ "${selection}" =~ ^[0-9]+$ ]] || { error "Invalid selection."; pause; return; }
+    (( selection >= 1 && selection <= ${#files[@]} )) || { error "Invalid selection."; pause; return; }
+
+    local source_file="${files[$((selection - 1))]}"
+    parse_source_connection "${source_file}" || {
+        error "Could not parse the selected strongSwan configuration."
+        pause
+        return
+    }
+
+    find_vti_for_mark "${DISC_MARK}" || {
+        error "Could not match VTI mark/key ${DISC_MARK} to an active VTI interface."
+        pause
+        return
+    }
+
+    derive_import_network "${DISC_VTI_CIDR}" || {
+        error "Could not derive a /30 tunnel network from ${DISC_VTI_CIDR}."
+        pause
+        return
+    }
+
+    find_source_vti_script "${DISC_VTI_INTERFACE}" "${DISC_MARK}" || true
+    find_source_service "${DISC_VTI_SCRIPT}" || true
+    discover_source_routes "${DISC_VTI_INTERFACE}" "${DISC_VTI_NETWORK}" "${DISC_VTI_SCRIPT}"
+
+    local conn_state
+    conn_state="$(source_connection_state "${DISC_CONN_NAME}")"
+
+    banner
+    section "IMPORT PREVIEW"
+
+    printf '%-28s %s\n' "Detected connection:" "${DISC_CONN_NAME}"
+    printf '%-28s %s\n' "Connection state:" "${conn_state}"
+    printf '%-28s %s\n' "Management:" "UNMANAGED / EXTERNAL"
+    printf '%-28s %s\n' "strongSwan config:" "${source_file}"
+    printf '%-28s %s\n' "Debian public IP:" "${DISC_PUBLIC_IP}"
+    printf '%-28s %s\n' "Authentication ID:" "${DISC_AUTH_ID}"
+    printf '%-28s %s\n' "VTI interface:" "${DISC_VTI_INTERFACE}"
+    printf '%-28s %s\n' "VTI key / mark:" "${DISC_MARK}"
+    printf '%-28s %s\n' "Tunnel network:" "${DISC_VTI_NETWORK}"
+    printf '%-28s %s\n' "Debian VTI IP:" "${DISC_DEBIAN_VTI_IP}"
+    printf '%-28s %s\n' "UniFi VTI IP:" "${DISC_UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "VTI startup script:" "${DISC_VTI_SCRIPT:-not detected}"
+    printf '%-28s %s\n' "systemd service:" "${DISC_SERVICE:-not detected}"
+    printf '%-28s %s\n' "Forced NAT-T:" "$([[ "${DISC_FORCED_NATT}" == "1" ]] && echo Yes || echo No)"
+    printf '%-28s %s\n' "PSK:" "$([[ -n "${DISC_PSK}" ]] && echo detected || echo NOT detected)"
+
+    echo
+    echo "Remote networks:"
+    if (( ${#DISC_ROUTES[@]} == 0 )); then
+        echo "  None detected"
+    else
+        local r
+        for r in "${DISC_ROUTES[@]}"; do
+            printf '  • %s\n' "${r}"
+        done
+    fi
+
+    echo
+    echo "IMPORTANT:"
+    echo "Import only creates S2S Manager state files."
+    echo "The existing strongSwan, VTI and systemd configuration is NOT changed,"
+    echo "renamed, disabled or removed."
+    echo
+    echo "Imported tunnels remain READ-ONLY until a later Take Over operation."
+    echo "The detected PSK is copied into the manager secret store so it can be"
+    echo "reused later without generating a new key."
+
+    if [[ -z "${DISC_PSK}" ]]; then
+        echo
+        warn "No PSK was detected. Import is cancelled to avoid creating an incomplete state."
+        pause
+        return
+    fi
+
+    echo
+    local suggested_name="${DISC_CONN_NAME}"
+    if tunnel_exists "${suggested_name}"; then
+        suggested_name="${DISC_CONN_NAME}-imported"
+    fi
+
+    local import_name="${suggested_name}"
+    while tunnel_exists "${import_name}"; do
+        import_name="${import_name}-1"
+    done
+
+    printf 'Manager name [%s]: ' "${import_name}"
+    local entered_name
+    read -r entered_name
+    [[ -n "${entered_name}" ]] && import_name="${entered_name}"
+
+    valid_tunnel_name "${import_name}" || {
+        error "Invalid manager tunnel name."
+        pause
+        return
+    }
+
+    tunnel_exists "${import_name}" && {
+        error "A manager tunnel named '${import_name}' already exists."
+        pause
+        return
+    }
+
+    echo
+    confirm_yes_no "Import this tunnel into manager state?" "N" || return
+
+    save_imported_tunnel \
+        "${import_name}" "${DISC_PUBLIC_IP}" "${DISC_AUTH_ID}" \
+        "${DISC_VTI_INTERFACE}" "${DISC_MARK}" "${DISC_VTI_NETWORK}" \
+        "${DISC_DEBIAN_VTI_IP}" "${DISC_UNIFI_VTI_IP}" \
+        "${DISC_CONN_NAME}" "${source_file}" "${DISC_VTI_SCRIPT}" \
+        "${DISC_SERVICE}" "${DISC_FORCED_NATT}"
+
+    write_routes "${import_name}" "${DISC_ROUTES[@]:-}"
+    save_psk "${import_name}" "${DISC_PSK}"
+
+    echo
+    ok "Tunnel imported into S2S Manager state."
+    echo
+    info "Original system configuration remains untouched."
+    info "PSK copied to manager secret store with mode 600."
+    echo
+    echo "State: IMPORTED / READ-ONLY"
+    pause
+}
+
+# ==============================================================================
 # Create / edit state
 # ==============================================================================
 
@@ -2028,6 +2524,13 @@ add_remote_network() {
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
 
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${name}"
+        pause
+        return
+    fi
+
+
     echo "Current remote networks:"
     local route count=0
     while read -r route; do
@@ -2085,6 +2588,13 @@ remove_remote_network() {
 
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
+
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${name}"
+        pause
+        return
+    fi
+
 
     local -a routes=()
     local route
@@ -2276,6 +2786,17 @@ show_unifi_configuration() {
     select_tunnel || return
 
     local tunnel="${SELECTED_TUNNEL}"
+    load_tunnel "${tunnel}" || return
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        warn "UniFi configuration display is not generated for imported tunnels."
+        echo "The existing external tunnel keeps its original UniFi/IPsec settings."
+        echo
+        printf '%-28s %s\n' "Source connection:" "${SOURCE_CONN_NAME}"
+        printf '%-28s %s\n' "Forced NAT-T:" "$([[ "${SOURCE_FORCED_NATT}" == "1" ]] && echo Yes || echo No)"
+        pause
+        return
+    fi
+
     local show_psk=0 choice
 
     while :; do
@@ -2318,6 +2839,11 @@ install_defined_tunnel() {
     select_tunnel || return
 
     load_tunnel "${SELECTED_TUNNEL}" || return
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${SELECTED_TUNNEL}"
+        pause
+        return
+    fi
     if [[ "${INSTALLED}" == "1" ]]; then
         warn "This tunnel is already marked as installed."
         pause
@@ -2333,6 +2859,11 @@ remove_installed_tunnel() {
     select_tunnel || return
 
     load_tunnel "${SELECTED_TUNNEL}" || return
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${SELECTED_TUNNEL}"
+        pause
+        return
+    fi
     if [[ "${INSTALLED}" != "1" ]]; then
         warn "This tunnel is not installed."
         pause
@@ -2427,7 +2958,8 @@ human_duration() {
 
 get_tunnel_sa_output() {
     local name="$1"
-    local conn="${MANAGED_PREFIX}-${name}"
+    local conn
+    conn="$(tunnel_connection_name "${name}")" || return 1
 
     swanctl_clean swanctl --list-sas 2>/dev/null | \
         awk -v c="${conn}:" '
@@ -2440,7 +2972,8 @@ get_tunnel_sa_output() {
 
 get_tunnel_connected_since_epoch() {
     local name="$1"
-    local conn="${MANAGED_PREFIX}-${name}"
+    local conn
+    conn="$(tunnel_connection_name "${name}")" || return 1
     local line epoch msg id
     local history_known=0
     local connected_since=""
@@ -2513,10 +3046,15 @@ show_tunnel_diagnostics() {
     load_tunnel "${name}" || return
 
     local service
-    service="$(managed_service_name "${name}")"
+    if [[ "${MANAGEMENT}" == "IMPORTED" && -n "${SOURCE_SERVICE}" ]]; then
+        service="${SOURCE_SERVICE}"
+    else
+        service="$(managed_service_name "${name}")"
+    fi
 
     printf '%-28s %s\n' "Tunnel:" "${NAME}"
-    printf '%-28s %s\n' "Manager state:" "$([[ "${INSTALLED}" == "1" ]] && echo INSTALLED || echo DEFINED)"
+    printf '%-28s %s\n' "Manager state:" "$([[ "${MANAGEMENT}" == "IMPORTED" ]] && echo IMPORTED || { [[ "${INSTALLED}" == "1" ]] && echo INSTALLED || echo DEFINED; })"
+    printf '%-28s %s\n' "Management:" "${MANAGEMENT}"
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
     printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
@@ -2718,6 +3256,7 @@ setup_required_menu() {
         section "SETUP REQUIRED"
         echo "  [1] Install / repair prerequisites"
         echo "  [2] Run pre-flight check again"
+        echo "  [3] Discover / import existing tunnels"
         echo "  [E] Exit"
         echo
 
@@ -2727,6 +3266,7 @@ setup_required_menu() {
         case "${choice}" in
             1) install_or_repair_prerequisites ;;
             2) ;;
+            3) discover_existing_tunnels ;;
             e|E|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
@@ -2753,6 +3293,7 @@ main_menu() {
         echo "  [10] Show system status"
         echo "  [11] Re-apply installed tunnel"
         echo "  [12] Reconnect tunnel"
+        echo "  [13] Discover / import existing tunnels"
         echo "  [E] Exit"
         echo
 
@@ -2772,6 +3313,7 @@ main_menu() {
             10) show_system_status ;;
             11) manual_reapply_tunnel ;;
             12) manual_reconnect_tunnel ;;
+            13) discover_existing_tunnels ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
