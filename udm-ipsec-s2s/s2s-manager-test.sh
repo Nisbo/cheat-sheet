@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.22-test"
+VERSION="0.23-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -919,13 +919,35 @@ show_existing_tunnels() {
         return
     fi
 
-    local name_width=20
+    # Keep all table widths in one place so header, separator and rows
+    # can never drift apart. Two spaces are used between columns so a
+    # value that exactly fills its column still remains visually separated.
+    local number_width=4
+    local name_width=22
+    local interface_width=10
+    local network_width=20
+    local management_width=22
+    local connection_width=14
     local auth_width=24
+    local gap="  "
 
-    printf '%-4s %-20s %-10s %-20s %-22s %-14s %-24s\n' \
-        "#" "Name" "Interface" "Tunnel Network" "Management" "Connection" "Authentication ID"
-    printf '%-4s %-20s %-10s %-20s %-22s %-14s %-24s\n' \
-        "──" "────────────────────" "──────────" "────────────────────" "──────────────────────" "──────────────" "────────────────────────"
+    printf '%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s\n' \
+        "${number_width}" "#" "${gap}" \
+        "${name_width}" "Name" "${gap}" \
+        "${interface_width}" "Interface" "${gap}" \
+        "${network_width}" "Tunnel Network" "${gap}" \
+        "${management_width}" "Management" "${gap}" \
+        "${connection_width}" "Connection" "${gap}" \
+        "${auth_width}" "Authentication ID"
+
+    printf '%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s\n' \
+        "${number_width}" "──" "${gap}" \
+        "${name_width}" "──────────────────────" "${gap}" \
+        "${interface_width}" "──────────" "${gap}" \
+        "${network_width}" "────────────────────" "${gap}" \
+        "${management_width}" "──────────────────────" "${gap}" \
+        "${connection_width}" "──────────────" "${gap}" \
+        "${auth_width}" "────────────────────────"
 
     local index=1 name management connection display_name display_auth
     while read -r name; do
@@ -946,22 +968,28 @@ show_existing_tunnels() {
         display_name="$(truncate_table_value "${NAME}" "${name_width}")"
         display_auth="$(truncate_table_value "${AUTH_ID}" "${auth_width}")"
 
-        printf '%-4s %-20s %-10s %-20s %-22s ' \
-            "${index}" "${display_name}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${management}"
+        printf '%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s' \
+            "${number_width}" "${index}" "${gap}" \
+            "${name_width}" "${display_name}" "${gap}" \
+            "${interface_width}" "${VTI_INTERFACE}" "${gap}" \
+            "${network_width}" "${VTI_NETWORK}" "${gap}" \
+            "${management_width}" "${management}" "${gap}"
 
         case "${connection}" in
             CONNECTED)
-                printf '%b%-14s%b ' "${C_GREEN}${C_BOLD}" "${connection}" "${C_RESET}"
+                printf '%b%-*s%b%s' \
+                    "${C_GREEN}${C_BOLD}" "${connection_width}" "${connection}" "${C_RESET}" "${gap}"
                 ;;
             DISCONNECTED)
-                printf '%b%-14s%b ' "${C_RED}${C_BOLD}" "${connection}" "${C_RESET}"
+                printf '%b%-*s%b%s' \
+                    "${C_RED}${C_BOLD}" "${connection_width}" "${connection}" "${C_RESET}" "${gap}"
                 ;;
             *)
-                printf '%-14s ' "${connection}"
+                printf '%-*s%s' "${connection_width}" "${connection}" "${gap}"
                 ;;
         esac
 
-        printf '%-24s\n' "${display_auth}"
+        printf '%-*s\n' "${auth_width}" "${display_auth}"
         ((index += 1))
     done < <(list_tunnel_names)
 }
