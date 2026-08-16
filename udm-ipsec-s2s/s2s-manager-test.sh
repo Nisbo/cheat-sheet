@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.13-test"
+VERSION="0.14-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1328,6 +1328,12 @@ connections {
 
         proposals = aes256-sha256-modp2048
 
+        # UniFi IKE lifetime: 28800s (8h).
+        # strongSwan's hard IKE lifetime is rekey_time + over_time.
+        rekey_time = 26182s
+        over_time = 2618s
+        rand_time = 2618s
+
         local {
             auth = psk
             id = ${PUBLIC_IP}
@@ -1344,6 +1350,12 @@ connections {
                 remote_ts = 0.0.0.0/0
 
                 esp_proposals = aes256-sha256-modp2048
+
+                # UniFi ESP lifetime: 3600s (1h).
+                # Rekey early to avoid both peers reaching the hard lifetime together.
+                life_time = 3600s
+                rekey_time = 3273s
+                rand_time = 327s
 
                 mark_in = ${VTI_KEY}
                 mark_out = ${VTI_KEY}
@@ -1623,23 +1635,36 @@ tunnel_is_installed() {
 
 reapply_installed_tunnel() {
     local name="$1"
+    local mode="${2:-changed}"
 
     load_tunnel "${name}" || return 1
 
     echo
     info "Tunnel '${name}' is currently installed."
-    echo "The saved configuration has changed."
+
+    if [[ "${mode}" == "manual" ]]; then
+        echo "The manager will regenerate and re-apply the Debian-side configuration"
+        echo "from the currently saved tunnel definition."
+    else
+        echo "The saved configuration has changed."
+        echo
+        echo "The manager can re-apply the Debian-side configuration now."
+    fi
+
     echo
-    echo "The manager can re-apply the Debian-side configuration now."
     echo "The existing PSK is kept unchanged."
     echo "No UniFi-side settings need to be changed."
     echo
 
-    confirm_yes_no "Apply the updated configuration now?" "Y" || {
-        warn "Change saved in manager state only."
-        info "The installed tunnel still uses the previous generated configuration."
-        return 0
-    }
+    if [[ "${mode}" == "manual" ]]; then
+        confirm_yes_no "Re-apply this tunnel now?" "Y" || return 0
+    else
+        confirm_yes_no "Apply the updated configuration now?" "Y" || {
+            warn "Change saved in manager state only."
+            info "The installed tunnel still uses the previous generated configuration."
+            return 0
+        }
+    fi
 
     section "RE-APPLYING TUNNEL"
 
@@ -1684,6 +1709,45 @@ reapply_installed_tunnel() {
     echo
     ok "Updated configuration applied."
     return 0
+}
+
+manual_reapply_tunnel() {
+    banner
+    section "RE-APPLY INSTALLED TUNNEL"
+
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+
+    if [[ "${INSTALLED}" != "1" ]]; then
+        warn "Tunnel '${name}' is not installed on Debian."
+        echo "Use 'Install defined tunnel on Debian' first."
+        pause
+        return
+    fi
+
+    echo
+    printf '%-28s %s\n' "Tunnel:" "${NAME}"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+    echo
+    info "Re-apply regenerates the manager-owned strongSwan, VTI and systemd"
+    echo "configuration from the saved definition."
+    echo
+    echo "The PSK is NOT regenerated."
+    echo "The tunnel definition is NOT changed."
+    echo "The UniFi configuration is NOT changed."
+    echo
+
+    reapply_installed_tunnel "${name}" "manual" || {
+        error "Re-applying tunnel '${name}' failed."
+        pause
+        return 1
+    }
+
+    pause
 }
 
 # ==============================================================================
@@ -2511,6 +2575,7 @@ main_menu() {
         echo "  [8] Show UniFi configuration"
         echo "  [9] Tunnel diagnostics"
         echo "  [10] Show system status"
+        echo "  [11] Re-apply installed tunnel"
         echo "  [E] Exit"
         echo
 
@@ -2528,6 +2593,7 @@ main_menu() {
             8) show_unifi_configuration ;;
             9) show_tunnel_diagnostics ;;
             10) show_system_status ;;
+            11) manual_reapply_tunnel ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
