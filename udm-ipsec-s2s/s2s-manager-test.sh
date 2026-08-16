@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.12-test"
+VERSION="0.13-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -868,7 +868,10 @@ select_tunnel() {
     echo
     read -r -p "Selection: " selection
 
-    case "${selection}" in ""|b|B|0) return 1 ;; esac
+    case "${selection}" in
+        ""|b|B|0) return 1 ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
 
     [[ "${selection}" =~ ^[0-9]+$ ]] || return 1
     (( selection >= 1 && selection <= ${#names[@]} )) || return 1
@@ -963,13 +966,14 @@ prompt_tunnel_network() {
             echo
             echo "  [1] Use ${value%%/*}/30"
             echo "  [2] Enter another network"
-            echo "  [0] Cancel"
+            echo "  [B] Back"
+            echo "  [E] Exit"
             echo
             read -r -p "Selection: " choice
             case "${choice}" in
                 1) value="${value%%/*}/30"; normalized="$(normalize_30_network "${value}")" || continue ;;
-                [bB]|0) return 1 ;;
-            [eE]) clear_screen; echo "Bye."; exit 0 ;;
+                b|B|0) return 1 ;;
+                e|E) clear_screen; echo "Bye."; exit 0 ;;
                 *) continue ;;
             esac
         fi
@@ -1065,6 +1069,8 @@ prompt_psk() {
     echo
     echo "  [1] Generate a secure random PSK"
     echo "  [2] Enter my own PSK"
+    echo "  [B] Back"
+    echo "  [E] Exit"
     echo
     echo "Press ENTER to use option 1."
     echo
@@ -1085,6 +1091,8 @@ prompt_psk() {
                 PROMPT_PSK="${value}"
                 return
                 ;;
+            b|B|0) return 1 ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection." ;;
         esac
     done
@@ -1145,7 +1153,8 @@ EOF
         echo
         echo "  [1] Install UFW and configure it safely"
         echo "  [2] Continue without UFW"
-        echo "  [0] Cancel"
+        echo "  [B] Back"
+        echo "  [E] Exit"
         echo
         read -r -p "Selection: " choice
 
@@ -1177,7 +1186,8 @@ EOF
                     echo
                     echo "  [1] Add additional firewall rule"
                     echo "  [2] Review and continue"
-                    echo "  [0] Cancel (UFW remains disabled)"
+                    echo "  [B] Back (UFW remains disabled)"
+                    echo "  [E] Exit"
                     echo
                     read -r -p "Selection: " action
 
@@ -1205,8 +1215,8 @@ EOF
                             pause
                             ;;
                         2) break ;;
-                        [bB]|0) return 0 ;;
-            [eE]) clear_screen; echo "Bye."; exit 0 ;;
+                        b|B|0) return 0 ;;
+                        e|E) clear_screen; echo "Bye."; exit 0 ;;
                     esac
                 done
 
@@ -1242,6 +1252,8 @@ EOF
                 return 0
                 ;;
             2) return 0 ;;
+            b|B|0) return 1 ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
             *) return 1 ;;
         esac
     fi
@@ -1253,12 +1265,15 @@ EOF
         echo
         echo "  [1] Add managed IPsec rules and keep UFW disabled"
         echo "  [2] Skip firewall changes"
-        echo "  [0] Cancel"
+        echo "  [B] Back"
+        echo "  [E] Exit"
         echo
         read -r -p "Selection: " choice
         case "${choice}" in
             1) ;;
             2) return 0 ;;
+            b|B|0) return 1 ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
             *) return 1 ;;
         esac
     fi
@@ -1714,7 +1729,7 @@ add_tunnel_definition() {
     local -a routes=("${PROMPT_ROUTES[@]:-}")
 
     section "STEP 6/6  Pre-Shared Key"
-    prompt_psk
+    prompt_psk || return
     local psk="${PROMPT_PSK}"
 
     local idx interface key
@@ -1784,13 +1799,16 @@ add_remote_network() {
 
     echo
     echo "Enter a CIDR network, e.g. 192.168.50.0/24"
-    echo "Press ENTER or type B to go back."
+    echo "Press ENTER or B to go back. E = Exit."
     echo
 
     local new_route
     while :; do
         read -r -p "New remote network: " new_route
-        case "${new_route}" in ""|b|B) return ;; esac
+        case "${new_route}" in
+            ""|b|B|0) return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+        esac
 
         valid_cidr "${new_route}" || { error "Invalid CIDR network."; echo; continue; }
         read_routes "${name}" | grep -Fxq "${new_route}" &&
@@ -1841,11 +1859,15 @@ remove_remote_network() {
         printf '  [%d] %s\n' "$((i + 1))" "${routes[$i]}"
     done
     echo
-    echo "Enter tunnel number and press ENTER."
+    echo "Enter network number and press ENTER."
     echo "B = Back    E = Exit"
-    read -r -p "Select network to remove: " selection
+    echo
+    read -r -p "Selection: " selection
 
-    case "${selection}" in ""|b|B|0) return ;; esac
+    case "${selection}" in
+        ""|b|B|0) return ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
     [[ "${selection}" =~ ^[0-9]+$ ]] || return
     (( selection >= 1 && selection <= ${#routes[@]} )) || return
 
@@ -2040,6 +2062,7 @@ show_unifi_configuration() {
                 fi
                 ;;
             0|""|b|B) return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
     done
@@ -2464,7 +2487,7 @@ setup_required_menu() {
         case "${choice}" in
             1) install_or_repair_prerequisites ;;
             2) ;;
-            0) exit 0 ;;
+            e|E|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
     done
