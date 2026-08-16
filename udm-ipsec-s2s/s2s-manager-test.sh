@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.8-test"
+VERSION="0.9-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -111,11 +111,24 @@ pause() {
 
 banner() {
     clear_screen
+
+    local width=62
+    local title="UniFi IPsec S2S Manager"
+    local version_text="Version ${VERSION}"
+    local left right
+
     printf '%b' "${C_CYAN}${C_BOLD}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                 UniFi IPsec S2S Manager                    ║"
-    printf '║                 Version %-35s║\n' "${VERSION}"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    printf '╔%s╗\n' "$(printf '═%.0s' $(seq 1 ${width}))"
+
+    left=$(( (width - ${#title}) / 2 ))
+    right=$(( width - ${#title} - left ))
+    printf '║%*s%s%*s║\n' "${left}" '' "${title}" "${right}" ''
+
+    left=$(( (width - ${#version_text}) / 2 ))
+    right=$(( width - ${#version_text} - left ))
+    printf '║%*s%s%*s║\n' "${left}" '' "${version_text}" "${right}" ''
+
+    printf '╚%s╝\n' "$(printf '═%.0s' $(seq 1 ${width}))"
     printf '%b' "${C_RESET}"
     echo
     printf '%b\n' "${C_YELLOW}${C_BOLD}DEVELOPMENT / TEST BUILD${C_RESET}"
@@ -759,6 +772,31 @@ next_vti_network() {
     printf '10.200.251.0/30'
 }
 
+tunnel_connection_state() {
+    local name="$1"
+    local conn="${MANAGED_PREFIX}-${name}"
+    local sa
+
+    if ! command_available swanctl; then
+        printf 'UNKNOWN'
+        return
+    fi
+
+    sa="$(swanctl_clean swanctl --list-sas 2>/dev/null || true)"
+
+    if grep -qE "^${conn}: .*ESTABLISHED" <<< "${sa}" && \
+       awk -v c="${conn}:" '
+           $0 ~ "^" c {show=1; next}
+           show && /^[^[:space:]]/ {exit}
+           show && /INSTALLED/ {found=1; exit}
+           END {exit found ? 0 : 1}
+       ' <<< "${sa}"; then
+        printf 'CONNECTED'
+    else
+        printf 'DISCONNECTED'
+    fi
+}
+
 # ==============================================================================
 # Tunnel list / selection
 # ==============================================================================
@@ -772,23 +810,40 @@ show_existing_tunnels() {
         return
     fi
 
-    printf '%-4s %-16s %-12s %-20s %-12s %-24s\n' \
-        "#" "Name" "Interface" "Tunnel Network" "State" "Authentication ID"
-    printf '%-4s %-16s %-12s %-20s %-12s %-24s\n' \
-        "──" "────────────────" "────────────" "────────────────────" "────────────" "────────────────────────"
+    printf '%-4s %-16s %-10s %-20s %-12s %-14s %-24s\n' \
+        "#" "Name" "Interface" "Tunnel Network" "State" "Connection" "Authentication ID"
+    printf '%-4s %-16s %-10s %-20s %-12s %-14s %-24s\n' \
+        "──" "────────────────" "──────────" "────────────────────" "────────────" "──────────────" "────────────────────────"
 
-    local index=1 name state
+    local index=1 name state connection
     while read -r name; do
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
+
         if [[ "${INSTALLED}" == "1" ]]; then
             state="INSTALLED"
+            connection="$(tunnel_connection_state "${NAME}")"
         else
             state="DEFINED"
+            connection="-"
         fi
 
-        printf '%-4s %-16s %-12s %-20s %-12s %-24s\n' \
-            "${index}" "${NAME}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${state}" "${AUTH_ID}"
+        printf '%-4s %-16s %-10s %-20s %-12s ' \
+            "${index}" "${NAME}" "${VTI_INTERFACE}" "${VTI_NETWORK}" "${state}"
+
+        case "${connection}" in
+            CONNECTED)
+                printf '%b%-14s%b ' "${C_GREEN}${C_BOLD}" "${connection}" "${C_RESET}"
+                ;;
+            DISCONNECTED)
+                printf '%b%-14s%b ' "${C_RED}${C_BOLD}" "${connection}" "${C_RESET}"
+                ;;
+            *)
+                printf '%-14s ' "${connection}"
+                ;;
+        esac
+
+        printf '%-24s\n' "${AUTH_ID}"
         ((index += 1))
     done < <(list_tunnel_names)
 }
@@ -2079,6 +2134,29 @@ human_bytes() {
     fi
 }
 
+
+human_duration() {
+    local seconds="${1:-0}"
+    local d h m s
+
+    [[ "${seconds}" =~ ^[0-9]+$ ]] || { printf '%s' "${seconds}"; return; }
+
+    d=$((seconds / 86400))
+    h=$(((seconds % 86400) / 3600))
+    m=$(((seconds % 3600) / 60))
+    s=$((seconds % 60))
+
+    if (( d > 0 )); then
+        printf '%dd %02dh %02dm %02ds' "${d}" "${h}" "${m}" "${s}"
+    elif (( h > 0 )); then
+        printf '%dh %02dm %02ds' "${h}" "${m}" "${s}"
+    elif (( m > 0 )); then
+        printf '%dm %02ds' "${m}" "${s}"
+    else
+        printf '%ds' "${s}"
+    fi
+}
+
 get_tunnel_sa_output() {
     local name="$1"
     local conn="${MANAGED_PREFIX}-${name}"
@@ -2138,14 +2216,25 @@ show_tunnel_diagnostics() {
     echo
     section "ROUTING"
 
-    local route
+    local route test_ip lookup
     printf '%-28s %s\n' "Table:" "220"
     while read -r route; do
         [[ -z "${route}" ]] && continue
-        if ip route show table 220 | grep -Fq "${route} dev ${VTI_INTERFACE}"; then
+
+        if [[ "${route}" == "${VTI_NETWORK}" ]]; then
+            test_ip="${UNIFI_VTI_IP}"
+        else
+            test_ip="${route%%/*}"
+        fi
+
+        lookup="$(ip route get "${test_ip}" 2>/dev/null || true)"
+
+        if grep -q "dev ${VTI_INTERFACE}" <<< "${lookup}" && \
+           grep -q "table 220" <<< "${lookup}"; then
             ok "${route} -> ${VTI_INTERFACE}"
         else
-            error "${route} is missing from table 220"
+            error "${route} is not routed via ${VTI_INTERFACE} / table 220"
+            [[ -n "${lookup}" ]] && printf '    Kernel lookup: %s\n' "${lookup}"
         fi
     done < <(printf '%s\n' "${VTI_NETWORK}"; read_routes "${name}")
 
@@ -2177,15 +2266,18 @@ show_tunnel_diagnostics() {
             info "Transport: native ESP tunnel"
         fi
 
-        local established
+        local established uptime_seconds
         established="$(grep -m1 -oE 'established [0-9]+s ago' <<< "${sa}" || true)"
-        [[ -n "${established}" ]] && printf '%-28s %s\n' "Uptime:" "${established#established }"
+        if [[ -n "${established}" ]]; then
+            uptime_seconds="$(grep -oE '[0-9]+' <<< "${established}" | head -1)"
+            printf '%-28s %s\n' "Uptime:" "$(human_duration "${uptime_seconds}")"
+        fi
 
         local in_bytes out_bytes in_packets out_packets
         in_bytes="$(awk '/^[[:space:]]+in[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="bytes,"){print $(i-1); exit}}' <<< "${sa}")"
         out_bytes="$(awk '/^[[:space:]]+out[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="bytes,"){print $(i-1); exit}}' <<< "${sa}")"
-        in_packets="$(awk '/^[[:space:]]+in[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="packets"){print $(i-1); exit}}' <<< "${sa}")"
-        out_packets="$(awk '/^[[:space:]]+out[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="packets"){print $(i-1); exit}}' <<< "${sa}")"
+        in_packets="$(awk '/^[[:space:]]+in[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="packets," || $i=="packets"){print $(i-1); exit}}' <<< "${sa}")"
+        out_packets="$(awk '/^[[:space:]]+out[[:space:]]/ {for(i=1;i<=NF;i++) if($i=="packets," || $i=="packets"){print $(i-1); exit}}' <<< "${sa}")"
 
         [[ -n "${in_bytes}" ]] && printf '%-28s %s (%s packets)\n' "Traffic IN:" "$(human_bytes "${in_bytes}")" "${in_packets:-0}"
         [[ -n "${out_bytes}" ]] && printf '%-28s %s (%s packets)\n' "Traffic OUT:" "$(human_bytes "${out_bytes}")" "${out_packets:-0}"
