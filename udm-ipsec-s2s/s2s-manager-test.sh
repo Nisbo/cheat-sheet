@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.19-test"
+VERSION="0.20-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -2574,6 +2574,120 @@ takeover_rollback() {
     echo "UniFi should reconnect to the restored external configuration automatically."
 }
 
+
+takeover_analyze_old_service() {
+    local service="$1"
+    local unit_file="${SYSTEMD_DIR}/${service}"
+
+    TAKEOVER_OLD_SERVICE_PRESENT=0
+    TAKEOVER_OLD_SERVICE_ACTIVE=0
+    TAKEOVER_OLD_SERVICE_STOP_HOOKS=0
+    TAKEOVER_OLD_SERVICE_SAFE_STOP=0
+    TAKEOVER_OLD_SERVICE_NOTE="No external systemd service detected."
+
+    [[ -n "${service}" ]] || return 0
+
+    if [[ -f "${unit_file}" ]]; then
+        TAKEOVER_OLD_SERVICE_PRESENT=1
+    fi
+
+    if systemctl is-active --quiet "${service}" 2>/dev/null; then
+        TAKEOVER_OLD_SERVICE_ACTIVE=1
+    fi
+
+    if [[ -f "${unit_file}" ]] &&
+       grep -Eq '^[[:space:]]*ExecStop(Post)?[[:space:]]*=' "${unit_file}"; then
+        TAKEOVER_OLD_SERVICE_STOP_HOOKS=1
+    fi
+
+    if [[ "${TAKEOVER_OLD_SERVICE_ACTIVE}" == "1" &&
+          "${TAKEOVER_OLD_SERVICE_STOP_HOOKS}" == "0" ]]; then
+        TAKEOVER_OLD_SERVICE_SAFE_STOP=1
+        TAKEOVER_OLD_SERVICE_NOTE="Active; no ExecStop/ExecStopPost hooks detected. Safe state-only stop planned."
+    elif [[ "${TAKEOVER_OLD_SERVICE_ACTIVE}" == "1" &&
+            "${TAKEOVER_OLD_SERVICE_STOP_HOOKS}" == "1" ]]; then
+        TAKEOVER_OLD_SERVICE_NOTE="Active; stop hooks detected. Manager will NOT automatically stop it."
+    elif [[ "${TAKEOVER_OLD_SERVICE_ACTIVE}" == "0" ]]; then
+        TAKEOVER_OLD_SERVICE_NOTE="Not active; no runtime stop required."
+    fi
+}
+
+show_takeover_backups() {
+    banner
+    section "TAKE OVER BACKUPS"
+
+    echo "Take Over backups are stored under:"
+    echo "  ${BACKUP_DIR}"
+    echo
+    echo "They are retained after a successful Take Over and after rollback."
+    echo "The manager does NOT automatically delete or prune these backups."
+    echo
+
+    if [[ ! -d "${BACKUP_DIR}" ]]; then
+        info "No Take Over backups found."
+        pause
+        return
+    fi
+
+    local -a backups=()
+    local d
+    while IFS= read -r d; do
+        backups+=("${d}")
+    done < <(find "${BACKUP_DIR}" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -r)
+
+    if (( ${#backups[@]} == 0 )); then
+        info "No Take Over backups found."
+        pause
+        return
+    fi
+
+    local i base tunnel stamp files size
+    printf '%-4s %-28s %-17s %-8s %s\n' "#" "Tunnel / Backup" "Timestamp" "Files" "Size"
+    printf '%-4s %-28s %-17s %-8s %s\n' "──" "────────────────────────────" "─────────────────" "────────" "────────"
+    for i in "${!backups[@]}"; do
+        d="${backups[$i]}"
+        base="$(basename "${d}")"
+        stamp="${base##*-}"
+        # timestamp consists of YYYYMMDD-HHMMSS, so recover the last two dash-separated parts
+        if [[ "${base}" =~ ^(.+)-([0-9]{8})-([0-9]{6})$ ]]; then
+            tunnel="${BASH_REMATCH[1]}"
+            stamp="${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+            stamp="${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:${stamp:13:2}"
+        else
+            tunnel="${base}"
+        fi
+        files="$(find "${d}" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+        size="$(du -sh "${d}" 2>/dev/null | awk '{print $1}')"
+        printf '%-4s %-28s %-17s %-8s %s\n' "$((i+1))" "${tunnel}" "${stamp}" "${files}" "${size:-?}"
+    done
+
+    echo
+    echo "Enter backup number to show its contents."
+    echo "B = Back    E = Exit"
+
+    local choice selected
+    read -r -p "Selection: " choice
+    case "${choice}" in
+        [bB]|0|"") return ;;
+        [eE]) clear_screen; echo "Bye."; exit 0 ;;
+    esac
+
+    [[ "${choice}" =~ ^[0-9]+$ ]] || { error "Invalid selection."; sleep 1; return; }
+    (( choice >= 1 && choice <= ${#backups[@]} )) || { error "Invalid selection."; sleep 1; return; }
+
+    selected="${backups[$((choice-1))]}"
+    banner
+    section "BACKUP DETAILS"
+    printf '%-30s %s\n' "Backup:" "${selected}"
+    printf '%-30s %s\n' "Size:" "$(du -sh "${selected}" 2>/dev/null | awk '{print $1}')"
+    echo
+    echo "Preserved files:"
+    find "${selected}" -maxdepth 1 -type f -printf '  • %f\n' 2>/dev/null | sort
+    echo
+    info "Backups are read-only from this menu; nothing is restored or deleted here."
+    pause
+}
+
 takeover_imported_tunnel() {
     banner
     section "TAKE OVER IMPORTED TUNNEL"
@@ -2596,6 +2710,8 @@ takeover_imported_tunnel() {
     local old_service="${SOURCE_SERVICE}"
     local old_forced_natt="${SOURCE_FORCED_NATT:-0}"
     local source_psk
+
+    takeover_analyze_old_service "${old_service}"
 
     source_psk="$(extract_psk_from_swan_file "${old_swan}" 2>/dev/null || true)"
     if [[ -z "${source_psk}" ]]; then
@@ -2621,6 +2737,9 @@ takeover_imported_tunnel() {
     printf '  strongSwan:  %s\n' "${old_swan:-not detected}"
     printf '  VTI script:  %s\n' "${old_vti_script:-not detected}"
     printf '  systemd:     %s\n' "${old_service:-not detected}"
+    if [[ -n "${old_service}" ]]; then
+        printf '  service state: %s\n' "${TAKEOVER_OLD_SERVICE_NOTE}"
+    fi
     echo
 
     echo "Manager files that will replace them:"
@@ -2642,6 +2761,15 @@ takeover_imported_tunnel() {
         echo
     fi
 
+    echo "SAFETY / BACKUP:"
+    echo "  • Take Over modifies an existing IPsec/VTI installation."
+    echo "  • Use at your own risk; console or provider access is recommended."
+    echo "  • The manager creates a timestamped backup BEFORE changing the source files."
+    echo "  • Backups are retained under ${BACKUP_DIR} and are NOT auto-deleted."
+    echo "  • Automatic rollback uses that backup if a later Take Over step fails."
+    echo "  • A backup reduces risk, but cannot guarantee recovery from every external"
+    echo "    network, firewall, systemd or host-specific configuration."
+    echo
     echo "Take Over will perform these exact 12 steps:"
     echo "  1. Back up the original files."
     echo "  2. Refresh the manager PSK from the original strongSwan config."
@@ -2649,7 +2777,7 @@ takeover_imported_tunnel() {
     echo "  4. Validate the staged manager connection while the old tunnel stays up."
     echo "  5. Write the manager VTI script."
     echo "  6. Write the manager systemd service."
-    echo "  7. Disable the old VTI service."
+    echo "  7. Disable the old VTI service and safely clear its runtime state when possible."
     echo "  8. Activate manager files and retire the old external files."
     echo "  9. Reload and verify the manager strongSwan connection."
     echo " 10. Enable the manager VTI service."
@@ -2752,9 +2880,21 @@ takeover_imported_tunnel() {
         return 1
     fi
 
-    printf '[7/12] Disabling old VTI service... '
+    printf '[7/12] Retiring old VTI service safely... '
     if [[ -n "${old_service}" ]]; then
         systemctl disable "${old_service}" >/tmp/s2s-manager-takeover-disable-old.log 2>&1 || true
+
+        if [[ "${TAKEOVER_OLD_SERVICE_SAFE_STOP}" == "1" ]]; then
+            # No ExecStop/ExecStopPost hooks were found. For a oneshot service
+            # with RemainAfterExit this clears only systemd's stale active state.
+            systemctl stop "${old_service}" >/tmp/s2s-manager-takeover-stop-old.log 2>&1 || true
+        elif [[ "${TAKEOVER_OLD_SERVICE_ACTIVE}" == "1" &&
+                "${TAKEOVER_OLD_SERVICE_STOP_HOOKS}" == "1" ]]; then
+            # Do not execute unknown external teardown hooks automatically.
+            printf '%bWARNING%b\n' "${C_YELLOW}" "${C_RESET}"
+            warn "Old service has ExecStop/ExecStopPost hooks and was not stopped automatically."
+            printf '       '
+        fi
     fi
     printf '%b\n' "${C_GREEN}OK${C_RESET}"
 
@@ -2846,6 +2986,7 @@ EOF
     echo
     info "The original PSK was retained."
     info "The original files are preserved in the Take Over backup."
+    info "Take Over backups are retained until you remove them manually."
     pause
 }
 
@@ -3734,6 +3875,7 @@ main_menu() {
         echo "  [12] Reconnect tunnel"
         echo "  [13] Discover / import existing tunnels"
         echo "  [14] Take over imported tunnel"
+        echo "  [15] Show Take Over backups"
         echo "  [E] Exit"
         echo
 
@@ -3755,6 +3897,7 @@ main_menu() {
             12) manual_reconnect_tunnel ;;
             13) discover_existing_tunnels ;;
             14) takeover_imported_tunnel ;;
+            15) show_takeover_backups ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
