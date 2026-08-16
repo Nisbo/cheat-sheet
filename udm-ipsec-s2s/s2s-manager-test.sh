@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.14-test"
+VERSION="0.15-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1734,11 +1734,16 @@ manual_reapply_tunnel() {
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
     echo
     info "Re-apply regenerates the manager-owned strongSwan, VTI and systemd"
-    echo "configuration from the saved definition."
+    echo "configuration from the saved definition and reloads it."
     echo
     echo "The PSK is NOT regenerated."
     echo "The tunnel definition is NOT changed."
     echo "The UniFi configuration is NOT changed."
+    echo
+    echo "IMPORTANT:"
+    echo "An already established IPsec connection is kept active."
+    echo "Changes that affect IKE or CHILD SAs may therefore take effect"
+    echo "only during the next automatic rekey."
     echo
 
     reapply_installed_tunnel "${name}" "manual" || {
@@ -1747,7 +1752,178 @@ manual_reapply_tunnel() {
         return 1
     }
 
+    echo
+    ok "Tunnel configuration successfully re-applied."
+    echo
+    info "The current IPsec connection was kept active."
+    echo "Changes affecting IKE or CHILD SAs may become effective only"
+    echo "during the next automatic rekey."
+    echo
+
+    while :; do
+        echo "  [1] Reconnect tunnel now"
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+        local choice
+        read -r -p "Selection: " choice
+
+        case "${choice}" in
+            1)
+                reconnect_tunnel_by_name "${name}"
+                return
+                ;;
+            b|B|0|"")
+                return
+                ;;
+            e|E)
+                clear_screen
+                echo "Bye."
+                exit 0
+                ;;
+            *)
+                error "Invalid selection."
+                ;;
+        esac
+    done
+}
+
+reconnect_tunnel_by_name() {
+    local name="$1"
+
+    load_tunnel "${name}" || return 1
+
+    local conn="${MANAGED_PREFIX}-${name}"
+    local timeout=60
+    local start end elapsed
+    local sa=""
+    local i
+
+    clear
+    banner
+    section "RECONNECT TUNNEL"
+
+    printf '%-28s %s\n' "Tunnel:" "${NAME}"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    echo
+    echo "Reconnect terminates the current IKE/CHILD SAs."
+    echo "The UniFi side will then establish a new IPsec connection."
+    echo
+    echo "Traffic through the tunnel will be interrupted briefly."
+    echo "The PSK and tunnel configuration are NOT changed."
+    echo
+    echo "In testing, UniFi usually reconnects after about 10 seconds."
+    echo "The manager will wait up to ${timeout} seconds."
+    echo
+
+    confirm_yes_no "Reconnect tunnel now?" "N" || return 0
+
+    section "RECONNECTING"
+
+    printf '[1/3] Terminating current IPsec connection... '
+    if swanctl_clean swanctl --terminate --ike "${conn}" >/tmp/s2s-manager-reconnect-terminate.log 2>&1; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        cat /tmp/s2s-manager-reconnect-terminate.log
+        return 1
+    fi
+
+    printf '[2/3] Waiting for UniFi to reconnect... '
+    start="$(date +%s)"
+
+    for i in $(seq 1 "${timeout}"); do
+        sa="$(swanctl_clean swanctl --list-sas 2>/dev/null || true)"
+
+        if grep -qE "^${conn}: .*ESTABLISHED" <<< "${sa}" &&
+           awk -v c="${conn}:" '
+               $0 ~ "^" c {show=1}
+               show && /INSTALLED/ {found=1; exit}
+               END {exit found ? 0 : 1}
+           ' <<< "${sa}"; then
+            end="$(date +%s)"
+            elapsed=$((end - start))
+            printf '%bOK%b (%ss)\n' "${C_GREEN}" "${C_RESET}" "${elapsed}"
+            break
+        fi
+
+        sleep 1
+    done
+
+    if ! grep -qE "^${conn}: .*ESTABLISHED" <<< "${sa}" ||
+       ! awk -v c="${conn}:" '
+           $0 ~ "^" c {show=1}
+           show && /INSTALLED/ {found=1; exit}
+           END {exit found ? 0 : 1}
+       ' <<< "${sa}"; then
+        printf '\n'
+        error "UniFi did not reconnect within ${timeout} seconds."
+        echo
+        echo "The tunnel configuration was NOT changed."
+        echo "Use Tunnel diagnostics and recent strongSwan logs for troubleshooting."
+        pause
+        return 1
+    fi
+
+    # UniFi showed one lost ICMP packet immediately after SA installation during testing.
+    sleep 2
+
+    printf '[3/3] Testing VTI connectivity...             '
+    if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-reconnect-ping.log 2>&1; then
+        printf '%bOK%b\n' "${C_GREEN}" "${C_RESET}"
+    else
+        # If at least one reply arrived, treat tunnel connectivity as established but warn.
+        if grep -Eq '[1-9][0-9]* received' /tmp/s2s-manager-reconnect-ping.log; then
+            printf '%bPARTIAL%b\n' "${C_YELLOW}" "${C_RESET}"
+            warn "Tunnel is connected, but the immediate VTI ping had packet loss."
+        else
+            printf '%bFAILED%b\n' "${C_RED}" "${C_RESET}"
+            error "IPsec SAs are installed, but the UniFi VTI address did not answer."
+        fi
+    fi
+
+    echo
+    ok "Tunnel '${name}' reconnected."
+
+    sa="$(swanctl_clean swanctl --list-sas 2>/dev/null || true)"
+    printf '%-28s %s\n' "Reconnect time:" "${elapsed}s"
+
+    if grep -qE "^${conn}: .*ESTABLISHED" <<< "${sa}"; then
+        printf '%-28s %s\n' "IKE:" "ESTABLISHED"
+    else
+        printf '%-28s %s\n' "IKE:" "NOT ESTABLISHED"
+    fi
+
+    if awk -v c="${conn}:" '
+        $0 ~ "^" c {show=1}
+        show && /INSTALLED/ {found=1; exit}
+        END {exit found ? 0 : 1}
+    ' <<< "${sa}"; then
+        printf '%-28s %s\n' "CHILD_SA:" "INSTALLED"
+    else
+        printf '%-28s %s\n' "CHILD_SA:" "NOT INSTALLED"
+    fi
+
     pause
+}
+
+manual_reconnect_tunnel() {
+    banner
+    section "RECONNECT TUNNEL"
+
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+
+    if [[ "${INSTALLED}" != "1" ]]; then
+        warn "Tunnel '${name}' is not installed on Debian."
+        pause
+        return
+    fi
+
+    reconnect_tunnel_by_name "${name}"
 }
 
 # ==============================================================================
@@ -2576,6 +2752,7 @@ main_menu() {
         echo "  [9] Tunnel diagnostics"
         echo "  [10] Show system status"
         echo "  [11] Re-apply installed tunnel"
+        echo "  [12] Reconnect tunnel"
         echo "  [E] Exit"
         echo
 
@@ -2594,6 +2771,7 @@ main_menu() {
             9) show_tunnel_diagnostics ;;
             10) show_system_status ;;
             11) manual_reapply_tunnel ;;
+            12) manual_reconnect_tunnel ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
