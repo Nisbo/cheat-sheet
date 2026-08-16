@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.27-test"
+VERSION="0.28-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -933,6 +933,7 @@ set_network_conflict() {
     NETWORK_CONFLICT_KIND="$1"
     NETWORK_CONFLICT_WITH="$2"
     NETWORK_CONFLICT_DETAIL="$3"
+    NETWORK_CONFLICT_SOURCE="${4:-unknown}"
 }
 
 check_manager_network_conflict() {
@@ -946,7 +947,8 @@ check_manager_network_conflict() {
 
         if cidr_overlaps "${candidate}" "${VTI_NETWORK}"; then
             set_network_conflict "TUNNEL" "${VTI_NETWORK}" \
-                "overlaps tunnel transfer network of '${NAME}'"
+                "overlaps tunnel transfer network" \
+                "S2S Manager tunnel '${NAME}'"
             return 0
         fi
 
@@ -955,7 +957,8 @@ check_manager_network_conflict() {
             valid_cidr "${route}" || continue
             if cidr_overlaps "${candidate}" "${route}"; then
                 set_network_conflict "REMOTE" "${route}" \
-                    "overlaps remote network of '${NAME}'"
+                    "overlaps configured remote network" \
+                    "S2S Manager tunnel '${NAME}'"
                 return 0
             fi
         done < <(read_routes "${name}")
@@ -988,7 +991,8 @@ check_live_system_route_conflict() {
 
         if cidr_overlaps "${candidate}" "${route}"; then
             set_network_conflict "SYSTEM" "${route}" \
-                "overlaps an existing live route${dev:+ on ${dev}}"
+                "overlaps an existing live Debian route" \
+                "Debian routing table${dev:+ (interface ${dev})}"
             return 0
         fi
     done < <(ip -4 route show table all 2>/dev/null)
@@ -1004,6 +1008,7 @@ check_network_conflict() {
     NETWORK_CONFLICT_KIND=""
     NETWORK_CONFLICT_WITH=""
     NETWORK_CONFLICT_DETAIL=""
+    NETWORK_CONFLICT_SOURCE=""
 
     check_manager_network_conflict "${candidate}" "${ignore_tunnel}" && return 0
     check_live_system_route_conflict "${candidate}" "${ignore_interface}" && return 0
@@ -1015,6 +1020,7 @@ show_network_conflict() {
         "NETWORK CONFLICT" \
         "Requested:       $1" \
         "Conflicts with:  ${NETWORK_CONFLICT_WITH}" \
+        "Source:          ${NETWORK_CONFLICT_SOURCE}" \
         "Reason:          ${NETWORK_CONFLICT_DETAIL}"
 }
 
@@ -1291,6 +1297,11 @@ prompt_tunnel_name() {
         echo "The tunnel name is used locally by the S2S Manager."
         echo "Examples: home, office, backup"
         echo
+        echo "Allowed:"
+        echo "  • 1-32 characters"
+        echo "  • letters, numbers, underscore (_) and hyphen (-)"
+        echo "  • first character must be a letter or number"
+        echo
         echo "Long names are allowed. Overview tables shorten long values for display only."
         echo "The complete tunnel name is always stored and used internally."
         echo
@@ -1299,8 +1310,23 @@ prompt_tunnel_name() {
         read -r -p "Tunnel name [${suggested}]: " value
         value="${value:-${suggested}}"
 
-        valid_tunnel_name "${value}" || { error "Invalid tunnel name."; echo; continue; }
-        tunnel_exists "${value}" && { error "Tunnel '${value}' already exists."; echo; continue; }
+        if ! valid_tunnel_name "${value}"; then
+            validation_error_block \
+                "INVALID TUNNEL NAME" \
+                "Entered:  ${value}" \
+                "Allowed:  letters, numbers, underscore (_) and hyphen (-)" \
+                "Length:   1-32 characters; first character must be alphanumeric" \
+                "Spaces and dots are not allowed."
+            continue
+        fi
+
+        if tunnel_exists "${value}"; then
+            validation_error_block \
+                "TUNNEL NAME ALREADY EXISTS" \
+                "Entered:  ${value}" \
+                "Source:   S2S Manager state"
+            continue
+        fi
 
         PROMPT_RESULT="${value}"
         return
@@ -1417,18 +1443,41 @@ prompt_auth_id() {
         echo "This is not an IP address and does not need to resolve in DNS."
         echo "Use a unique Authentication ID for every S2S tunnel."
         echo
+        echo "Allowed:"
+        echo "  • 1-64 characters"
+        echo "  • letters, numbers, dot (.), underscore (_), colon (:) and hyphen (-)"
+        echo "  • first character must be a letter or number"
+        echo
         echo "Press ENTER to accept the suggested value or enter another value."
         echo
         read -r -p "UniFi authentication ID [${suggested}]: " value
         value="${value:-${suggested}}"
 
-        valid_auth_id "${value}" || { error "Invalid Authentication ID."; echo; continue; }
-        auth_id_in_use "${value}" && { error "Authentication ID already in manager state."; echo; continue; }
-        auth_id_in_loaded_swan "${value}" && {
-            error "Authentication ID is already used by a loaded strongSwan connection."
-            echo
+        if ! valid_auth_id "${value}"; then
+            validation_error_block \
+                "INVALID AUTHENTICATION ID" \
+                "Entered:  ${value}" \
+                "Allowed:  letters, numbers, dot (.), underscore (_), colon (:) and hyphen (-)" \
+                "Length:   1-64 characters; first character must be alphanumeric" \
+                "Spaces are not allowed."
             continue
-        }
+        fi
+
+        if auth_id_in_use "${value}"; then
+            validation_error_block \
+                "AUTHENTICATION ID ALREADY IN USE" \
+                "Entered:  ${value}" \
+                "Source:   S2S Manager state"
+            continue
+        fi
+
+        if auth_id_in_loaded_swan "${value}"; then
+            validation_error_block \
+                "AUTHENTICATION ID ALREADY IN USE" \
+                "Entered:  ${value}" \
+                "Source:   loaded strongSwan connection"
+            continue
+        fi
 
         PROMPT_RESULT="${value}"
         return
