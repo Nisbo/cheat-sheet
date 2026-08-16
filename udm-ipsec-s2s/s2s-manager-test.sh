@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.23-test"
+VERSION="0.24-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -910,6 +910,14 @@ truncate_table_value() {
     fi
 }
 
+table_divider_segment() {
+    local width="$1"
+    local i
+    for ((i=0; i<width; i++)); do
+        printf '─'
+    done
+}
+
 show_existing_tunnels() {
     local count
     count="$(tunnel_count)"
@@ -940,14 +948,23 @@ show_existing_tunnels() {
         "${connection_width}" "Connection" "${gap}" \
         "${auth_width}" "Authentication ID"
 
-    printf '%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s\n' \
-        "${number_width}" "──" "${gap}" \
-        "${name_width}" "──────────────────────" "${gap}" \
-        "${interface_width}" "──────────" "${gap}" \
-        "${network_width}" "────────────────────" "${gap}" \
-        "${management_width}" "──────────────────────" "${gap}" \
-        "${connection_width}" "──────────────" "${gap}" \
-        "${auth_width}" "────────────────────────"
+    # Do not feed UTF-8 box-drawing characters through printf field widths:
+    # bash printf may count their bytes instead of their terminal columns.
+    # Generate each separator segment by character count instead.
+    table_divider_segment "${number_width}"
+    printf '%s' "${gap}"
+    table_divider_segment "${name_width}"
+    printf '%s' "${gap}"
+    table_divider_segment "${interface_width}"
+    printf '%s' "${gap}"
+    table_divider_segment "${network_width}"
+    printf '%s' "${gap}"
+    table_divider_segment "${management_width}"
+    printf '%s' "${gap}"
+    table_divider_segment "${connection_width}"
+    printf '%s' "${gap}"
+    table_divider_segment "${auth_width}"
+    printf '\n'
 
     local index=1 name management connection display_name display_auth
     while read -r name; do
