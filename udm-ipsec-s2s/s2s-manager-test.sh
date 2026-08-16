@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.9-test"
+VERSION="0.10-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -2169,6 +2169,72 @@ get_tunnel_sa_output() {
         '
 }
 
+
+get_tunnel_connected_since_epoch() {
+    local name="$1"
+    local conn="${MANAGED_PREFIX}-${name}"
+    local line epoch msg id
+    local history_known=0
+    local connected_since=""
+    local active_count=0
+    declare -A active_ike=()
+
+    # We only report a continuous connection start if the retained journal
+    # contains a reliable anchor. A strongSwan service start is such an anchor:
+    # no IKE SA can predate the daemon start.
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+
+        epoch="${line%% *}"
+        epoch="${epoch%%.*}"
+        [[ "${epoch}" =~ ^[0-9]+$ ]] || continue
+        msg="${line#* }"
+
+        if [[ "${msg}" == *"Started strongswan.service"* ]] || \
+           [[ "${msg}" == *"Started strongSwan IPsec"* ]]; then
+            active_ike=()
+            active_count=0
+            connected_since=""
+            history_known=1
+            continue
+        fi
+
+        if [[ "${msg}" =~ IKE_SA[[:space:]]+${conn}\[([0-9]+)\][[:space:]]+established[[:space:]]+between ]]; then
+            id="${BASH_REMATCH[1]}"
+            if [[ -z "${active_ike[$id]+x}" ]]; then
+                if (( active_count == 0 )) && (( history_known == 1 )); then
+                    connected_since="${epoch}"
+                fi
+                active_ike[$id]=1
+                ((active_count += 1))
+            fi
+            continue
+        fi
+
+        if [[ "${msg}" =~ deleting[[:space:]]+IKE_SA[[:space:]]+${conn}\[([0-9]+)\] ]]; then
+            id="${BASH_REMATCH[1]}"
+            if [[ -n "${active_ike[$id]+x}" ]]; then
+                unset 'active_ike[$id]'
+                ((active_count -= 1))
+                if (( active_count == 0 )); then
+                    connected_since=""
+                fi
+            fi
+            continue
+        fi
+    done < <(journalctl -u strongswan --no-pager -o short-unix 2>/dev/null)
+
+    # If the currently active SA is visible but we have no anchored start in
+    # the retained journal, do not guess. Let the caller report that it cannot
+    # be determined from logs.
+    if (( history_known == 1 )) && (( active_count > 0 )) && [[ -n "${connected_since}" ]]; then
+        printf '%s' "${connected_since}"
+        return 0
+    fi
+
+    return 1
+}
+
 show_tunnel_diagnostics() {
     banner
     section "TUNNEL DIAGNOSTICS"
@@ -2266,11 +2332,32 @@ show_tunnel_diagnostics() {
             info "Transport: native ESP tunnel"
         fi
 
-        local established uptime_seconds
+        local established ike_age_seconds child_installed child_age_seconds
+        local connected_since_epoch now_epoch connected_for_seconds
+
+        connected_since_epoch="$(get_tunnel_connected_since_epoch "${name}" 2>/dev/null || true)"
+        if [[ -n "${connected_since_epoch}" ]]; then
+            now_epoch="$(date +%s)"
+            connected_for_seconds=$((now_epoch - connected_since_epoch))
+            if (( connected_for_seconds >= 0 )); then
+                printf '%-28s %s\n' "Connected for:" "$(human_duration "${connected_for_seconds}")"
+            else
+                printf '%-28s %s\n' "Connected for:" "Cannot be determined from logs"
+            fi
+        else
+            printf '%-28s %s\n' "Connected for:" "Cannot be determined from logs"
+        fi
+
         established="$(grep -m1 -oE 'established [0-9]+s ago' <<< "${sa}" || true)"
         if [[ -n "${established}" ]]; then
-            uptime_seconds="$(grep -oE '[0-9]+' <<< "${established}" | head -1)"
-            printf '%-28s %s\n' "Uptime:" "$(human_duration "${uptime_seconds}")"
+            ike_age_seconds="$(grep -oE '[0-9]+' <<< "${established}" | head -1)"
+            printf '%-28s %s\n' "Current IKE SA age:" "$(human_duration "${ike_age_seconds}")"
+        fi
+
+        child_installed="$(grep -m1 -oE 'installed [0-9]+s ago' <<< "${sa}" || true)"
+        if [[ -n "${child_installed}" ]]; then
+            child_age_seconds="$(grep -oE '[0-9]+' <<< "${child_installed}" | head -1)"
+            printf '%-28s %s\n' "Current CHILD SA age:" "$(human_duration "${child_age_seconds}")"
         fi
 
         local in_bytes out_bytes in_packets out_packets
