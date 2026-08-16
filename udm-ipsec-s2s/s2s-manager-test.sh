@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.20-test"
+VERSION="0.21-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -2685,7 +2685,16 @@ show_takeover_backups() {
     find "${selected}" -maxdepth 1 -type f -printf '  • %f\n' 2>/dev/null | sort
     echo
     info "Backups are read-only from this menu; nothing is restored or deleted here."
-    pause
+    echo
+    echo "B = Back to backup list    E = Exit"
+
+    local detail_choice
+    read -r -p "Selection: " detail_choice
+    case "${detail_choice}" in
+        [eE]) clear_screen; echo "Bye."; exit 0 ;;
+        [bB]|0|"") show_takeover_backups; return ;;
+        *) error "Invalid selection."; sleep 1; show_takeover_backups; return ;;
+    esac
 }
 
 takeover_imported_tunnel() {
