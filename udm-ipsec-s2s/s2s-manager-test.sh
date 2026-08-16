@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.26-test"
+VERSION="0.27-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -103,6 +103,28 @@ error() {
 
 info() {
     printf '%b\n' "${C_CYAN}[i]${C_RESET} $*"
+}
+
+validation_error_block() {
+    local title="$1"
+    shift
+
+    echo
+    printf '%b\n' "${C_RED}${C_BOLD}──────────────────────────────────────────────────────────────${C_RESET}"
+    printf '%b\n' "${C_RED}${C_BOLD}  ✗ ${title}${C_RESET}"
+    printf '%b\n' "${C_RED}${C_BOLD}──────────────────────────────────────────────────────────────${C_RESET}"
+
+    local message
+    for message in "$@"; do
+        printf '%b\n' "${C_RED}${message}${C_RESET}"
+    done
+
+    printf '%b\n' "${C_RED}${C_BOLD}──────────────────────────────────────────────────────────────${C_RESET}"
+    echo
+}
+
+validation_success() {
+    printf '%b\n' "${C_GREEN}${C_BOLD}[✓] $*${C_RESET}"
 }
 
 pause() {
@@ -989,10 +1011,11 @@ check_network_conflict() {
 }
 
 show_network_conflict() {
-    error "Network conflict detected."
-    printf '%-18s %s\n' "Requested:" "$1"
-    printf '%-18s %s\n' "Conflicts with:" "${NETWORK_CONFLICT_WITH}"
-    printf '%-18s %s\n' "Reason:" "${NETWORK_CONFLICT_DETAIL}"
+    validation_error_block \
+        "NETWORK CONFLICT" \
+        "Requested:       $1" \
+        "Conflicts with:  ${NETWORK_CONFLICT_WITH}" \
+        "Reason:          ${NETWORK_CONFLICT_DETAIL}"
 }
 
 auth_id_in_loaded_swan() {
@@ -1337,13 +1360,10 @@ prompt_tunnel_network() {
         rc=$?
 
         if (( rc == 1 )); then
-            error "Invalid IPv4 network."
-            echo
+            validation_error_block                 "INVALID TUNNEL NETWORK"                 "The entered value is not a valid IPv4 network:"                 "  ${value}"
             continue
         elif (( rc == 2 )); then
-            warn "This manager uses /30 networks."
-            echo "You entered: ${value}"
-            echo "Suggested:   ${value%%/*}/30"
+            validation_error_block                 "WRONG PREFIX LENGTH"                 "This manager uses /30 transfer networks."                 "Entered:    ${value}"                 "Suggested:  ${value%%/*}/30"
             echo
             echo "  [1] Use ${value%%/*}/30"
             echo "  [2] Enter another network"
@@ -1361,11 +1381,7 @@ prompt_tunnel_network() {
 
         if ! network_is_exact_base "${value}"; then
             calculate_30_addresses "${normalized}"
-            warn "${value%%/*} is not a /30 network address."
-            printf '%-14s %s\n' "Network:" "${CALC_NETWORK}"
-            printf '%-14s %s\n' "Debian IP:" "${CALC_DEBIAN}"
-            printf '%-14s %s\n' "UniFi IP:" "${CALC_UNIFI}"
-            printf '%-14s %s\n' "Broadcast:" "${CALC_BROADCAST}"
+            validation_error_block                 "HOST ADDRESS ENTERED"                 "${value%%/*} is not the base address of a /30 network."                 "Calculated network:  ${CALC_NETWORK}"                 "Debian IP:           ${CALC_DEBIAN}"                 "UniFi IP:            ${CALC_UNIFI}"                 "Broadcast:           ${CALC_BROADCAST}"
             echo
             confirm_yes_no "Use this calculated /30 network?" "N" || continue
         fi
@@ -1378,7 +1394,7 @@ prompt_tunnel_network() {
 
         calculate_30_addresses "${normalized}"
 
-        ok "Valid /30 network"
+        validation_success "Tunnel network available: ${CALC_NETWORK}"
         printf '%-14s %s\n' "Network:" "${CALC_NETWORK}"
         printf '%-14s %s\n' "Debian IP:" "${CALC_DEBIAN}"
         printf '%-14s %s\n' "UniFi IP:" "${CALC_UNIFI}"
@@ -1439,32 +1455,49 @@ prompt_remote_networks() {
     local index=1 route normalized existing conflict
     while :; do
         read -r -p "Remote network #${index}: " route
-        [[ -z "${route}" ]] && break
 
-        valid_cidr "${route}" || { error "Invalid CIDR network."; echo; continue; }
+        if [[ -z "${route}" ]]; then
+            if (( ${#PROMPT_ROUTES[@]} == 0 )); then
+                info "Remote network entry finished: no remote networks configured."
+            else
+                validation_success "Remote network entry finished (${#PROMPT_ROUTES[@]} network(s))."
+            fi
+            return 0
+        fi
+
+        if ! valid_cidr "${route}"; then
+            validation_error_block \
+                "INVALID CIDR NETWORK" \
+                "The entered value is not a valid IPv4 CIDR network:" \
+                "  ${route}"
+            continue
+        fi
 
         if [[ "${route}" == "0.0.0.0/0" ]]; then
-            error "0.0.0.0/0 is not allowed as a remote network."
-            echo "Use explicit remote LAN/VLAN networks instead."
-            echo
+            validation_error_block \
+                "REMOTE NETWORK NOT ALLOWED" \
+                "0.0.0.0/0 is not allowed as a remote network." \
+                "Use explicit remote LAN/VLAN networks instead."
             continue
         fi
 
         if ! cidr_is_exact_network "${route}"; then
             normalized="$(cidr_normalized "${route}")"
-            error "${route} is a host address, not the network base."
-            echo "Use: ${normalized}"
-            echo
+            validation_error_block \
+                "HOST ADDRESS ENTERED" \
+                "${route} is not the network base address." \
+                "Use instead:  ${normalized}"
             continue
         fi
         normalized="$(cidr_normalized "${route}")"
 
         if [[ -n "${own_tunnel_network}" ]] &&
            cidr_overlaps "${normalized}" "${own_tunnel_network}"; then
-            error "Remote network overlaps this tunnel's transfer network."
-            printf '%-18s %s\n' "Remote network:" "${normalized}"
-            printf '%-18s %s\n' "Tunnel network:" "${own_tunnel_network}"
-            echo
+            validation_error_block \
+                "NETWORK CONFLICT" \
+                "Remote network:  ${normalized}" \
+                "Tunnel network:  ${own_tunnel_network}" \
+                "Reason:          remote network overlaps this tunnel's transfer network"
             continue
         fi
 
@@ -1472,22 +1505,23 @@ prompt_remote_networks() {
         for existing in "${PROMPT_ROUTES[@]:-}"; do
             [[ -z "${existing}" ]] && continue
             if cidr_overlaps "${normalized}" "${existing}"; then
-                error "Remote network overlaps another network entered for this tunnel."
-                printf '%-18s %s\n' "Requested:" "${normalized}"
-                printf '%-18s %s\n' "Conflicts with:" "${existing}"
+                validation_error_block \
+                    "NETWORK CONFLICT" \
+                    "Requested:       ${normalized}" \
+                    "Conflicts with:  ${existing}" \
+                    "Reason:          overlaps another remote network entered for this tunnel"
                 conflict=1
                 break
             fi
         done
-        (( conflict == 1 )) && { echo; continue; }
+        (( conflict == 1 )) && continue
 
         if check_network_conflict "${normalized}"; then
             show_network_conflict "${normalized}"
-            echo
             continue
         fi
 
-        ok "No network conflict detected"
+        validation_success "Network available: ${normalized}"
         PROMPT_ROUTES+=("${normalized}")
         ((index += 1))
     done
@@ -3370,7 +3404,7 @@ add_tunnel_definition() {
     local auth_id="${PROMPT_RESULT}"
 
     section "STEP 5/6  Remote Networks"
-    prompt_remote_networks "${network}"
+    prompt_remote_networks "${network}" || return
     local -a routes=("${PROMPT_ROUTES[@]:-}")
 
     section "STEP 6/6  Pre-Shared Key"
@@ -3467,27 +3501,24 @@ add_remote_network() {
             e|E) clear_screen; echo "Bye."; exit 0 ;;
         esac
 
-        valid_cidr "${new_route}" || { error "Invalid CIDR network."; echo; continue; }
+        if ! valid_cidr "${new_route}"; then
+            validation_error_block                 "INVALID CIDR NETWORK"                 "The entered value is not a valid IPv4 CIDR network:"                 "  ${new_route}"
+            continue
+        fi
 
         if [[ "${new_route}" == "0.0.0.0/0" ]]; then
-            error "0.0.0.0/0 is not allowed as a remote network."
-            echo
+            validation_error_block                 "REMOTE NETWORK NOT ALLOWED"                 "0.0.0.0/0 is not allowed as a remote network."                 "Use explicit remote LAN/VLAN networks instead."
             continue
         fi
 
         if ! cidr_is_exact_network "${new_route}"; then
-            error "${new_route} is a host address, not the network base."
-            echo "Use: $(cidr_normalized "${new_route}")"
-            echo
+            validation_error_block                 "HOST ADDRESS ENTERED"                 "${new_route} is not the network base address."                 "Use instead:  $(cidr_normalized "${new_route}")"
             continue
         fi
         new_route="$(cidr_normalized "${new_route}")"
 
         if cidr_overlaps "${new_route}" "${VTI_NETWORK}"; then
-            error "Remote network overlaps this tunnel's transfer network."
-            printf '%-18s %s\n' "Remote network:" "${new_route}"
-            printf '%-18s %s\n' "Tunnel network:" "${VTI_NETWORK}"
-            echo
+            validation_error_block                 "NETWORK CONFLICT"                 "Remote network:  ${new_route}"                 "Tunnel network:  ${VTI_NETWORK}"                 "Reason:          remote network overlaps this tunnel's transfer network"
             continue
         fi
 
@@ -3495,9 +3526,7 @@ add_remote_network() {
         while read -r existing_route; do
             [[ -z "${existing_route}" ]] && continue
             if cidr_overlaps "${new_route}" "${existing_route}"; then
-                error "Remote network overlaps an existing remote network on this tunnel."
-                printf '%-18s %s\n' "Requested:" "${new_route}"
-                printf '%-18s %s\n' "Conflicts with:" "${existing_route}"
+                validation_error_block                     "NETWORK CONFLICT"                     "Requested:       ${new_route}"                     "Conflicts with:  ${existing_route}"                     "Reason:          overlaps an existing remote network on this tunnel"
                 same_tunnel_conflict=1
                 break
             fi
@@ -3510,7 +3539,7 @@ add_remote_network() {
             continue
         fi
 
-        ok "No network conflict detected"
+        validation_success "Network available: ${new_route}"
         confirm_yes_no "Add ${new_route}?" "N" || return
 
         printf '%s\n' "${new_route}" >> "$(tunnel_route_file "${name}")"
