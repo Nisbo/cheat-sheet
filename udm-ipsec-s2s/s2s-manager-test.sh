@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.25-test"
+VERSION="0.26-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -583,6 +583,77 @@ valid_cidr() {
     (( prefix >= 0 && prefix <= 32 ))
 }
 
+cidr_network_int() {
+    local cidr="$1"
+    local ip="${cidr%%/*}"
+    local prefix="${cidr##*/}"
+    local ipn mask
+
+    ipn="$(ipv4_to_int "${ip}")"
+    if (( prefix == 0 )); then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    printf '%u' "$(( ipn & mask ))"
+}
+
+cidr_broadcast_int() {
+    local cidr="$1"
+    local prefix="${cidr##*/}"
+    local network mask
+
+    network="$(cidr_network_int "${cidr}")"
+    if (( prefix == 0 )); then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    printf '%u' "$(( network | ((~mask) & 0xFFFFFFFF) ))"
+}
+
+cidr_is_exact_network() {
+    local cidr="$1"
+    valid_cidr "${cidr}" || return 1
+    (( $(ipv4_to_int "${cidr%%/*}") == $(cidr_network_int "${cidr}") ))
+}
+
+cidr_normalized() {
+    local cidr="$1"
+    valid_cidr "${cidr}" || return 1
+    printf '%s/%s' "$(int_to_ipv4 "$(cidr_network_int "${cidr}")")" "${cidr##*/}"
+}
+
+cidr_overlaps() {
+    local a="$1" b="$2"
+    valid_cidr "${a}" || return 1
+    valid_cidr "${b}" || return 1
+
+    local as ae bs be
+    as="$(cidr_network_int "${a}")"
+    ae="$(cidr_broadcast_int "${a}")"
+    bs="$(cidr_network_int "${b}")"
+    be="$(cidr_broadcast_int "${b}")"
+    (( as <= be && bs <= ae ))
+}
+
+route_token_to_cidr() {
+    local token="$1"
+    case "${token}" in
+        default|local|broadcast|unreachable|prohibit|blackhole|throw|nat|multicast|anycast)
+            return 1 ;;
+    esac
+
+    if [[ "${token}" == */* ]]; then
+        valid_cidr "${token}" || return 1
+        printf '%s' "${token}"
+    elif valid_ipv4 "${token}"; then
+        printf '%s/32' "${token}"
+    else
+        return 1
+    fi
+}
+
 valid_tunnel_name() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]
 }
@@ -836,21 +907,146 @@ network_in_use() {
     return 1
 }
 
+set_network_conflict() {
+    NETWORK_CONFLICT_KIND="$1"
+    NETWORK_CONFLICT_WITH="$2"
+    NETWORK_CONFLICT_DETAIL="$3"
+}
+
+check_manager_network_conflict() {
+    local candidate="$1"
+    local ignore_tunnel="${2:-}"
+    local name route
+
+    while read -r name; do
+        [[ -z "${name}" || "${name}" == "${ignore_tunnel}" ]] && continue
+        load_tunnel "${name}" || continue
+
+        if cidr_overlaps "${candidate}" "${VTI_NETWORK}"; then
+            set_network_conflict "TUNNEL" "${VTI_NETWORK}" \
+                "overlaps tunnel transfer network of '${NAME}'"
+            return 0
+        fi
+
+        while read -r route; do
+            [[ -z "${route}" ]] && continue
+            valid_cidr "${route}" || continue
+            if cidr_overlaps "${candidate}" "${route}"; then
+                set_network_conflict "REMOTE" "${route}" \
+                    "overlaps remote network of '${NAME}'"
+                return 0
+            fi
+        done < <(read_routes "${name}")
+    done < <(list_tunnel_names)
+
+    return 1
+}
+
+check_live_system_route_conflict() {
+    local candidate="$1"
+    local ignore_interface="${2:-}"
+    local line token route dev
+
+    command_available ip || return 1
+
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        token="${line%% *}"
+        route="$(route_token_to_cidr "${token}" 2>/dev/null || true)"
+        [[ -n "${route}" ]] || continue
+        [[ "${route}" == "0.0.0.0/0" || "${route}" == "127.0.0.0/8" ]] && continue
+
+        dev="$(awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i=="dev" && (i+1)<=NF) { print $(i+1); exit }
+            }
+        }' <<< "${line}")"
+
+        [[ -n "${ignore_interface}" && "${dev}" == "${ignore_interface}" ]] && continue
+
+        if cidr_overlaps "${candidate}" "${route}"; then
+            set_network_conflict "SYSTEM" "${route}" \
+                "overlaps an existing live route${dev:+ on ${dev}}"
+            return 0
+        fi
+    done < <(ip -4 route show table all 2>/dev/null)
+
+    return 1
+}
+
+check_network_conflict() {
+    local candidate="$1"
+    local ignore_tunnel="${2:-}"
+    local ignore_interface="${3:-}"
+
+    NETWORK_CONFLICT_KIND=""
+    NETWORK_CONFLICT_WITH=""
+    NETWORK_CONFLICT_DETAIL=""
+
+    check_manager_network_conflict "${candidate}" "${ignore_tunnel}" && return 0
+    check_live_system_route_conflict "${candidate}" "${ignore_interface}" && return 0
+    return 1
+}
+
+show_network_conflict() {
+    error "Network conflict detected."
+    printf '%-18s %s\n' "Requested:" "$1"
+    printf '%-18s %s\n' "Conflicts with:" "${NETWORK_CONFLICT_WITH}"
+    printf '%-18s %s\n' "Reason:" "${NETWORK_CONFLICT_DETAIL}"
+}
+
+auth_id_in_loaded_swan() {
+    local wanted="$1"
+    command_available swanctl || return 1
+
+    swanctl_clean swanctl --list-conns 2>/dev/null | awk -v wanted="${wanted}" '
+        /remote .*authentication:/ { remote_auth=1; next }
+        remote_auth && /^[[:space:]]+id:[[:space:]]*/ {
+            line=$0
+            sub(/^[[:space:]]+id:[[:space:]]*/, "", line)
+            if (line == wanted) found=1
+            remote_auth=0
+        }
+        /^[^[:space:]]/ && $0 !~ /authentication:/ { remote_auth=0 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+vti_key_in_system_use() {
+    local wanted="$1"
+    command_available ip || return 1
+    ip -d link show type vti 2>/dev/null |
+        grep -Eq "vti .* (ikey|okey) (0\\.0\\.0\\.)?${wanted}([[:space:]]|$)"
+}
+
+interface_in_system_use() {
+    local iface="$1"
+    ip link show "${iface}" >/dev/null 2>&1
+}
+
 next_interface_index() {
-    local index=0 name used
+    local index=0 name used key
 
     while :; do
         used=0
+        key=$((DEFAULT_VTI_KEY + index))
+
         while read -r name; do
             [[ -z "${name}" ]] && continue
             load_tunnel "${name}" || continue
-            if [[ "${VTI_INTERFACE}" == "ipsec${index}" ]]; then
+            if [[ "${VTI_INTERFACE}" == "ipsec${index}" || "${VTI_KEY}" == "${key}" ]]; then
                 used=1
                 break
             fi
         done < <(list_tunnel_names)
 
-        (( used == 0 )) && { printf '%d' "${index}"; return; }
+        if (( used == 0 )) &&
+           ! interface_in_system_use "ipsec${index}" &&
+           ! vti_key_in_system_use "${key}"; then
+            printf '%d' "${index}"
+            return
+        fi
+
         ((index += 1))
     done
 }
@@ -859,7 +1055,7 @@ next_vti_network() {
     local c candidate
     for (( c=DEFAULT_NET_START_C; c<=250; c++ )); do
         candidate="${DEFAULT_NET_PREFIX_A}.${DEFAULT_NET_PREFIX_B}.${c}.0/30"
-        if ! network_in_use "${candidate}"; then
+        if ! check_network_conflict "${candidate}"; then
             printf '%s' "${candidate}"
             return
         fi
@@ -1174,11 +1370,11 @@ prompt_tunnel_network() {
             confirm_yes_no "Use this calculated /30 network?" "N" || continue
         fi
 
-        network_in_use "${normalized}" && {
-            error "Network ${normalized} is already used by another tunnel."
+        if check_network_conflict "${normalized}"; then
+            show_network_conflict "${normalized}"
             echo
             continue
-        }
+        fi
 
         calculate_30_addresses "${normalized}"
 
@@ -1211,7 +1407,12 @@ prompt_auth_id() {
         value="${value:-${suggested}}"
 
         valid_auth_id "${value}" || { error "Invalid Authentication ID."; echo; continue; }
-        auth_id_in_use "${value}" && { error "Authentication ID already in use."; echo; continue; }
+        auth_id_in_use "${value}" && { error "Authentication ID already in manager state."; echo; continue; }
+        auth_id_in_loaded_swan "${value}" && {
+            error "Authentication ID is already used by a loaded strongSwan connection."
+            echo
+            continue
+        }
 
         PROMPT_RESULT="${value}"
         return
@@ -1219,6 +1420,8 @@ prompt_auth_id() {
 }
 
 prompt_remote_networks() {
+    local own_tunnel_network="${1:-}"
+
     PROMPT_ROUTES=()
     echo "Enter UniFi-side networks that Debian must return through the S2S tunnel."
     echo
@@ -1226,24 +1429,66 @@ prompt_remote_networks() {
     echo "  192.168.178.0/23   Main LAN"
     echo "  192.168.4.0/24     UniFi Teleport"
     echo
+    echo "Networks are checked for overlaps with tunnel networks,"
+    echo "other remote networks and live Debian routes (LAN/VPN/WireGuard/etc.)."
+    echo
     echo "Enter one network per line."
     echo "Press ENTER on an empty line when finished."
     echo
 
-    local index=1 route existing duplicate
+    local index=1 route normalized existing conflict
     while :; do
         read -r -p "Remote network #${index}: " route
         [[ -z "${route}" ]] && break
 
         valid_cidr "${route}" || { error "Invalid CIDR network."; echo; continue; }
 
-        duplicate=0
-        for existing in "${PROMPT_ROUTES[@]:-}"; do
-            [[ "${existing}" == "${route}" ]] && duplicate=1
-        done
-        (( duplicate == 1 )) && { warn "Network already added."; continue; }
+        if [[ "${route}" == "0.0.0.0/0" ]]; then
+            error "0.0.0.0/0 is not allowed as a remote network."
+            echo "Use explicit remote LAN/VLAN networks instead."
+            echo
+            continue
+        fi
 
-        PROMPT_ROUTES+=("${route}")
+        if ! cidr_is_exact_network "${route}"; then
+            normalized="$(cidr_normalized "${route}")"
+            error "${route} is a host address, not the network base."
+            echo "Use: ${normalized}"
+            echo
+            continue
+        fi
+        normalized="$(cidr_normalized "${route}")"
+
+        if [[ -n "${own_tunnel_network}" ]] &&
+           cidr_overlaps "${normalized}" "${own_tunnel_network}"; then
+            error "Remote network overlaps this tunnel's transfer network."
+            printf '%-18s %s\n' "Remote network:" "${normalized}"
+            printf '%-18s %s\n' "Tunnel network:" "${own_tunnel_network}"
+            echo
+            continue
+        fi
+
+        conflict=0
+        for existing in "${PROMPT_ROUTES[@]:-}"; do
+            [[ -z "${existing}" ]] && continue
+            if cidr_overlaps "${normalized}" "${existing}"; then
+                error "Remote network overlaps another network entered for this tunnel."
+                printf '%-18s %s\n' "Requested:" "${normalized}"
+                printf '%-18s %s\n' "Conflicts with:" "${existing}"
+                conflict=1
+                break
+            fi
+        done
+        (( conflict == 1 )) && { echo; continue; }
+
+        if check_network_conflict "${normalized}"; then
+            show_network_conflict "${normalized}"
+            echo
+            continue
+        fi
+
+        ok "No network conflict detected"
+        PROMPT_ROUTES+=("${normalized}")
         ((index += 1))
     done
 }
@@ -3125,7 +3370,7 @@ add_tunnel_definition() {
     local auth_id="${PROMPT_RESULT}"
 
     section "STEP 5/6  Remote Networks"
-    prompt_remote_networks
+    prompt_remote_networks "${network}"
     local -a routes=("${PROMPT_ROUTES[@]:-}")
 
     section "STEP 6/6  Pre-Shared Key"
@@ -3147,6 +3392,11 @@ add_tunnel_definition() {
     printf '%-28s %s\n' "Tunnel network:" "${network}"
     printf '%-28s %s\n' "Debian VTI IP:" "${debian_ip}"
     printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_ip}"
+
+    echo
+    ok "Conflict validation passed"
+    printf '%-28s %s\n' "Interface allocation:" "${interface} (free)"
+    printf '%-28s %s\n' "VTI key / mark allocation:" "${key} (free)"
 
     echo
     echo "Remote networks:"
@@ -3218,9 +3468,49 @@ add_remote_network() {
         esac
 
         valid_cidr "${new_route}" || { error "Invalid CIDR network."; echo; continue; }
-        read_routes "${name}" | grep -Fxq "${new_route}" &&
-            { warn "Network already configured."; echo; continue; }
 
+        if [[ "${new_route}" == "0.0.0.0/0" ]]; then
+            error "0.0.0.0/0 is not allowed as a remote network."
+            echo
+            continue
+        fi
+
+        if ! cidr_is_exact_network "${new_route}"; then
+            error "${new_route} is a host address, not the network base."
+            echo "Use: $(cidr_normalized "${new_route}")"
+            echo
+            continue
+        fi
+        new_route="$(cidr_normalized "${new_route}")"
+
+        if cidr_overlaps "${new_route}" "${VTI_NETWORK}"; then
+            error "Remote network overlaps this tunnel's transfer network."
+            printf '%-18s %s\n' "Remote network:" "${new_route}"
+            printf '%-18s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+            echo
+            continue
+        fi
+
+        local existing_route same_tunnel_conflict=0
+        while read -r existing_route; do
+            [[ -z "${existing_route}" ]] && continue
+            if cidr_overlaps "${new_route}" "${existing_route}"; then
+                error "Remote network overlaps an existing remote network on this tunnel."
+                printf '%-18s %s\n' "Requested:" "${new_route}"
+                printf '%-18s %s\n' "Conflicts with:" "${existing_route}"
+                same_tunnel_conflict=1
+                break
+            fi
+        done < <(read_routes "${name}")
+        (( same_tunnel_conflict == 1 )) && { echo; continue; }
+
+        if check_network_conflict "${new_route}" "${name}" "${VTI_INTERFACE}"; then
+            show_network_conflict "${new_route}"
+            echo
+            continue
+        fi
+
+        ok "No network conflict detected"
         confirm_yes_no "Add ${new_route}?" "N" || return
 
         printf '%s\n' "${new_route}" >> "$(tunnel_route_file "${name}")"
