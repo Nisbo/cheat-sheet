@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.24-test"
+VERSION="0.25-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -910,6 +910,21 @@ truncate_table_value() {
     fi
 }
 
+print_table_cell() {
+    local value="$1"
+    local width="$2"
+    local prefix="${3:-}"
+    local suffix="${4:-}"
+    local display pad
+
+    display="$(truncate_table_value "${value}" "${width}")"
+    pad=$(( width - ${#display} ))
+    (( pad < 0 )) && pad=0
+
+    printf '%b%s%b' "${prefix}" "${display}" "${suffix}"
+    printf '%*s' "${pad}" ''
+}
+
 table_divider_segment() {
     local width="$1"
     local i
@@ -927,9 +942,6 @@ show_existing_tunnels() {
         return
     fi
 
-    # Keep all table widths in one place so header, separator and rows
-    # can never drift apart. Two spaces are used between columns so a
-    # value that exactly fills its column still remains visually separated.
     local number_width=4
     local name_width=22
     local interface_width=10
@@ -939,18 +951,23 @@ show_existing_tunnels() {
     local auth_width=24
     local gap="  "
 
-    printf '%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s%-*s\n' \
-        "${number_width}" "#" "${gap}" \
-        "${name_width}" "Name" "${gap}" \
-        "${interface_width}" "Interface" "${gap}" \
-        "${network_width}" "Tunnel Network" "${gap}" \
-        "${management_width}" "Management" "${gap}" \
-        "${connection_width}" "Connection" "${gap}" \
-        "${auth_width}" "Authentication ID"
+    # Header. print_table_cell() pads by Bash character count instead of
+    # printf byte width, so UTF-8 characters in later rows cannot shift columns.
+    print_table_cell "#" "${number_width}"
+    printf '%s' "${gap}"
+    print_table_cell "Name" "${name_width}"
+    printf '%s' "${gap}"
+    print_table_cell "Interface" "${interface_width}"
+    printf '%s' "${gap}"
+    print_table_cell "Tunnel Network" "${network_width}"
+    printf '%s' "${gap}"
+    print_table_cell "Management" "${management_width}"
+    printf '%s' "${gap}"
+    print_table_cell "Connection" "${connection_width}"
+    printf '%s' "${gap}"
+    print_table_cell "Authentication ID" "${auth_width}"
+    printf '\n'
 
-    # Do not feed UTF-8 box-drawing characters through printf field widths:
-    # bash printf may count their bytes instead of their terminal columns.
-    # Generate each separator segment by character count instead.
     table_divider_segment "${number_width}"
     printf '%s' "${gap}"
     table_divider_segment "${name_width}"
@@ -966,7 +983,7 @@ show_existing_tunnels() {
     table_divider_segment "${auth_width}"
     printf '\n'
 
-    local index=1 name management connection display_name display_auth
+    local index=1 name management connection
     while read -r name; do
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
@@ -982,31 +999,33 @@ show_existing_tunnels() {
             connection="-"
         fi
 
-        display_name="$(truncate_table_value "${NAME}" "${name_width}")"
-        display_auth="$(truncate_table_value "${AUTH_ID}" "${auth_width}")"
-
-        printf '%-*s%s%-*s%s%-*s%s%-*s%s%-*s%s' \
-            "${number_width}" "${index}" "${gap}" \
-            "${name_width}" "${display_name}" "${gap}" \
-            "${interface_width}" "${VTI_INTERFACE}" "${gap}" \
-            "${network_width}" "${VTI_NETWORK}" "${gap}" \
-            "${management_width}" "${management}" "${gap}"
+        print_table_cell "${index}" "${number_width}"
+        printf '%s' "${gap}"
+        print_table_cell "${NAME}" "${name_width}"
+        printf '%s' "${gap}"
+        print_table_cell "${VTI_INTERFACE}" "${interface_width}"
+        printf '%s' "${gap}"
+        print_table_cell "${VTI_NETWORK}" "${network_width}"
+        printf '%s' "${gap}"
+        print_table_cell "${management}" "${management_width}"
+        printf '%s' "${gap}"
 
         case "${connection}" in
             CONNECTED)
-                printf '%b%-*s%b%s' \
-                    "${C_GREEN}${C_BOLD}" "${connection_width}" "${connection}" "${C_RESET}" "${gap}"
+                print_table_cell "${connection}" "${connection_width}" "${C_GREEN}${C_BOLD}" "${C_RESET}"
                 ;;
             DISCONNECTED)
-                printf '%b%-*s%b%s' \
-                    "${C_RED}${C_BOLD}" "${connection_width}" "${connection}" "${C_RESET}" "${gap}"
+                print_table_cell "${connection}" "${connection_width}" "${C_RED}${C_BOLD}" "${C_RESET}"
                 ;;
             *)
-                printf '%-*s%s' "${connection_width}" "${connection}" "${gap}"
+                print_table_cell "${connection}" "${connection_width}"
                 ;;
         esac
 
-        printf '%-*s\n' "${auth_width}" "${display_auth}"
+        printf '%s' "${gap}"
+        print_table_cell "${AUTH_ID}" "${auth_width}"
+        printf '\n'
+
         ((index += 1))
     done < <(list_tunnel_names)
 }
