@@ -5,7 +5,7 @@
 #
 # Purpose:
 #   Interactive setup and management of route-based IKEv2/IPsec S2S tunnels
-#   between Debian 13 (strongSwan/swanctl) and UniFi UDM gateways.
+#   between Debian 13 (strongSwan/swanctl) and UniFi UDM gateways or Debian peers.
 #
 # State:
 #   /root/s2s-manager-test/
@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.39-test"
+VERSION="0.40-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -777,6 +777,7 @@ load_tunnel() {
     # a wildcard VTI endpoint and accepted an incoming peer from %any.
     : "${PEER_MODE:=dynamic}"
     : "${PEER_ADDRESS:=}"
+    : "${PEER_TYPE:=unifi}"
     : "${DISPLAY_NAME:=${NAME}}"
 }
 
@@ -793,6 +794,7 @@ save_tunnel() {
     local peer_mode="${10:-dynamic}"
     local peer_address="${11:-}"
     local display_name="${12:-${name}}"
+    local peer_type="${13:-unifi}"
 
     local config
     config="$(tunnel_config_file "${name}")"
@@ -809,6 +811,7 @@ save_tunnel() {
         printf 'UNIFI_VTI_IP=%q\n' "${unifi_ip}"
         printf 'PEER_MODE=%q\n' "${peer_mode}"
         printf 'PEER_ADDRESS=%q\n' "${peer_address}"
+        printf 'PEER_TYPE=%q\n' "${peer_type}"
         printf 'CREATED_AT=%q\n' "$(date -Is)"
         printf 'INSTALLED=%q\n' "${installed}"
     } > "${config}"
@@ -1909,131 +1912,121 @@ peer_mode_label() {
 }
 
 prompt_peer_endpoint() {
+    local peer_type="${1:-unifi}"
     PROMPT_PEER_MODE=""
     PROMPT_PEER_ADDRESS=""
 
-    echo "Choose how Debian identifies the public UniFi peer endpoint."
-    echo
-    echo "  [1] Dynamic / unknown"
-    echo "      UniFi initiates the connection."
-    echo "      Uses VTI remote 0.0.0.0."
-    echo "      Only one wildcard VTI is possible per Debian public IP."
-    echo
-    echo "  [2] Static IPv4 address"
-    echo "      Uses a peer-specific VTI."
-    echo "      Allows additional VTI tunnels when peer endpoint IPs differ."
-    echo
-    echo "  [3] Hostname / Dynamic DNS"
-    echo "      strongSwan uses the hostname directly."
-    echo "      The VTI resolves it to one IPv4 address when applied."
-    echo "      Multiple DNS A records are rejected because one VTI has one endpoint."
-    echo
-    echo "  [B] Back"
-    echo "  [E] Exit"
-    echo
-    echo "Press ENTER to use option 1."
+    if [[ "${peer_type}" == "debian" ]]; then
+        echo "Choose how this Debian server identifies the remote Debian / strongSwan peer."
+        echo
+        echo "  [1] Static IPv4 address"
+        echo "      Uses a peer-specific VTI endpoint."
+        echo
+        echo "  [2] Hostname / Dynamic DNS"
+        echo "      strongSwan uses the hostname directly."
+        echo "      The VTI resolves it to one IPv4 address when applied."
+        echo "      Multiple DNS A records are rejected because one VTI has one endpoint."
+        echo
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+        echo "Press ENTER to use option 1."
+    else
+        echo "Choose how Debian identifies the public UniFi peer endpoint."
+        echo
+        echo "  [1] Dynamic / unknown"
+        echo "      UniFi initiates the connection."
+        echo "      Uses VTI remote 0.0.0.0."
+        echo "      Only one wildcard VTI is possible per Debian public IP."
+        echo
+        echo "  [2] Static IPv4 address"
+        echo "      Uses a peer-specific VTI."
+        echo "      Allows additional VTI tunnels when peer endpoint IPs differ."
+        echo
+        echo "  [3] Hostname / Dynamic DNS"
+        echo "      strongSwan uses the hostname directly."
+        echo "      The VTI resolves it to one IPv4 address when applied."
+        echo "      Multiple DNS A records are rejected because one VTI has one endpoint."
+        echo
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+        echo "Press ENTER to use option 1."
+    fi
 
-    local choice value rc
+    local choice value rc static_choice dns_choice
+    if [[ "${peer_type}" == "debian" ]]; then
+        static_choice=1; dns_choice=2
+    else
+        static_choice=2; dns_choice=3
+    fi
+
     while :; do
         read -r -p "Selection [1]: " choice
         choice="${choice:-1}"
 
-        case "${choice}" in
-            1)
-                PROMPT_PEER_MODE="dynamic"
-                PROMPT_PEER_ADDRESS=""
-                return 0
-                ;;
-            2)
-                echo
-                while :; do
+        if [[ "${peer_type}" != "debian" && "${choice}" == "1" ]]; then
+            PROMPT_PEER_MODE="dynamic"
+            PROMPT_PEER_ADDRESS=""
+            return 0
+        elif [[ "${choice}" == "${static_choice}" ]]; then
+            echo
+            while :; do
+                if [[ "${peer_type}" == "debian" ]]; then
+                    read -r -p "Remote Debian public IPv4: " value
+                else
                     read -r -p "UniFi public IPv4: " value
-                    [[ -z "${value}" ]] && { warn "IPv4 address is required."; continue; }
-
-                    if ! valid_ipv4 "${value}" || [[ "${value}" == "0.0.0.0" ]]; then
-                        validation_error_block \
-                            "INVALID PEER IPV4" \
-                            "Entered:  ${value}" \
-                            "Enter the public IPv4 address used by the UniFi peer."
-                        continue
-                    fi
-
-                    PROMPT_PEER_MODE="static"
-                    PROMPT_PEER_ADDRESS="${value}"
-                    return 0
-                done
-                ;;
-            3)
+                fi
+                [[ -z "${value}" ]] && { warn "IPv4 address is required."; continue; }
+                if ! valid_ipv4 "${value}" || [[ "${value}" == "0.0.0.0" ]]; then
+                    validation_error_block "INVALID PEER IPV4" "Entered:  ${value}" "Enter a valid public IPv4 address for the remote peer."
+                    continue
+                fi
+                PROMPT_PEER_MODE="static"
+                PROMPT_PEER_ADDRESS="${value}"
+                return 0
+            done
+        elif [[ "${choice}" == "${dns_choice}" ]]; then
+            echo
+            while :; do
+                echo "Enter only the hostname / FQDN."
+                echo "Do NOT include http://, https://, a port or a path."
+                echo "Example: peer.example.com"
                 echo
-                while :; do
-                    echo "Enter only the hostname / FQDN."
-                    echo "Do NOT include http://, https://, a port or a path."
-                    echo "Example: my-unifi.example.com"
-                    echo
-                    echo "Hostname only - this is NOT a web URL."
+                echo "Hostname only - this is NOT a web URL."
+                if [[ "${peer_type}" == "debian" ]]; then
+                    read -r -p "Remote Debian hostname / Dynamic DNS name: " value
+                else
                     read -r -p "UniFi hostname / Dynamic DNS name: " value
-                    [[ -z "${value}" ]] && { warn "Hostname is required."; continue; }
-
-                    if [[ "${value}" == *"://"* || "${value}" == */* || "${value}" == *:* ]]; then
-                        validation_error_block \
-                            "HOSTNAME ONLY - NOT A URL" \
-                            "Entered:  ${value}" \
-                            "Use only the hostname / FQDN." \
-                            "Example:  my-unifi.example.com" \
-                            "Do not include http://, https://, ports or paths."
-                        continue
-                    fi
-
-                    if ! valid_hostname "${value}"; then
-                        validation_error_block \
-                            "INVALID PEER HOSTNAME" \
-                            "Entered:  ${value}" \
-                            "Use a valid hostname such as my-unifi.example.com."
-                        continue
-                    fi
-
-                    PEER_RESOLVED_IP=""
-                    PEER_RESOLVE_MULTIPLE=""
-                    resolve_peer_hostname "${value}"
-                    rc=$?
-
-                    case "${rc}" in
-                        0)
-                            validation_success "Hostname currently resolves to ${PEER_RESOLVED_IP}"
-                            PEER_IP_MATCH_TUNNEL=""
-                            PEER_IP_MATCH_MODE=""
-                            if peer_ip_used_by_other_tunnel "${PEER_RESOLVED_IP}"; then
-                                info "This IPv4 is also used by tunnel '${PEER_IP_MATCH_TUNNEL}'."
-                                echo "    This is allowed for peer-specific VTI tunnels."
-                            fi
-                            ;;
-                        1)
-                            warn "Hostname is valid but currently does not resolve to IPv4."
-                            echo "The definition may still be saved, but installation will be blocked"
-                            echo "until the hostname resolves."
-                            ;;
-                        2)
-                            warn "getent is unavailable, so DNS cannot currently be checked."
-                            ;;
-                        3)
-                            validation_error_block \
-                                "MULTIPLE IPV4 ADDRESSES" \
-                                "Hostname:  ${value}" \
-                                "IPv4s:     ${PEER_RESOLVE_MULTIPLE}" \
-                                "A classic VTI requires one concrete remote endpoint."
-                            continue
-                            ;;
-                    esac
-
-                    PROMPT_PEER_MODE="dns"
-                    PROMPT_PEER_ADDRESS="${value}"
-                    return 0
-                done
-                ;;
-            b|B|0) return 1 ;;
-            e|E) clear_screen; echo "Bye."; exit 0 ;;
-            *) validation_error_block "INVALID SELECTION" "Choose 1, 2 or 3." ;;
-        esac
+                fi
+                [[ -z "${value}" ]] && { warn "Hostname is required."; continue; }
+                if [[ "${value}" == *"://"* || "${value}" == */* || "${value}" == *:* ]]; then
+                    validation_error_block "HOSTNAME ONLY - NOT A URL" "Entered:  ${value}" "Use only the hostname / FQDN." "Example:  peer.example.com" "Do not include http://, https://, ports or paths."
+                    continue
+                fi
+                if ! valid_hostname "${value}"; then
+                    validation_error_block "INVALID PEER HOSTNAME" "Entered:  ${value}" "Use a valid hostname such as peer.example.com."
+                    continue
+                fi
+                PEER_RESOLVED_IP=""; PEER_RESOLVE_MULTIPLE=""
+                resolve_peer_hostname "${value}"; rc=$?
+                case "${rc}" in
+                    0) validation_success "Hostname currently resolves to ${PEER_RESOLVED_IP}" ;;
+                    1) warn "Hostname is valid but currently does not resolve to IPv4."; echo "The definition may still be saved, but installation will be blocked until it resolves." ;;
+                    2) warn "getent is unavailable, so DNS cannot currently be checked." ;;
+                    3) validation_error_block "MULTIPLE IPV4 ADDRESSES" "Hostname:  ${value}" "IPv4s:     ${PEER_RESOLVE_MULTIPLE}" "A classic VTI requires one concrete remote endpoint."; continue ;;
+                esac
+                PROMPT_PEER_MODE="dns"
+                PROMPT_PEER_ADDRESS="${value}"
+                return 0
+            done
+        else
+            case "${choice}" in
+                b|B|0) return 1 ;;
+                e|E) clear_screen; echo "Bye."; exit 0 ;;
+                *) if [[ "${peer_type}" == "debian" ]]; then validation_error_block "INVALID SELECTION" "Choose 1 or 2."; else validation_error_block "INVALID SELECTION" "Choose 1, 2 or 3."; fi ;;
+            esac
+        fi
     done
 }
 
@@ -4435,27 +4428,51 @@ add_tunnel_definition() {
     suggested_name="home"
     (( tunnel_number > 1 )) && suggested_name="s2s-${tunnel_number}"
 
-    section "STEP 1/7  Tunnel Display Name"
+    section "STEP 1/8  Tunnel Display Name"
     prompt_display_name "${suggested_name}"
     local display_name="${PROMPT_RESULT}"
     local name
     name="$(next_internal_name_for_display "${display_name}")"
-
     echo
-    printf '%-28s %s
-' "Display name:" "${display_name}"
-    printf '%-28s %s
-' "Internal name:" "${name}"
+    printf '%-28s %s\n' "Display name:" "${display_name}"
+    printf '%-28s %s\n' "Internal name:" "${name}"
     if [[ "${name}" != "$(display_to_internal_base "${display_name}")" ]]; then
         info "Internal name adjusted automatically to avoid a technical name/file collision."
     fi
 
-    section "STEP 2/7  UniFi Peer Endpoint"
-    prompt_peer_endpoint || return
+    section "STEP 2/8  Peer Type"
+    echo "Choose the remote Site-to-Site peer type."
+    echo
+    echo "  [1] UniFi Gateway"
+    echo "      Create a tunnel to a UniFi gateway."
+    echo
+    echo "  [2] Debian / strongSwan"
+    echo "      Create a tunnel to another Debian server running strongSwan."
+    echo "      A mirrored peer bundle including the PSK can be created afterwards."
+    echo
+    echo "  [B] Back"
+    echo "  [E] Exit"
+    echo
+    echo "Press ENTER to use option 1."
+    local peer_type_choice peer_type
+    while :; do
+        read -r -p "Selection [1]: " peer_type_choice
+        peer_type_choice="${peer_type_choice:-1}"
+        case "${peer_type_choice}" in
+            1) peer_type="unifi"; break ;;
+            2) peer_type="debian"; break ;;
+            b|B|0) return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) validation_error_block "INVALID SELECTION" "Choose 1 or 2." ;;
+        esac
+    done
+
+    section "STEP 3/8  Peer Endpoint"
+    prompt_peer_endpoint "${peer_type}" || return
     local peer_mode="${PROMPT_PEER_MODE}"
     local peer_address="${PROMPT_PEER_ADDRESS}"
 
-    section "STEP 3/7  Debian Public IP"
+    section "STEP 4/8  Debian Public IP"
     prompt_public_ip "${detected_ip}"
     local public_ip="${PROMPT_RESULT}"
     local install_topology_conflict=0
@@ -4534,24 +4551,38 @@ add_tunnel_definition() {
         fi
     fi
 
-    section "STEP 4/7  Site-to-Site Tunnel Network"
+
+    section "STEP 5/8  Site-to-Site Tunnel Network"
     local suggested_network
     suggested_network="$(next_vti_network)"
     prompt_tunnel_network "${suggested_network}" || return
-
     local network="${PROMPT_NETWORK}"
     local debian_ip="${PROMPT_DEBIAN_IP}"
     local unifi_ip="${PROMPT_UNIFI_IP}"
 
-    section "STEP 5/7  UniFi Authentication ID"
-    prompt_auth_id "unifi-${name}"
-    local auth_id="${PROMPT_RESULT}"
+    local auth_id
+    section "STEP 6/8  Peer Authentication ID"
+    if [[ "${peer_type}" == "debian" ]]; then
+        auth_id="$(resolve_tunnel_peer_ipv4 "${peer_mode}" "${peer_address}" 2>/dev/null || true)"
+        if [[ -z "${auth_id}" ]]; then
+            validation_error_block "PEER AUTHENTICATION ID UNAVAILABLE" "The Debian peer endpoint must currently resolve to exactly one IPv4 address" "so its IKE Authentication ID can be configured." "Peer: ${peer_address}"
+            return
+        fi
+        echo "For Debian / strongSwan peers, the remote server identifies itself"
+        echo "with its public IPv4 address. The manager sets this automatically."
+        echo
+        printf '%-28s %s\n' "Authentication ID:" "${auth_id}"
+        validation_success "Debian peer Authentication ID set automatically"
+    else
+        prompt_auth_id "unifi-${name}"
+        auth_id="${PROMPT_RESULT}"
+    fi
 
-    section "STEP 6/7  Remote Networks"
+    section "STEP 7/8  Remote Networks"
     prompt_remote_networks "${network}" || return
     local -a routes=("${PROMPT_ROUTES[@]:-}")
 
-    section "STEP 7/7  Pre-Shared Key"
+    section "STEP 8/8  Pre-Shared Key"
     prompt_psk || return
     local psk="${PROMPT_PSK}"
 
@@ -4561,19 +4592,22 @@ add_tunnel_definition() {
     key=$((DEFAULT_VTI_KEY + idx))
 
     section "CONFIGURATION SUMMARY"
-
-    printf '%-28s %s\n' "Tunnel name:" "${name}"
+    printf '%-28s %s\n' "Display name:" "${display_name}"
+    printf '%-28s %s\n' "Internal name:" "${name}"
+    printf '%-28s %s\n' "Peer type:" "$([[ "${peer_type}" == "debian" ]] && echo 'Debian / strongSwan' || echo 'UniFi Gateway')"
     printf '%-28s %s\n' "Debian public IP:" "${public_ip}"
     printf '%-28s %s\n' "Authentication ID:" "${auth_id}"
     printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${peer_mode}")"
-    if [[ "${peer_mode}" != "dynamic" ]]; then
-        printf '%-28s %s\n' "Peer address:" "${peer_address}"
-    fi
+    [[ "${peer_mode}" != "dynamic" ]] && printf '%-28s %s\n' "Peer address:" "${peer_address}"
     printf '%-28s %s\n' "VTI interface:" "${interface}"
     printf '%-28s %s\n' "VTI key / mark:" "${key}"
     printf '%-28s %s\n' "Tunnel network:" "${network}"
-    printf '%-28s %s\n' "Debian VTI IP:" "${debian_ip}"
-    printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_ip}"
+    printf '%-28s %s\n' "Local VTI IP:" "${debian_ip}"
+    if [[ "${peer_type}" == "debian" ]]; then
+        printf '%-28s %s\n' "Peer VTI IP:" "${unifi_ip}"
+    else
+        printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_ip}"
+    fi
 
     echo
     if (( install_topology_conflict == 1 )); then
@@ -4585,30 +4619,24 @@ add_tunnel_definition() {
     fi
     printf '%-28s %s\n' "Interface allocation:" "${interface} (free)"
     printf '%-28s %s\n' "VTI key / mark allocation:" "${key} (free)"
-
     echo
     echo "Remote networks:"
     local nonempty_routes=0 r
-    for r in "${routes[@]:-}"; do
-        [[ -n "${r}" ]] && ((nonempty_routes += 1))
-    done
-    if (( nonempty_routes == 0 )); then
-        echo "  None"
-    else
-        for r in "${routes[@]:-}"; do
-            [[ -n "${r}" ]] && printf '  • %s\n' "${r}"
-        done
-    fi
+    for r in "${routes[@]:-}"; do [[ -n "${r}" ]] && ((nonempty_routes += 1)); done
+    if (( nonempty_routes == 0 )); then echo "  None"; else for r in "${routes[@]:-}"; do [[ -n "${r}" ]] && printf '  • %s\n' "${r}"; done; fi
 
     echo
     confirm_yes_no "Save tunnel definition?" "N" || return
-
     save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}" \
-        "${network}" "${debian_ip}" "${unifi_ip}" "0" "${peer_mode}" "${peer_address}" "${display_name}"
+        "${network}" "${debian_ip}" "${unifi_ip}" "0" "${peer_mode}" "${peer_address}" "${display_name}" "${peer_type}"
     write_routes "${name}" "${routes[@]:-}"
     save_psk "${name}" "${psk}"
-
     ok "Tunnel definition saved."
+
+    if [[ "${peer_type}" == "debian" ]]; then
+        echo
+        info "After saving, use 'Create Debian peer bundle' to create the mirrored peer configuration including the same PSK."
+    fi
 
     echo
     if preflight_ready; then
@@ -4619,7 +4647,6 @@ add_tunnel_definition() {
     else
         warn "System prerequisites are not ready, so the tunnel definition was saved only."
     fi
-
     pause
 }
 
@@ -5852,7 +5879,7 @@ import_debian_peer_bundle() {
     confirm_yes_no "Import this Debian peer tunnel definition?" "N" || return
 
     save_tunnel "${internal}" "${PUBLIC_IP}" "${AUTH_ID}" "${interface}" "${key}" \
-        "${VTI_NETWORK}" "${LOCAL_VTI_IP}" "${REMOTE_VTI_IP}" "0" "static" "${REMOTE_PUBLIC_IP}" "${peer_display}"
+        "${VTI_NETWORK}" "${LOCAL_VTI_IP}" "${REMOTE_VTI_IP}" "0" "static" "${REMOTE_PUBLIC_IP}" "${peer_display}" "debian"
     write_routes "${internal}"
     save_psk "${internal}" "${PSK}"
     ok "Debian peer tunnel definition imported."
