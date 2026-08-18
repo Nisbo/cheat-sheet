@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.42-test"
+VERSION="0.43-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -5921,11 +5921,68 @@ import_debian_peer_bundle() {
         return
     fi
 
-    local peer_display="${PEER_DISPLAY_NAME:-${SOURCE_DISPLAY_NAME:-Debian-Peer}}"
-    local internal idx interface key normalized
-    normalized="$(normalize_30_network "${VTI_NETWORK}" 2>/dev/null || true)"
-    if [[ -z "${normalized}" || "${normalized}" != "${VTI_NETWORK}" ]]; then
-        error "Bundle contains an invalid /30 tunnel network."
+    # IMPORTANT:
+    # Bundle fields use some of the same variable names as load_tunnel().
+    # Conflict helpers call load_tunnel() internally, so snapshot every bundle
+    # value into locals before running any validation.
+    local bundle_source_display="${SOURCE_DISPLAY_NAME:-}"
+    local bundle_peer_display="${PEER_DISPLAY_NAME:-${SOURCE_DISPLAY_NAME:-Debian-Peer}}"
+    local bundle_public_ip="${PUBLIC_IP}"
+    local bundle_remote_public_ip="${REMOTE_PUBLIC_IP}"
+    local bundle_auth_id="${AUTH_ID}"
+    local bundle_vti_network="${VTI_NETWORK}"
+    local bundle_local_vti_ip="${LOCAL_VTI_IP}"
+    local bundle_remote_vti_ip="${REMOTE_VTI_IP}"
+    local bundle_psk="${PSK}"
+
+    local normalized
+    normalized="$(normalize_30_network "${bundle_vti_network}" 2>/dev/null || true)"
+    if [[ -z "${normalized}" || "${normalized}" != "${bundle_vti_network}" ]]; then
+        validation_error_block \
+            "INVALID PEER BUNDLE" \
+            "Tunnel network is not a valid /30 network base." \
+            "Tunnel network: ${bundle_vti_network}"
+        pause
+        return
+    fi
+
+    # The two VTI addresses must be exactly the two usable hosts of the /30.
+    calculate_30_addresses "${bundle_vti_network}"
+    if ! {
+        [[ "${bundle_local_vti_ip}" == "${CALC_DEBIAN}" && "${bundle_remote_vti_ip}" == "${CALC_UNIFI}" ]] ||
+        [[ "${bundle_local_vti_ip}" == "${CALC_UNIFI}" && "${bundle_remote_vti_ip}" == "${CALC_DEBIAN}" ]]
+    }; then
+        validation_error_block \
+            "INVALID PEER BUNDLE" \
+            "The VTI addresses do not belong to the declared tunnel /30." \
+            "Tunnel network: ${bundle_vti_network}" \
+            "Usable hosts:   ${CALC_DEBIAN}, ${CALC_UNIFI}" \
+            "Local VTI IP:   ${bundle_local_vti_ip}" \
+            "Remote VTI IP:  ${bundle_remote_vti_ip}"
+        pause
+        return
+    fi
+
+    # Debian peer bundles use the remote server's public IPv4 as IKE ID.
+    if [[ "${bundle_auth_id}" != "${bundle_remote_public_ip}" ]]; then
+        validation_error_block \
+            "INVALID PEER BUNDLE" \
+            "Authentication ID does not match the remote Debian public IPv4." \
+            "Authentication ID: ${bundle_auth_id}" \
+            "Remote public IP:  ${bundle_remote_public_ip}"
+        pause
+        return
+    fi
+
+    local detected_public
+    detected_public="$(detect_public_ipv4)"
+    if [[ -n "${detected_public}" && "${bundle_public_ip}" != "${detected_public}" ]]; then
+        validation_error_block \
+            "PEER BUNDLE FOR ANOTHER SERVER" \
+            "Bundle local public IP:    ${bundle_public_ip}" \
+            "Detected server public IP: ${detected_public}" \
+            "" \
+            "Import this bundle on the Debian server it was created for."
         pause
         return
     fi
@@ -5933,24 +5990,24 @@ import_debian_peer_bundle() {
     section "LOCAL CONFLICT VALIDATION"
     local validation_failed=0
 
-    if check_network_conflict "${VTI_NETWORK}"; then
-        show_network_conflict "${VTI_NETWORK}"
+    if check_network_conflict "${bundle_vti_network}"; then
+        show_network_conflict "${bundle_vti_network}"
         validation_failed=1
     else
-        ok "Tunnel network is available on this Debian server: ${VTI_NETWORK}"
+        ok "Tunnel network is available on this Debian server: ${bundle_vti_network}"
     fi
 
-    if find_specific_vti_conflict "${PUBLIC_IP}" "${REMOTE_PUBLIC_IP}" ""; then
+    if find_specific_vti_conflict "${bundle_public_ip}" "${bundle_remote_public_ip}" ""; then
         validation_error_block \
             "VTI ENDPOINT CONFLICT" \
-            "Local public IP:   ${PUBLIC_IP}" \
-            "Remote public IP:  ${REMOTE_PUBLIC_IP}" \
+            "Local public IP:   ${bundle_public_ip}" \
+            "Remote public IP:  ${bundle_remote_public_ip}" \
             "Existing VTI:      ${VTI_TOPOLOGY_CONFLICT_INTERFACE}" \
             "" \
             "This local/remote endpoint pair is already used by another VTI."
         validation_failed=1
     else
-        ok "VTI endpoint pair is available: ${PUBLIC_IP} <-> ${REMOTE_PUBLIC_IP}"
+        ok "VTI endpoint pair is available: ${bundle_public_ip} <-> ${bundle_remote_public_ip}"
     fi
 
     if (( validation_failed != 0 )); then
@@ -5960,19 +6017,20 @@ import_debian_peer_bundle() {
         return
     fi
 
+    local peer_display="${bundle_peer_display}"
     if display_name_in_use "${peer_display}"; then
         warn "Display name '${peer_display}' already exists."
         prompt_display_name "${peer_display}"
         peer_display="${PROMPT_RESULT}"
     fi
 
+    local internal idx interface key
     internal="$(next_internal_name_for_display "${peer_display}")"
     idx="$(next_interface_index)"
     interface="ipsec${idx}"
     key=$((DEFAULT_VTI_KEY + idx))
 
-    # next_interface_index() already checks both manager state and live Debian
-    # interfaces/VTI marks. Keep explicit checks here as a final import guard.
+    # next_interface_index() checks manager state and live Debian VTI resources.
     if interface_in_system_use "${interface}" || vti_key_in_system_use "${key}"; then
         validation_error_block \
             "VTI ALLOCATION CONFLICT" \
@@ -5991,22 +6049,24 @@ import_debian_peer_bundle() {
     section "PEER IMPORT PREVIEW"
     printf '%-28s %s\n' "Display name:" "${peer_display}"
     printf '%-28s %s\n' "Internal name:" "${internal}"
-    printf '%-28s %s\n' "Local public IP:" "${PUBLIC_IP}"
-    printf '%-28s %s\n' "Remote public IP:" "${REMOTE_PUBLIC_IP}"
-    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+    printf '%-28s %s\n' "Local public IP:" "${bundle_public_ip}"
+    printf '%-28s %s\n' "Remote public IP:" "${bundle_remote_public_ip}"
+    printf '%-28s %s\n' "Authentication ID:" "${bundle_auth_id}"
     printf '%-28s %s\n' "VTI interface:" "${interface}"
     printf '%-28s %s\n' "VTI key / mark:" "${key}"
-    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
-    printf '%-28s %s\n' "Local VTI IP:" "${LOCAL_VTI_IP}"
-    printf '%-28s %s\n' "Remote VTI IP:" "${REMOTE_VTI_IP}"
+    printf '%-28s %s\n' "Tunnel network:" "${bundle_vti_network}"
+    printf '%-28s %s\n' "Local VTI IP:" "${bundle_local_vti_ip}"
+    printf '%-28s %s\n' "Remote VTI IP:" "${bundle_remote_vti_ip}"
     echo
     warn "The bundle contains and will store the shared PSK."
     confirm_yes_no "Import this Debian peer tunnel definition?" "N" || return
 
-    save_tunnel "${internal}" "${PUBLIC_IP}" "${AUTH_ID}" "${interface}" "${key}" \
-        "${VTI_NETWORK}" "${LOCAL_VTI_IP}" "${REMOTE_VTI_IP}" "0" "static" "${REMOTE_PUBLIC_IP}" "${peer_display}" "debian"
+    save_tunnel "${internal}" "${bundle_public_ip}" "${bundle_auth_id}" "${interface}" "${key}" \
+        "${bundle_vti_network}" "${bundle_local_vti_ip}" "${bundle_remote_vti_ip}" \
+        "0" "static" "${bundle_remote_public_ip}" "${peer_display}" "debian"
     write_routes "${internal}"
-    save_psk "${internal}" "${PSK}"
+    save_psk "${internal}" "${bundle_psk}"
+
     ok "Debian peer tunnel definition imported."
     info "The tunnel is defined but not installed yet."
     echo
