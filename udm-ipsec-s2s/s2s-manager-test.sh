@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.36-test"
+VERSION="0.37-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -4338,6 +4338,55 @@ add_tunnel_definition() {
         fi
     fi
 
+    # For Static IPv4 / Dynamic DNS, compare the effective IPv4 endpoint pair
+    # against already existing VTIs. DNS names are compared by resolved IPv4.
+    if [[ "${peer_mode}" == "static" || "${peer_mode}" == "dns" ]]; then
+        local effective_peer_ip=""
+        if [[ "${peer_mode}" == "static" ]]; then
+            effective_peer_ip="${peer_address}"
+        else
+            PEER_RESOLVED_IP=""
+            PEER_RESOLVE_MULTIPLE=""
+            if resolve_peer_hostname "${peer_address}"; then
+                effective_peer_ip="${PEER_RESOLVED_IP}"
+            fi
+        fi
+
+        if [[ -n "${effective_peer_ip}" ]] &&
+           find_specific_vti_conflict "${public_ip}" "${effective_peer_ip}" ""; then
+            local specific_conflict="${VTI_TOPOLOGY_CONFLICT_INTERFACE}"
+            local existing_tunnel=""
+            local candidate
+            while IFS= read -r candidate; do
+                [[ -n "${candidate}" ]] || continue
+                load_tunnel "${candidate}" >/dev/null 2>&1 || continue
+                if [[ "${VTI_INTERFACE}" == "${specific_conflict}" ]]; then
+                    existing_tunnel="${candidate}"
+                    break
+                fi
+            done < <(list_tunnel_names)
+
+            install_topology_conflict=1
+            install_topology_conflict_detail="endpoint pair conflict with ${specific_conflict}"
+
+            echo
+            printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
+            printf '%b\n' "${C_BOLD}${C_RED}  ✗ VTI ENDPOINT CONFLICT${C_RESET}"
+            printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
+            printf '%b%s%b\n' "${C_RED}" "Another VTI already uses this endpoint pair." "${C_RESET}"
+            echo
+            printf '%b%-20s %s%b\n' "${C_RED}" "Debian public IP:" "${public_ip}" "${C_RESET}"
+            printf '%b%-20s %s%b\n' "${C_RED}" "Peer endpoint:" "${effective_peer_ip}" "${C_RESET}"
+            [[ -n "${existing_tunnel}" ]] && printf '%b%-20s %s%b\n' "${C_RED}" "Existing tunnel:" "${existing_tunnel}" "${C_RESET}"
+            printf '%b%-20s %s%b\n' "${C_RED}" "Existing VTI:" "${specific_conflict}" "${C_RESET}"
+            echo
+            printf '%b%s%b\n' "${C_BOLD}${C_RED}" "You CAN save this tunnel definition, but you CANNOT activate/install it" "${C_RESET}"
+            printf '%b%s%b\n' "${C_BOLD}${C_RED}" "while another VTI uses the same local and remote endpoint addresses." "${C_RESET}"
+            printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
+            echo
+        fi
+    fi
+
     section "STEP 4/7  Site-to-Site Tunnel Network"
     local suggested_network
     suggested_network="$(next_vti_network)"
@@ -4381,7 +4430,7 @@ add_tunnel_definition() {
 
     echo
     if (( install_topology_conflict == 1 )); then
-        warn "Definition validation passed, but installation topology has a conflict."
+        validation_error "VTI topology conflict detected - definition cannot currently be installed"
         printf '%-28s %s\n' "Installation status:" "CANNOT ACTIVATE"
         printf '%-28s %s\n' "Reason:" "${install_topology_conflict_detail}"
     else
