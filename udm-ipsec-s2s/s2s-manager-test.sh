@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.28-test"
+VERSION="0.29-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1982,6 +1982,163 @@ mark_tunnel_defined() {
         "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0"
 }
 
+
+install_artifacts_present() {
+    local name="$1"
+
+    [[ -e "$(managed_swan_file "${name}")" ]] && return 0
+    [[ -e "$(managed_vti_script "${name}")" ]] && return 0
+    [[ -e "$(managed_service_file "${name}")" ]] && return 0
+    [[ -L "${SYSTEMD_DIR}/multi-user.target.wants/$(managed_service_name "${name}")" ]] && return 0
+
+    load_tunnel "${name}" >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$(managed_service_name "${name}")" 2>/dev/null && return 0
+    systemctl is-failed --quiet "$(managed_service_name "${name}")" 2>/dev/null && return 0
+
+    return 1
+}
+
+cleanup_partial_install() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    section "CLEANING PARTIAL INSTALLATION"
+
+    printf '[1/5] Stopping / disabling tunnel service... '
+    systemctl disable --now "$(managed_service_name "${name}")" \
+        >/tmp/s2s-manager-install-clean-service.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[2/5] Removing partial VTI interface... '
+    ip link del "${VTI_INTERFACE}" >/tmp/s2s-manager-install-clean-vti.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[3/5] Removing manager-generated files... '
+    rm -f \
+        "$(managed_swan_file "${name}")" \
+        "$(managed_vti_script "${name}")" \
+        "$(managed_service_file "${name}")" \
+        "${SYSTEMD_DIR}/multi-user.target.wants/$(managed_service_name "${name}")"
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[4/5] Reloading systemd / strongSwan... '
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$(managed_service_name "${name}")" >/dev/null 2>&1 || true
+    swanctl_clean swanctl --load-all >/tmp/s2s-manager-install-clean-swan.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[5/5] Keeping tunnel definition in DEFINED state... '
+    mark_tunnel_defined "${name}" >/dev/null 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    echo
+    ok "Partial installation artifacts cleaned."
+    info "Tunnel definition and PSK were kept."
+}
+
+install_rollback() {
+    local name="$1"
+    local failed_step="$2"
+    local remove_shared_firewall="${3:-0}"
+
+    load_tunnel "${name}" || return 1
+
+    echo
+    section "INSTALLATION ROLLBACK"
+
+    warn "Installation failed at: ${failed_step}"
+    echo "The manager is reverting files/services created for this tunnel."
+    echo
+
+    printf '[1/6] Stopping / disabling tunnel service... '
+    systemctl disable --now "$(managed_service_name "${name}")" \
+        >/tmp/s2s-manager-install-rollback-service.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[2/6] Removing VTI interface... '
+    ip link del "${VTI_INTERFACE}" >/tmp/s2s-manager-install-rollback-vti.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[3/6] Removing generated manager files... '
+    rm -f \
+        "$(managed_swan_file "${name}")" \
+        "$(managed_vti_script "${name}")" \
+        "$(managed_service_file "${name}")" \
+        "${SYSTEMD_DIR}/multi-user.target.wants/$(managed_service_name "${name}")"
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[4/6] Reloading systemd / strongSwan... '
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$(managed_service_name "${name}")" >/dev/null 2>&1 || true
+    swanctl_clean swanctl --load-all >/tmp/s2s-manager-install-rollback-swan.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[5/6] Restoring manager state to DEFINED... '
+    mark_tunnel_defined "${name}" >/dev/null 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    printf '[6/6] Shared firewall rules... '
+    if [[ "${remove_shared_firewall}" == "1" ]] && ufw_installed; then
+        remove_managed_ufw_rules >/dev/null 2>&1 || true
+        printf '%b\n' "${C_GREEN}REMOVED${C_RESET}"
+    else
+        printf '%b\n' "${C_CYAN}UNCHANGED${C_RESET}"
+    fi
+
+    echo
+    ok "Installation rollback completed."
+    info "Tunnel definition and PSK were kept."
+}
+
+find_wildcard_vti_conflict() {
+    local public_ip="$1"
+    local ignore_interface="${2:-}"
+    local current_iface="" line
+
+    VTI_TOPOLOGY_CONFLICT_INTERFACE=""
+
+    command_available ip || return 1
+
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^[0-9]+:\ ([^:@]+) ]]; then
+            current_iface="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        [[ -z "${current_iface}" ]] && continue
+        [[ -n "${ignore_interface}" && "${current_iface}" == "${ignore_interface}" ]] && continue
+
+        if [[ "${line}" == *"vti remote any local ${public_ip}"* ]]; then
+            VTI_TOPOLOGY_CONFLICT_INTERFACE="${current_iface}"
+            return 0
+        fi
+    done < <(ip -d link show type vti 2>/dev/null)
+
+    return 1
+}
+
+check_vti_install_topology() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    if find_wildcard_vti_conflict "${PUBLIC_IP}" "${VTI_INTERFACE}"; then
+        validation_error_block \
+            "VTI TOPOLOGY CONFLICT" \
+            "Requested interface:  ${VTI_INTERFACE}" \
+            "Local public IP:      ${PUBLIC_IP}" \
+            "Existing VTI:         ${VTI_TOPOLOGY_CONFLICT_INTERFACE}" \
+            "Reason:               another wildcard-remote VTI already uses this local endpoint" \
+            "" \
+            "The missing UniFi peer is NOT the cause." \
+            "With the current wildcard VTI design, a second VTI on the same public IP" \
+            "cannot be installed safely." \
+            "No new tunnel installation changes were applied."
+        return 1
+    fi
+
+    return 0
+}
+
 install_tunnel_system_config() {
     local name="$1"
 
@@ -1992,6 +2149,26 @@ install_tunnel_system_config() {
     }
 
     load_tunnel "${name}" || return 1
+
+    # A previous failed install may have left manager-owned files or a failed
+    # oneshot service even though the state correctly remained DEFINED.
+    if [[ "${INSTALLED}" != "1" ]] && install_artifacts_present "${name}"; then
+        section "PARTIAL INSTALLATION DETECTED"
+        warn "Manager-owned artifacts from an earlier incomplete installation were found."
+        echo
+        echo "The tunnel definition and PSK are safe and will be kept."
+        echo "Only manager-generated system files/service/interface for '${name}' will be removed."
+        echo
+
+        if confirm_yes_no "Clean the partial installation now?" "Y"; then
+            cleanup_partial_install "${name}"
+            load_tunnel "${name}" || return 1
+        else
+            info "Installation cancelled. No further changes were made."
+            pause
+            return 1
+        fi
+    fi
 
     section "INSTALLATION PLAN"
 
@@ -2004,6 +2181,12 @@ install_tunnel_system_config() {
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
 
     echo
+    echo "Peer / connection behavior:"
+    echo "  • The UniFi side does NOT need to be configured yet."
+    echo "  • Local Debian installation should still complete successfully."
+    echo "  • Until UniFi is configured, DISCONNECTED is an expected state."
+    echo "  • A local VTI/systemd failure is NOT caused by a missing UniFi peer."
+    echo
     echo "System changes:"
     echo "  + managed strongSwan connection"
     echo "  + managed VTI startup script"
@@ -2011,8 +2194,23 @@ install_tunnel_system_config() {
     echo "  + table 220 return routes"
     echo "  + shared UFW IPsec rules for UDP 500 / 4500 (if UFW is available)"
     echo
+    echo "Failure handling:"
+    echo "  • If an installation step fails, generated tunnel files/services are rolled back."
+    echo "  • The tunnel definition and PSK remain available for correction/retry."
+    echo
+
+    # Important: check the Linux VTI topology BEFORE firewall/files/systemd changes.
+    if ! check_vti_install_topology "${name}"; then
+        pause
+        return 1
+    fi
+
+    validation_success "Local VTI topology check passed"
 
     confirm_yes_no "Install this tunnel on the Debian system?" "N" || return
+
+    local installed_before remove_shared_firewall_on_rollback=0
+    installed_before="$(installed_tunnel_count)"
 
     ensure_shared_firewall_rules "${PUBLIC_IP}" || {
         error "Firewall step cancelled or failed."
@@ -2020,28 +2218,54 @@ install_tunnel_system_config() {
         return 1
     }
 
+    # If there were no installed manager tunnels before this attempt, any
+    # manager-owned UFW rules can be removed again during rollback.
+    if (( installed_before == 0 )); then
+        remove_shared_firewall_on_rollback=1
+    fi
+
     echo
     section "INSTALLING TUNNEL"
 
     printf '[1/6] Writing strongSwan configuration... '
-    render_strongswan_config "${name}" &&
-        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
-        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+    if render_strongswan_config "${name}"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        install_rollback "${name}" "writing strongSwan configuration" "${remove_shared_firewall_on_rollback}"
+        pause
+        return 1
+    fi
 
     printf '[2/6] Writing VTI script... '
-    render_vti_script "${name}" &&
-        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
-        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+    if render_vti_script "${name}"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        install_rollback "${name}" "writing VTI script" "${remove_shared_firewall_on_rollback}"
+        pause
+        return 1
+    fi
 
     printf '[3/6] Writing systemd service... '
-    render_systemd_service "${name}" &&
-        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
-        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+    if render_systemd_service "${name}"; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        install_rollback "${name}" "writing systemd service" "${remove_shared_firewall_on_rollback}"
+        pause
+        return 1
+    fi
 
     printf '[4/6] Reloading systemd... '
-    systemctl daemon-reload &&
-        printf '%b\n' "${C_GREEN}OK${C_RESET}" ||
-        { printf '%b\n' "${C_RED}FAILED${C_RESET}"; pause; return 1; }
+    if systemctl daemon-reload; then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+    else
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        install_rollback "${name}" "reloading systemd" "${remove_shared_firewall_on_rollback}"
+        pause
+        return 1
+    fi
 
     printf '[5/6] Enabling / starting VTI service... '
     if systemctl enable --now "$(managed_service_name "${name}")" >/tmp/s2s-manager-vti.log 2>&1; then
@@ -2049,16 +2273,21 @@ install_tunnel_system_config() {
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
         cat /tmp/s2s-manager-vti.log
+        install_rollback "${name}" "starting VTI service" "${remove_shared_firewall_on_rollback}"
         pause
         return 1
     fi
 
-    printf '[6/6] Loading strongSwan configuration... '
-    if swanctl --load-all >/tmp/s2s-manager-swanctl.log 2>&1; then
+    printf '[6/6] Loading / verifying strongSwan configuration... '
+    swanctl_clean swanctl --load-all >/tmp/s2s-manager-swanctl.log 2>&1 || true
+
+    if swanctl_clean swanctl --list-conns 2>/dev/null |
+       grep -qE "^${MANAGED_PREFIX}-${name}:"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
-        cat /tmp/s2s-manager-swanctl.log
+        cat /tmp/s2s-manager-swanctl.log 2>/dev/null || true
+        install_rollback "${name}" "loading/verifying strongSwan configuration" "${remove_shared_firewall_on_rollback}"
         pause
         return 1
     fi
@@ -2067,7 +2296,8 @@ install_tunnel_system_config() {
 
     echo
     ok "Tunnel '${name}' is installed on Debian."
-    info "The IPsec SA will remain waiting until the UniFi side is configured."
+    info "The UniFi peer may be configured later."
+    info "Until then, DISCONNECTED is expected and does not mean installation failed."
     pause
 }
 
