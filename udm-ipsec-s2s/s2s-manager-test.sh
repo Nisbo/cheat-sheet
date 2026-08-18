@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.31-test"
+VERSION="0.32-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -4368,39 +4368,113 @@ remove_remote_network() {
     pause
 }
 
-delete_tunnel_definition() {
+delete_tunnel_completely() {
     banner
-    section "DELETE TUNNEL"
+    section "DELETE TUNNEL COMPLETELY"
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
 
-    if [[ "${MANAGEMENT}" != "IMPORTED" && "${INSTALLED}" == "1" ]]; then
-        error "Tunnel is currently installed."
-        echo "Remove its installed system configuration first."
+    echo "Tunnel:                      ${name}"
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        printf '%-28s %s\n' "Management:" "IMPORTED / READ-ONLY"
+        echo
+        warn "This tunnel is imported and READ-ONLY."
+        echo "Only the S2S Manager state and copied PSK will be deleted."
+        echo "The external strongSwan, VTI and systemd configuration will NOT be changed."
+        echo
+        read -r -p "Type DELETE to confirm: " confirm
+        [[ "${confirm}" == "DELETE" ]] || return
+
+        rm -f \
+            "$(tunnel_config_file "${name}")" \
+            "$(tunnel_route_file "${name}")" \
+            "$(tunnel_secret_file "${name}")"
+
+        ok "Imported tunnel removed from S2S Manager state."
         pause
         return
     fi
 
-    echo "Tunnel: ${name}"
-    echo
-    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
-        echo "This removes ONLY the imported S2S Manager state and copied PSK."
-        echo "The external strongSwan, VTI and systemd configuration is NOT changed."
+    local was_installed=0
+    tunnel_is_installed "${name}" && was_installed=1
+    # tunnel_is_installed() may load state for another check, so restore this tunnel.
+    load_tunnel "${name}" || return
+
+    if (( was_installed == 1 )); then
+        printf '%-28s %s\n' "Management:" "MANAGED / INSTALLED"
+        echo
+        echo "This will completely remove the tunnel from Debian and the manager."
+        echo
+        echo "The following will be removed:"
+        echo "  • active strongSwan configuration"
+        echo "  • VTI interface ${VTI_INTERFACE}"
+        echo "  • systemd VTI service"
+        echo "  • table 220 routes created by the VTI script"
+        echo "  • tunnel definition and remote-network state"
+        echo "  • stored PSK"
     else
-        echo "This removes its state and PSK files."
+        printf '%-28s %s\n' "Management:" "DEFINED / MANAGED"
+        echo
+        echo "This tunnel is not installed on Debian."
+        echo "The tunnel definition, remote-network state and stored PSK will be removed."
     fi
+
     echo
     read -r -p "Type DELETE to confirm: " confirm
     [[ "${confirm}" == "DELETE" ]] || return
+
+    if (( was_installed == 1 )); then
+        echo
+        section "REMOVING INSTALLED TUNNEL"
+
+        printf '[1/5] Terminating active IPsec connection... '
+        swanctl --terminate --ike "${MANAGED_PREFIX}-${name}" >/dev/null 2>&1 || true
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+        printf '[2/5] Stopping / disabling VTI service... '
+        systemctl disable --now "$(managed_service_name "${name}")" >/dev/null 2>&1 || true
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+        printf '[3/5] Removing VTI interface and manager system files... '
+        ip link del "${VTI_INTERFACE}" >/dev/null 2>&1 || true
+        rm -f \
+            "$(managed_swan_file "${name}")" \
+            "$(managed_vti_script "${name}")" \
+            "$(managed_service_file "${name}")"
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+        printf '[4/5] Reloading systemd / strongSwan... '
+        systemctl daemon-reload
+        swanctl_clean swanctl --load-all >/dev/null 2>&1 || true
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+        printf '[5/5] Removing manager definition and PSK... '
+    fi
 
     rm -f \
         "$(tunnel_config_file "${name}")" \
         "$(tunnel_route_file "${name}")" \
         "$(tunnel_secret_file "${name}")"
 
-    ok "Tunnel definition deleted."
+    if (( was_installed == 1 )); then
+        printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+        if (( $(installed_tunnel_count) == 0 )) && ufw_installed; then
+            echo
+            warn "No other managed S2S tunnels are installed."
+            if confirm_yes_no "Remove shared S2S Manager UFW rules?" "Y"; then
+                remove_managed_ufw_rules
+                ok "Managed UFW rules removed."
+            fi
+        fi
+        echo
+        ok "Tunnel '${name}' completely removed."
+    else
+        ok "Tunnel definition and PSK deleted."
+    fi
+
     pause
 }
 
@@ -5014,22 +5088,35 @@ main_menu() {
         section "CONFIGURED TUNNELS"
         show_existing_tunnels
 
-        section "MENU"
+        section "TUNNEL CONFIGURATION"
         echo "  [1] Show tunnel configuration"
-        echo "  [2] Add S2S tunnel definition"
-        echo "  [3] Add remote network"
-        echo "  [4] Remove remote network"
-        echo "  [5] Install defined tunnel on Debian"
-        echo "  [6] Remove installed tunnel from Debian"
-        echo "  [7] Delete tunnel definition"
-        echo "  [8] Show UniFi configuration"
+        echo "  [2] Add S2S tunnel"
+        echo "  [3] Add remote network to tunnel"
+        echo "  [4] Remove remote network from tunnel"
+        echo "  [5] Show UniFi configuration"
+        echo
+        echo "  TUNNEL OPERATIONS"
+        echo "  ────────────────────────────────────────────────────────────"
+        echo "  [6] Install tunnel on Debian"
+        echo "  [7] Re-apply tunnel configuration"
+        echo "  [8] Reconnect tunnel"
         echo "  [9] Tunnel diagnostics"
-        echo "  [10] Show system status"
-        echo "  [11] Re-apply installed tunnel"
-        echo "  [12] Reconnect tunnel"
-        echo "  [13] Discover / import existing tunnels"
-        echo "  [14] Take over imported tunnel"
-        echo "  [15] Show Take Over backups"
+        echo
+        echo "  REMOVE / DELETE"
+        echo "  ────────────────────────────────────────────────────────────"
+        echo "  [10] Uninstall tunnel from Debian (keep definition + PSK)"
+        echo "  [11] Delete tunnel completely"
+        echo
+        echo "  IMPORT / TAKE OVER"
+        echo "  ────────────────────────────────────────────────────────────"
+        echo "  [12] Discover / import existing tunnels"
+        echo "  [13] Take over imported tunnel"
+        echo "  [14] Show Take Over backups"
+        echo
+        echo "  SYSTEM"
+        echo "  ────────────────────────────────────────────────────────────"
+        echo "  [15] Show system status"
+        echo
         echo "  [E] Exit"
         echo
 
@@ -5041,17 +5128,17 @@ main_menu() {
             2) add_tunnel_definition ;;
             3) add_remote_network ;;
             4) remove_remote_network ;;
-            5) install_defined_tunnel ;;
-            6) remove_installed_tunnel ;;
-            7) delete_tunnel_definition ;;
-            8) show_unifi_configuration ;;
+            5) show_unifi_configuration ;;
+            6) install_defined_tunnel ;;
+            7) manual_reapply_tunnel ;;
+            8) manual_reconnect_tunnel ;;
             9) show_tunnel_diagnostics ;;
-            10) show_system_status ;;
-            11) manual_reapply_tunnel ;;
-            12) manual_reconnect_tunnel ;;
-            13) discover_existing_tunnels ;;
-            14) takeover_imported_tunnel ;;
-            15) show_takeover_backups ;;
+            10) remove_installed_tunnel ;;
+            11) delete_tunnel_completely ;;
+            12) discover_existing_tunnels ;;
+            13) takeover_imported_tunnel ;;
+            14) show_takeover_backups ;;
+            15) show_system_status ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
