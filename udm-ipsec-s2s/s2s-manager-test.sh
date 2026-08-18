@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.37-test"
+VERSION="0.38-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -751,7 +751,7 @@ load_tunnel() {
     unset VTI_NETWORK DEBIAN_VTI_IP UNIFI_VTI_IP CREATED_AT INSTALLED
     unset MANAGEMENT SOURCE_CONN_NAME SOURCE_SWAN_FILE SOURCE_VTI_SCRIPT
     unset SOURCE_SERVICE SOURCE_FORCED_NATT
-    unset PEER_MODE PEER_ADDRESS
+    unset PEER_MODE PEER_ADDRESS DISPLAY_NAME
 
     # shellcheck disable=SC1090
     source "${file}"
@@ -768,6 +768,7 @@ load_tunnel() {
     # a wildcard VTI endpoint and accepted an incoming peer from %any.
     : "${PEER_MODE:=dynamic}"
     : "${PEER_ADDRESS:=}"
+    : "${DISPLAY_NAME:=${NAME}}"
 }
 
 save_tunnel() {
@@ -782,12 +783,14 @@ save_tunnel() {
     local installed="${9:-0}"
     local peer_mode="${10:-dynamic}"
     local peer_address="${11:-}"
+    local display_name="${12:-${name}}"
 
     local config
     config="$(tunnel_config_file "${name}")"
 
     {
         printf 'NAME=%q\n' "${name}"
+        printf 'DISPLAY_NAME=%q\n' "${display_name}"
         printf 'PUBLIC_IP=%q\n' "${public_ip}"
         printf 'AUTH_ID=%q\n' "${auth_id}"
         printf 'VTI_INTERFACE=%q\n' "${interface}"
@@ -1478,7 +1481,7 @@ show_existing_tunnels() {
                 case "${DNS_PEER_STATUS}" in
                     OUTDATED|RESOLVE_FAILED|CHECK_UNAVAILABLE|MULTIPLE|VTI_MISSING)
                         connection="DISCONNECTED (DNS)"
-                        dns_notices+=("${NAME}|${DNS_PEER_STATUS}|${DNS_PEER_HOSTNAME}|${DNS_PEER_RESOLVED_IP}|${DNS_PEER_VTI_IP}|${DNS_PEER_DETAIL}")
+                        dns_notices+=("${DISPLAY_NAME}|${DNS_PEER_STATUS}|${DNS_PEER_HOSTNAME}|${DNS_PEER_RESOLVED_IP}|${DNS_PEER_VTI_IP}|${DNS_PEER_DETAIL}")
                         ;;
                 esac
             fi
@@ -1489,7 +1492,7 @@ show_existing_tunnels() {
 
         print_table_cell "${index}" "${number_width}"
         printf '%s' "${gap}"
-        print_table_cell "${NAME}" "${name_width}"
+        print_table_cell "${DISPLAY_NAME}" "${name_width}"
         printf '%s' "${gap}"
         print_table_cell "${VTI_INTERFACE}" "${interface_width}"
         printf '%s' "${gap}"
@@ -1578,6 +1581,130 @@ select_tunnel() {
 # ==============================================================================
 # Prompts
 # ==============================================================================
+
+valid_display_name() {
+    local value="$1"
+    (( ${#value} >= 1 && ${#value} <= 48 )) || return 1
+    [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* && "${value}" != *$'\t'* ]] || return 1
+    [[ "${value}" != " "* && "${value}" != *" " ]] || return 1
+}
+
+display_name_in_use() {
+    local wanted="$1"
+    local ignore="${2:-}"
+    local name
+
+    DISPLAY_NAME_CONFLICT_TUNNEL=""
+    while read -r name; do
+        [[ -z "${name}" || "${name}" == "${ignore}" ]] && continue
+        load_tunnel "${name}" || continue
+        if [[ "${DISPLAY_NAME,,}" == "${wanted,,}" ]]; then
+            DISPLAY_NAME_CONFLICT_TUNNEL="${NAME}"
+            return 0
+        fi
+    done < <(list_tunnel_names)
+    return 1
+}
+
+internal_name_artifacts_exist() {
+    local name="$1"
+
+    tunnel_exists "${name}" && return 0
+    [[ -e "$(managed_swan_file "${name}")" ]] && return 0
+    [[ -e "$(managed_vti_script "${name}")" ]] && return 0
+    [[ -e "$(managed_service_file "${name}")" ]] && return 0
+    [[ -L "${SYSTEMD_DIR}/multi-user.target.wants/$(managed_service_name "${name}")" ]] && return 0
+
+    if command_available swanctl; then
+        swanctl_clean swanctl --list-conns 2>/dev/null |
+            grep -qE "^${MANAGED_PREFIX}-${name}:" && return 0
+    fi
+    return 1
+}
+
+display_to_internal_base() {
+    local value="$1"
+    local base
+
+    base="${value,,}"
+    base="${base// /-}"
+    base="${base//./-}"
+    base="$(printf '%s' "${base}" | tr -cd 'a-z0-9_-')"
+    base="$(printf '%s' "${base}" | sed -E 's/[-_]+/-/g; s/^-+//; s/-+$//')"
+    [[ -n "${base}" ]] || base="tunnel"
+    [[ "${base}" =~ ^[a-z0-9] ]] || base="t-${base}"
+    base="${base:0:32}"
+    base="${base%-}"
+    [[ -n "${base}" ]] || base="tunnel"
+    printf '%s' "${base}"
+}
+
+next_internal_name_for_display() {
+    local display="$1"
+    local base candidate suffix n=1 max_base
+
+    base="$(display_to_internal_base "${display}")"
+    candidate="${base}"
+    while internal_name_artifacts_exist "${candidate}"; do
+        ((n += 1))
+        suffix="-${n}"
+        max_base=$((32 - ${#suffix}))
+        candidate="${base:0:${max_base}}${suffix}"
+    done
+    printf '%s' "${candidate}"
+}
+
+prompt_display_name() {
+    local suggested="$1"
+    local ignore_internal="${2:-}"
+    local value
+
+    while :; do
+        echo "This is the name shown in the S2S Manager interface."
+        echo "It can be changed later without renaming strongSwan, systemd or manager files."
+        echo
+        echo "Rules:"
+        echo "  • 1-48 characters"
+        echo "  • spaces and normal display characters are allowed"
+        echo "  • display names must be unique"
+        echo
+        read -r -p "Tunnel display name [${suggested}]: " value
+        value="${value:-${suggested}}"
+
+        if ! valid_display_name "${value}"; then
+            validation_error_block \
+                "INVALID DISPLAY NAME" \
+                "Use 1-48 characters without leading/trailing spaces or control characters."
+            continue
+        fi
+
+        if display_name_in_use "${value}" "${ignore_internal}"; then
+            validation_error_block \
+                "DISPLAY NAME ALREADY IN USE" \
+                "Display name:  ${value}" \
+                "Used by:      ${DISPLAY_NAME_CONFLICT_TUNNEL}"
+            continue
+        fi
+
+        PROMPT_RESULT="${value}"
+        return 0
+    done
+}
+
+set_tunnel_display_name() {
+    local name="$1"
+    local new_display="$2"
+    local file tmp
+
+    file="$(tunnel_config_file "${name}")"
+    [[ -f "${file}" ]] || return 1
+    tmp="${file}.display-name.$$"
+
+    awk '!/^DISPLAY_NAME=/' "${file}" > "${tmp}"
+    printf 'DISPLAY_NAME=%q\n' "${new_display}" >> "${tmp}"
+    chmod 600 "${tmp}"
+    mv -f "${tmp}" "${file}"
+}
 
 prompt_tunnel_name() {
     local suggested="$1" value
@@ -2493,7 +2620,7 @@ mark_tunnel_installed() {
 
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
-        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"         "${PEER_MODE}" "${PEER_ADDRESS}"
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"         "${PEER_MODE}" "${PEER_ADDRESS}" "${DISPLAY_NAME}"
 }
 
 mark_tunnel_defined() {
@@ -2502,7 +2629,7 @@ mark_tunnel_defined() {
 
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
-        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0"         "${PEER_MODE}" "${PEER_ADDRESS}"
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0"         "${PEER_MODE}" "${PEER_ADDRESS}" "${DISPLAY_NAME}"
 }
 
 
@@ -4261,7 +4388,7 @@ takeover_imported_tunnel() {
 
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
-        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"         "${PEER_MODE}" "${PEER_ADDRESS}"
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"         "${PEER_MODE}" "${PEER_ADDRESS}" "${DISPLAY_NAME}"
 
     cat >> "$(tunnel_config_file "${name}")" <<EOF
 TAKEOVER_BACKUP_DIR=$(printf '%q' "${backup_root}")
@@ -4299,9 +4426,20 @@ add_tunnel_definition() {
     suggested_name="home"
     (( tunnel_number > 1 )) && suggested_name="s2s-${tunnel_number}"
 
-    section "STEP 1/7  Tunnel Name"
-    prompt_tunnel_name "${suggested_name}"
-    local name="${PROMPT_RESULT}"
+    section "STEP 1/7  Tunnel Display Name"
+    prompt_display_name "${suggested_name}"
+    local display_name="${PROMPT_RESULT}"
+    local name
+    name="$(next_internal_name_for_display "${display_name}")"
+
+    echo
+    printf '%-28s %s
+' "Display name:" "${display_name}"
+    printf '%-28s %s
+' "Internal name:" "${name}"
+    if [[ "${name}" != "$(display_to_internal_base "${display_name}")" ]]; then
+        info "Internal name adjusted automatically to avoid a technical name/file collision."
+    fi
 
     section "STEP 2/7  UniFi Peer Endpoint"
     prompt_peer_endpoint || return
@@ -4457,7 +4595,7 @@ add_tunnel_definition() {
     confirm_yes_no "Save tunnel definition?" "N" || return
 
     save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}" \
-        "${network}" "${debian_ip}" "${unifi_ip}" "0" "${peer_mode}" "${peer_address}"
+        "${network}" "${debian_ip}" "${unifi_ip}" "0" "${peer_mode}" "${peer_address}" "${display_name}"
     write_routes "${name}" "${routes[@]:-}"
     save_psk "${name}" "${psk}"
 
@@ -4766,9 +4904,10 @@ show_tunnel_details() {
     local name="$1"
     load_tunnel "${name}" || return 1
 
-    section "Tunnel configuration: ${name}"
+    section "Tunnel configuration: ${DISPLAY_NAME}"
 
-    printf '%-28s %s\n' "Name:" "${NAME}"
+    printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
     if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
         printf '%-28s %s\n' "Management:" "IMPORTED / READ-ONLY"
         printf '%-28s %s\n' "Connection:" "$(tunnel_connection_state "${NAME}")"
@@ -4798,6 +4937,48 @@ show_tunnel_details() {
         ((count += 1))
     done < <(read_routes "${name}")
     (( count == 0 )) && echo "  None"
+}
+
+rename_tunnel_display_name() {
+    banner
+    section "RENAME TUNNEL DISPLAY NAME"
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+
+    echo
+    printf '%-28s %s\n' "Current display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
+    echo
+    echo "Only the display name will change."
+    echo "strongSwan connection names, VTI interfaces, systemd services,"
+    echo "manager filenames, routes, Authentication ID and PSK remain unchanged."
+    echo
+
+    prompt_display_name "${DISPLAY_NAME}" "${NAME}"
+    local new_display="${PROMPT_RESULT}"
+
+    if [[ "${new_display}" == "${DISPLAY_NAME}" ]]; then
+        info "Display name unchanged."
+        pause
+        return
+    fi
+
+    echo
+    printf '%-28s %s\n' "Old display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "New display name:" "${new_display}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
+    echo
+    confirm_yes_no "Change tunnel display name?" "N" || return
+
+    if set_tunnel_display_name "${name}" "${new_display}"; then
+        ok "Tunnel display name changed."
+        info "No active IPsec/VTI/systemd configuration was modified."
+    else
+        error "Failed to change tunnel display name."
+    fi
+    pause
 }
 
 show_configuration() {
@@ -5406,24 +5587,25 @@ main_menu() {
         echo "  [3] Add remote network to tunnel"
         echo "  [4] Remove remote network from tunnel"
         echo "  [5] Show UniFi configuration"
+        echo "  [6] Rename tunnel display name"
 
         menu_group_header "TUNNEL OPERATIONS" "${C_GREEN}"
-        echo "  [6] Install tunnel on Debian"
-        echo "  [7] Re-apply tunnel configuration"
-        echo "  [8] Reconnect tunnel"
-        echo "  [9] Tunnel diagnostics"
+        echo "  [7] Install tunnel on Debian"
+        echo "  [8] Re-apply tunnel configuration"
+        echo "  [9] Reconnect tunnel"
+        echo "  [10] Tunnel diagnostics"
 
         menu_group_header "REMOVE / DELETE" "${C_YELLOW}"
-        echo "  [10] Uninstall tunnel from Debian (keep definition + PSK)"
-        echo "  [11] Delete tunnel completely"
+        echo "  [11] Uninstall tunnel from Debian (keep definition + PSK)"
+        echo "  [12] Delete tunnel completely"
 
         menu_group_header "IMPORT / TAKE OVER" "${C_BLUE}"
-        echo "  [12] Discover / import existing tunnels"
-        echo "  [13] Take over imported tunnel"
-        echo "  [14] Show Take Over backups"
+        echo "  [13] Discover / import existing tunnels"
+        echo "  [14] Take over imported tunnel"
+        echo "  [15] Show Take Over backups"
 
         menu_group_header "SYSTEM" "${C_CYAN}"
-        echo "  [15] Show system status"
+        echo "  [16] Show system status"
 
         echo
         echo "  [E] Exit"
@@ -5438,16 +5620,17 @@ main_menu() {
             3) add_remote_network ;;
             4) remove_remote_network ;;
             5) show_unifi_configuration ;;
-            6) install_defined_tunnel ;;
-            7) manual_reapply_tunnel ;;
-            8) manual_reconnect_tunnel ;;
-            9) show_tunnel_diagnostics ;;
-            10) remove_installed_tunnel ;;
-            11) delete_tunnel_completely ;;
-            12) discover_existing_tunnels ;;
-            13) takeover_imported_tunnel ;;
-            14) show_takeover_backups ;;
-            15) show_system_status ;;
+            6) rename_tunnel_display_name ;;
+            7) install_defined_tunnel ;;
+            8) manual_reapply_tunnel ;;
+            9) manual_reconnect_tunnel ;;
+            10) show_tunnel_diagnostics ;;
+            11) remove_installed_tunnel ;;
+            12) delete_tunnel_completely ;;
+            13) discover_existing_tunnels ;;
+            14) takeover_imported_tunnel ;;
+            15) show_takeover_backups ;;
+            16) show_system_status ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
