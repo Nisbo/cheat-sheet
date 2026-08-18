@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.32-test"
+VERSION="0.33-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -165,6 +165,18 @@ section() {
     printf '  %b%s%b\n' "${C_BOLD}${C_CYAN}" "$1" "${C_RESET}"
     line
     echo
+}
+
+menu_group_header() {
+    local title="$1"
+    local color="$2"
+    local width=60
+
+    echo
+    printf '  %b%s%b\n' "${C_BOLD}${color}" "${title}" "${C_RESET}"
+    printf '  %b' "${color}"
+    table_divider_segment "${width}"
+    printf '%b\n' "${C_RESET}"
 }
 
 confirm_yes_no() {
@@ -5088,34 +5100,37 @@ main_menu() {
         section "CONFIGURED TUNNELS"
         show_existing_tunnels
 
-        section "TUNNEL CONFIGURATION"
+        # General visual separator between the tunnel table and the menu groups.
+        echo
+        printf '%b' "${C_DIM}"
+        table_divider_segment 128
+        printf '%b\n' "${C_RESET}"
+
+        menu_group_header "TUNNEL CONFIGURATION" "${C_CYAN}"
         echo "  [1] Show tunnel configuration"
         echo "  [2] Add S2S tunnel"
         echo "  [3] Add remote network to tunnel"
         echo "  [4] Remove remote network from tunnel"
         echo "  [5] Show UniFi configuration"
-        echo
-        echo "  TUNNEL OPERATIONS"
-        echo "  ────────────────────────────────────────────────────────────"
+
+        menu_group_header "TUNNEL OPERATIONS" "${C_GREEN}"
         echo "  [6] Install tunnel on Debian"
         echo "  [7] Re-apply tunnel configuration"
         echo "  [8] Reconnect tunnel"
         echo "  [9] Tunnel diagnostics"
-        echo
-        echo "  REMOVE / DELETE"
-        echo "  ────────────────────────────────────────────────────────────"
+
+        menu_group_header "REMOVE / DELETE" "${C_YELLOW}"
         echo "  [10] Uninstall tunnel from Debian (keep definition + PSK)"
         echo "  [11] Delete tunnel completely"
-        echo
-        echo "  IMPORT / TAKE OVER"
-        echo "  ────────────────────────────────────────────────────────────"
+
+        menu_group_header "IMPORT / TAKE OVER" "${C_BLUE}"
         echo "  [12] Discover / import existing tunnels"
         echo "  [13] Take over imported tunnel"
         echo "  [14] Show Take Over backups"
-        echo
-        echo "  SYSTEM"
-        echo "  ────────────────────────────────────────────────────────────"
+
+        menu_group_header "SYSTEM" "${C_CYAN}"
         echo "  [15] Show system status"
+
         echo
         echo "  [E] Exit"
         echo
