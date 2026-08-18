@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.35-test"
+VERSION="0.36-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1834,6 +1834,7 @@ prompt_peer_endpoint() {
                     echo "Do NOT include http://, https://, a port or a path."
                     echo "Example: my-unifi.example.com"
                     echo
+                    echo "Hostname only - this is NOT a web URL."
                     read -r -p "UniFi hostname / Dynamic DNS name: " value
                     [[ -z "${value}" ]] && { warn "Hostname is required."; continue; }
 
@@ -5343,7 +5344,6 @@ main_menu() {
 
         section "CONFIGURED TUNNELS"
         show_existing_tunnels
-        show_dns_summary_warnings
 
         # General visual separator between the tunnel table and the menu groups.
         echo
