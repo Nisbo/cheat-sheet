@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.40-test"
+VERSION="0.41-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -5772,15 +5772,49 @@ transfer_debian_peer_bundle() {
     fi
     command_available scp || { error "scp is not installed."; pause; return; }
 
-    local host user port remote_dir target
-    read -r -p "Peer SSH hostname / IPv4: " host
-    [[ -n "${host}" ]] || { error "Peer host is required."; pause; return; }
+    local host user port remote_dir target suggested_host="" raw_host
+
+    # Peer bundles already contain the peer server's public IPv4 address. Use it
+    # as the default SSH destination, but still allow a DNS hostname instead.
+    if read_peer_bundle "${bundle}" >/dev/null 2>&1; then
+        suggested_host="${PUBLIC_IP:-}"
+    fi
+
+    echo "Enter the remote SSH server as an IPv4 address or DNS hostname."
+    echo "Examples: 94.130.110.232 or server.example.org"
+    echo "Do not include http:// or https:// (it will be removed automatically)."
+    echo
+
+    while :; do
+        if [[ -n "${suggested_host}" ]]; then
+            read -r -p "Remote SSH server (hostname or IPv4) [${suggested_host}]: " raw_host
+            [[ -n "${raw_host}" ]] || raw_host="${suggested_host}"
+        else
+            read -r -p "Remote SSH server (hostname or IPv4): " raw_host
+        fi
+
+        host="${raw_host#http://}"
+        host="${host#https://}"
+        host="${host%%/*}"
+        host="${host%%:*}"
+
+        if [[ -z "${host}" ]]; then
+            error "Remote SSH server is required."
+            continue
+        fi
+
+        if [[ "${host}" != "${raw_host}" ]]; then
+            info "Using SSH server: ${host}"
+        fi
+        break
+    done
+
     read -r -p "SSH user [root]: " user
     [[ -n "${user}" ]] || user="root"
     read -r -p "SSH port [22]: " port
     [[ -n "${port}" ]] || port="22"
     [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { error "Invalid SSH port."; pause; return; }
-    read -r -p "Remote directory [/root/s2s-manager-import]: " remote_dir
+    read -r -p "Remote import directory [/root/s2s-manager-import]: " remote_dir
     [[ -n "${remote_dir}" ]] || remote_dir="/root/s2s-manager-import"
 
     echo
@@ -5790,11 +5824,16 @@ transfer_debian_peer_bundle() {
     warn "The bundle contains the tunnel PSK. SCP encrypts the transfer over SSH."
     confirm_yes_no "Transfer this bundle now?" "N" || return
 
+    info "Checking / preparing remote import directory..."
     if ! ssh -p "${port}" "${user}@${host}" "mkdir -p -- $(printf '%q' "${remote_dir}") && chmod 700 -- $(printf '%q' "${remote_dir}")"; then
-        error "Could not prepare the remote import directory."
+        error "Could not create or prepare the remote import directory."
+        echo "The bundle was not transferred and remains available locally."
         pause
         return
     fi
+    ok "Remote import directory is ready: ${remote_dir}"
+
+    info "Transferring peer bundle via SCP..."
     if scp -P "${port}" -- "${bundle}" "${user}@${host}:${remote_dir}/"; then
         target="${remote_dir}/$(basename "${bundle}")"
         echo
