@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.30-test"
+VERSION="0.31-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1102,6 +1102,75 @@ next_vti_network() {
     printf '10.200.251.0/30'
 }
 
+vti_current_remote_endpoint() {
+    local iface="$1"
+    local remote=""
+
+    command_available ip || return 1
+    ip link show "${iface}" >/dev/null 2>&1 || return 1
+
+    remote="$(
+        ip -d link show "${iface}" 2>/dev/null |
+        awk '/vti / {
+            for (i=1; i<=NF; i++) {
+                if ($i=="remote" && (i+1)<=NF) { print $(i+1); exit }
+            }
+        }'
+    )"
+
+    [[ "${remote}" == "any" ]] && remote="0.0.0.0"
+    [[ -n "${remote}" ]] || return 1
+    printf '%s' "${remote}"
+}
+
+dns_peer_endpoint_status() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    DNS_PEER_STATUS="NOT_DNS"
+    DNS_PEER_HOSTNAME="${PEER_ADDRESS:-}"
+    DNS_PEER_RESOLVED_IP=""
+    DNS_PEER_VTI_IP=""
+    DNS_PEER_DETAIL=""
+
+    [[ "${PEER_MODE}" == "dns" ]] || return 0
+
+    PEER_RESOLVED_IP=""
+    PEER_RESOLVE_MULTIPLE=""
+    resolve_peer_hostname "${PEER_ADDRESS}"
+    case "$?" in
+        0)
+            DNS_PEER_RESOLVED_IP="${PEER_RESOLVED_IP}"
+            ;;
+        1)
+            DNS_PEER_STATUS="RESOLVE_FAILED"
+            DNS_PEER_DETAIL="hostname currently has no resolvable IPv4 address"
+            return 0
+            ;;
+        2)
+            DNS_PEER_STATUS="CHECK_UNAVAILABLE"
+            DNS_PEER_DETAIL="getent is unavailable"
+            return 0
+            ;;
+        3)
+            DNS_PEER_STATUS="MULTIPLE"
+            DNS_PEER_DETAIL="hostname resolves to multiple IPv4 addresses: ${PEER_RESOLVE_MULTIPLE}"
+            return 0
+            ;;
+    esac
+
+    DNS_PEER_VTI_IP="$(vti_current_remote_endpoint "${VTI_INTERFACE}" 2>/dev/null || true)"
+    if [[ -z "${DNS_PEER_VTI_IP}" ]]; then
+        DNS_PEER_STATUS="VTI_MISSING"
+        DNS_PEER_DETAIL="VTI interface is missing or its remote endpoint could not be read"
+    elif [[ "${DNS_PEER_VTI_IP}" != "${DNS_PEER_RESOLVED_IP}" ]]; then
+        DNS_PEER_STATUS="OUTDATED"
+        DNS_PEER_DETAIL="DNS endpoint changed; Re-apply is required"
+    else
+        DNS_PEER_STATUS="CURRENT"
+    fi
+}
+
 tunnel_connection_state() {
     local name="$1"
     local conn
@@ -1182,7 +1251,7 @@ show_existing_tunnels() {
     local interface_width=10
     local network_width=20
     local management_width=22
-    local connection_width=14
+    local connection_width=18
     local auth_width=24
     local gap="  "
 
@@ -1219,6 +1288,7 @@ show_existing_tunnels() {
     printf '\n'
 
     local index=1 name management connection
+    local -a dns_notices=()
     while read -r name; do
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
@@ -1229,6 +1299,16 @@ show_existing_tunnels() {
         elif [[ "${INSTALLED}" == "1" ]]; then
             management="MANAGED"
             connection="$(tunnel_connection_state "${NAME}")"
+
+            if [[ "${PEER_MODE}" == "dns" ]]; then
+                dns_peer_endpoint_status "${NAME}" || true
+                case "${DNS_PEER_STATUS}" in
+                    OUTDATED|RESOLVE_FAILED|CHECK_UNAVAILABLE|MULTIPLE|VTI_MISSING)
+                        connection="DISCONNECTED (DNS)"
+                        dns_notices+=("${NAME}|${DNS_PEER_STATUS}|${DNS_PEER_HOSTNAME}|${DNS_PEER_RESOLVED_IP}|${DNS_PEER_VTI_IP}|${DNS_PEER_DETAIL}")
+                        ;;
+                esac
+            fi
         else
             management="DEFINED / MANAGED"
             connection="-"
@@ -1249,7 +1329,7 @@ show_existing_tunnels() {
             CONNECTED)
                 print_table_cell "${connection}" "${connection_width}" "${C_GREEN}${C_BOLD}" "${C_RESET}"
                 ;;
-            DISCONNECTED)
+            DISCONNECTED|"DISCONNECTED (DNS)")
                 print_table_cell "${connection}" "${connection_width}" "${C_RED}${C_BOLD}" "${C_RESET}"
                 ;;
             *)
@@ -1263,6 +1343,31 @@ show_existing_tunnels() {
 
         ((index += 1))
     done < <(list_tunnel_names)
+
+    if (( ${#dns_notices[@]} > 0 )); then
+        echo
+        local notice n_name n_status n_host n_dns n_vti n_detail
+        for notice in "${dns_notices[@]}"; do
+            IFS='|' read -r n_name n_status n_host n_dns n_vti n_detail <<< "${notice}"
+            printf '%b\n' "${C_RED}${C_BOLD}[!] ${n_name}: Dynamic DNS endpoint requires attention${C_RESET}"
+            printf '    Hostname:       %s\n' "${n_host}"
+            case "${n_status}" in
+                OUTDATED)
+                    printf '    Current DNS IP: %s\n' "${n_dns}"
+                    printf '    VTI remote IP:  %s\n' "${n_vti}"
+                    printf '    Action:         Re-apply the tunnel to use the new DNS endpoint.\n'
+                    ;;
+                RESOLVE_FAILED|CHECK_UNAVAILABLE|MULTIPLE)
+                    printf '    DNS status:     %s\n' "${n_detail}"
+                    [[ -n "${n_vti}" ]] && printf '    VTI remote IP:  %s\n' "${n_vti}"
+                    ;;
+                VTI_MISSING)
+                    printf '    Current DNS IP: %s\n' "${n_dns:-unknown}"
+                    printf '    VTI status:     %s\n' "${n_detail}"
+                    ;;
+            esac
+        done
+    fi
 }
 
 select_tunnel() {
@@ -2726,6 +2831,24 @@ reapply_installed_tunnel() {
     echo "The existing PSK is kept unchanged."
     echo "No UniFi-side settings need to be changed."
     echo
+
+    if ! check_vti_install_topology "${name}"; then
+        return 1
+    fi
+
+    if [[ "${PEER_MODE}" == "dns" ]]; then
+        local old_remote
+        old_remote="$(vti_current_remote_endpoint "${VTI_INTERFACE}" 2>/dev/null || true)"
+        printf '%-28s %s\n' "DNS hostname:" "${PEER_ADDRESS}"
+        printf '%-28s %s\n' "Resolved peer IPv4:" "${INSTALL_PEER_RESOLVED_IP}"
+        [[ -n "${old_remote}" ]] && printf '%-28s %s\n' "Current VTI remote IPv4:" "${old_remote}"
+        if [[ -n "${old_remote}" && "${old_remote}" != "${INSTALL_PEER_RESOLVED_IP}" ]]; then
+            warn "DNS endpoint changed. Re-apply will replace the VTI remote endpoint."
+        else
+            ok "Dynamic DNS endpoint is current."
+        fi
+        echo
+    fi
 
     if [[ "${mode}" == "manual" ]]; then
         confirm_yes_no "Re-apply this tunnel now?" "Y" || return 0
