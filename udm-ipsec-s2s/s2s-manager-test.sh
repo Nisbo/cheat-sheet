@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.33-test"
+VERSION="0.34-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -4121,11 +4121,38 @@ add_tunnel_definition() {
     prompt_tunnel_name "${suggested_name}"
     local name="${PROMPT_RESULT}"
 
-    section "STEP 2/7  Debian Public IP"
+    section "STEP 2/7  UniFi Peer Endpoint"
+    prompt_peer_endpoint || return
+    local peer_mode="${PROMPT_PEER_MODE}"
+    local peer_address="${PROMPT_PEER_ADDRESS}"
+
+    section "STEP 3/7  Debian Public IP"
     prompt_public_ip "${detected_ip}"
     local public_ip="${PROMPT_RESULT}"
 
-    section "STEP 3/7  Site-to-Site Tunnel Network"
+    # Warn immediately if this definition uses a wildcard VTI that cannot later
+    # be installed alongside an existing wildcard VTI on the same local endpoint.
+    if [[ "${peer_mode}" == "dynamic" ]]; then
+        local wildcard_conflict=""
+        if find_wildcard_vti_conflict "${public_ip}" ""; then
+            wildcard_conflict="${VTI_TOPOLOGY_CONFLICT_INTERFACE}"
+        fi
+        if [[ -n "${wildcard_conflict}" ]]; then
+            echo
+            printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
+            printf '%b\n' "${C_BOLD}${C_RED}  ✗ DYNAMIC ENDPOINT CONFLICT${C_RESET}"
+            printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
+            printf '%b%s%b\n' "${C_RED}" "Another wildcard VTI already uses Debian public IP ${public_ip}." "${C_RESET}"
+            printf '%b%s%b\n' "${C_RED}" "Existing VTI: ${wildcard_conflict}" "${C_RESET}"
+            echo
+            printf '%b%s%b\n' "${C_BOLD}${C_RED}" "You CAN save this tunnel definition, but you CANNOT activate/install it" "${C_RESET}"
+            printf '%b%s%b\n' "${C_BOLD}${C_RED}" "while both tunnels use Dynamic / unknown on the same Debian public IP." "${C_RESET}"
+            printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
+            echo
+        fi
+    fi
+
+    section "STEP 4/7  Site-to-Site Tunnel Network"
     local suggested_network
     suggested_network="$(next_vti_network)"
     prompt_tunnel_network "${suggested_network}" || return
@@ -4133,11 +4160,6 @@ add_tunnel_definition() {
     local network="${PROMPT_NETWORK}"
     local debian_ip="${PROMPT_DEBIAN_IP}"
     local unifi_ip="${PROMPT_UNIFI_IP}"
-
-    section "STEP 4/7  UniFi Peer Endpoint"
-    prompt_peer_endpoint || return
-    local peer_mode="${PROMPT_PEER_MODE}"
-    local peer_address="${PROMPT_PEER_ADDRESS}"
 
     section "STEP 5/7  UniFi Authentication ID"
     prompt_auth_id "unifi-${name}"
