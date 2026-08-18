@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.41-test"
+VERSION="0.42-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -5866,12 +5866,55 @@ read_peer_bundle() {
 import_debian_peer_bundle() {
     banner
     section "IMPORT DEBIAN PEER BUNDLE"
-    local default_dir="/root/s2s-manager-import" file
-    echo "Enter the peer bundle path."
-    echo "SCP transfers default to: ${default_dir}"
-    echo
-    read -r -p "Bundle file: " file
-    [[ -n "${file}" ]] || return
+
+    local default_dir="/root/s2s-manager-import"
+    local -a bundles=()
+    local file="" f choice i
+
+    mkdir -p "${default_dir}" 2>/dev/null || true
+    while IFS= read -r f; do
+        [[ -n "${f}" ]] && bundles+=("${f}")
+    done < <(find "${default_dir}" -maxdepth 1 -type f -name '*.s2s-peer' -printf '%p\n' 2>/dev/null | sort)
+
+    if (( ${#bundles[@]} > 0 )); then
+        echo "Peer bundles found in ${default_dir}:"
+        echo
+        for i in "${!bundles[@]}"; do
+            printf '  [%d] %s\n' "$((i+1))" "$(basename "${bundles[$i]}")"
+        done
+        echo
+        echo "  [P] Enter another bundle path"
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+        while :; do
+            read -r -p "Selection: " choice
+            case "${choice}" in
+                [1-9]|[1-9][0-9]*)
+                    if (( choice >= 1 && choice <= ${#bundles[@]} )); then
+                        file="${bundles[$((choice-1))]}"
+                        break
+                    fi
+                    error "Invalid selection."
+                    ;;
+                p|P)
+                    read -r -p "Bundle file: " file
+                    [[ -n "${file}" ]] || return
+                    break
+                    ;;
+                b|B|0) return ;;
+                e|E) clear_screen; echo "Bye."; exit 0 ;;
+                *) error "Invalid selection." ;;
+            esac
+        done
+    else
+        echo "No peer bundles were found in ${default_dir}."
+        echo
+        echo "Enter another peer bundle path, or press ENTER to go back."
+        read -r -p "Bundle file: " file
+        [[ -n "${file}" ]] || return
+    fi
+
     if ! read_peer_bundle "${file}"; then
         error "Invalid or unsupported Debian peer bundle."
         pause
@@ -5886,20 +5929,63 @@ import_debian_peer_bundle() {
         pause
         return
     fi
+
+    section "LOCAL CONFLICT VALIDATION"
+    local validation_failed=0
+
     if check_network_conflict "${VTI_NETWORK}"; then
         show_network_conflict "${VTI_NETWORK}"
+        validation_failed=1
+    else
+        ok "Tunnel network is available on this Debian server: ${VTI_NETWORK}"
+    fi
+
+    if find_specific_vti_conflict "${PUBLIC_IP}" "${REMOTE_PUBLIC_IP}" ""; then
+        validation_error_block \
+            "VTI ENDPOINT CONFLICT" \
+            "Local public IP:   ${PUBLIC_IP}" \
+            "Remote public IP:  ${REMOTE_PUBLIC_IP}" \
+            "Existing VTI:      ${VTI_TOPOLOGY_CONFLICT_INTERFACE}" \
+            "" \
+            "This local/remote endpoint pair is already used by another VTI."
+        validation_failed=1
+    else
+        ok "VTI endpoint pair is available: ${PUBLIC_IP} <-> ${REMOTE_PUBLIC_IP}"
+    fi
+
+    if (( validation_failed != 0 )); then
+        echo
+        error "Peer bundle import stopped before any manager files or PSK were written."
         pause
         return
     fi
+
     if display_name_in_use "${peer_display}"; then
         warn "Display name '${peer_display}' already exists."
         prompt_display_name "${peer_display}"
         peer_display="${PROMPT_RESULT}"
     fi
+
     internal="$(next_internal_name_for_display "${peer_display}")"
     idx="$(next_interface_index)"
     interface="ipsec${idx}"
     key=$((DEFAULT_VTI_KEY + idx))
+
+    # next_interface_index() already checks both manager state and live Debian
+    # interfaces/VTI marks. Keep explicit checks here as a final import guard.
+    if interface_in_system_use "${interface}" || vti_key_in_system_use "${key}"; then
+        validation_error_block \
+            "VTI ALLOCATION CONFLICT" \
+            "Requested interface: ${interface}" \
+            "Requested key/mark:  ${key}" \
+            "" \
+            "The automatically selected VTI resources became unavailable."
+        pause
+        return
+    fi
+
+    ok "VTI interface allocation: ${interface} (free)"
+    ok "VTI key / mark allocation: ${key} (free)"
 
     echo
     section "PEER IMPORT PREVIEW"
