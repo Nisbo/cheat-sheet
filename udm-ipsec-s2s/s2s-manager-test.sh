@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.29-test"
+VERSION="0.30-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -739,6 +739,7 @@ load_tunnel() {
     unset VTI_NETWORK DEBIAN_VTI_IP UNIFI_VTI_IP CREATED_AT INSTALLED
     unset MANAGEMENT SOURCE_CONN_NAME SOURCE_SWAN_FILE SOURCE_VTI_SCRIPT
     unset SOURCE_SERVICE SOURCE_FORCED_NATT
+    unset PEER_MODE PEER_ADDRESS
 
     # shellcheck disable=SC1090
     source "${file}"
@@ -750,6 +751,11 @@ load_tunnel() {
     : "${SOURCE_VTI_SCRIPT:=}"
     : "${SOURCE_SERVICE:=}"
     : "${SOURCE_FORCED_NATT:=1}"
+
+    # Backward compatibility: all manager states created before v0.30 used
+    # a wildcard VTI endpoint and accepted an incoming peer from %any.
+    : "${PEER_MODE:=dynamic}"
+    : "${PEER_ADDRESS:=}"
 }
 
 save_tunnel() {
@@ -762,6 +768,8 @@ save_tunnel() {
     local debian_ip="$7"
     local unifi_ip="$8"
     local installed="${9:-0}"
+    local peer_mode="${10:-dynamic}"
+    local peer_address="${11:-}"
 
     local config
     config="$(tunnel_config_file "${name}")"
@@ -775,6 +783,8 @@ save_tunnel() {
         printf 'VTI_NETWORK=%q\n' "${network}"
         printf 'DEBIAN_VTI_IP=%q\n' "${debian_ip}"
         printf 'UNIFI_VTI_IP=%q\n' "${unifi_ip}"
+        printf 'PEER_MODE=%q\n' "${peer_mode}"
+        printf 'PEER_ADDRESS=%q\n' "${peer_address}"
         printf 'CREATED_AT=%q\n' "$(date -Is)"
         printf 'INSTALLED=%q\n' "${installed}"
     } > "${config}"
@@ -797,7 +807,7 @@ save_imported_tunnel() {
     local source_service="${12}"
     local forced_natt="${13:-0}"
 
-    save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}"         "${network}" "${debian_ip}" "${unifi_ip}" "1"
+    save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}"         "${network}" "${debian_ip}" "${unifi_ip}" "1" "dynamic" ""
 
     cat >> "$(tunnel_config_file "${name}")" <<EOF
 MANAGEMENT=IMPORTED
@@ -1436,6 +1446,162 @@ prompt_tunnel_network() {
     done
 }
 
+valid_hostname() {
+    local host="$1"
+
+    (( ${#host} >= 1 && ${#host} <= 253 )) || return 1
+    [[ "${host}" != *" "* ]] || return 1
+    [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    [[ "${host}" != *".."* ]] || return 1
+
+    local label
+    IFS='.' read -r -a _host_labels <<< "${host}"
+    for label in "${_host_labels[@]}"; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+resolve_peer_hostname() {
+    local host="$1"
+    local -a ips=()
+
+    command_available getent || return 2
+
+    while IFS= read -r ip; do
+        [[ -n "${ip}" ]] && ips+=("${ip}")
+    done < <(getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | sort -u)
+
+    if (( ${#ips[@]} == 0 )); then
+        return 1
+    fi
+
+    if (( ${#ips[@]} > 1 )); then
+        PEER_RESOLVE_MULTIPLE="${ips[*]}"
+        return 3
+    fi
+
+    PEER_RESOLVED_IP="${ips[0]}"
+    return 0
+}
+
+peer_mode_label() {
+    case "$1" in
+        dynamic) printf '%s' "Dynamic / unknown (wildcard VTI)" ;;
+        static)  printf '%s' "Static IPv4" ;;
+        dns)     printf '%s' "Hostname / Dynamic DNS" ;;
+        *)       printf '%s' "$1" ;;
+    esac
+}
+
+prompt_peer_endpoint() {
+    PROMPT_PEER_MODE=""
+    PROMPT_PEER_ADDRESS=""
+
+    echo "Choose how Debian identifies the public UniFi peer endpoint."
+    echo
+    echo "  [1] Dynamic / unknown"
+    echo "      UniFi initiates the connection."
+    echo "      Uses VTI remote 0.0.0.0."
+    echo "      Only one wildcard VTI is possible per Debian public IP."
+    echo
+    echo "  [2] Static IPv4 address"
+    echo "      Uses a peer-specific VTI."
+    echo "      Allows additional VTI tunnels when peer endpoint IPs differ."
+    echo
+    echo "  [3] Hostname / Dynamic DNS"
+    echo "      strongSwan uses the hostname directly."
+    echo "      The VTI resolves it to one IPv4 address when applied."
+    echo "      Multiple DNS A records are rejected because one VTI has one endpoint."
+    echo
+    echo "  [B] Back"
+    echo "  [E] Exit"
+    echo
+    echo "Press ENTER to use option 1."
+
+    local choice value rc
+    while :; do
+        read -r -p "Selection [1]: " choice
+        choice="${choice:-1}"
+
+        case "${choice}" in
+            1)
+                PROMPT_PEER_MODE="dynamic"
+                PROMPT_PEER_ADDRESS=""
+                return 0
+                ;;
+            2)
+                echo
+                while :; do
+                    read -r -p "UniFi public IPv4: " value
+                    [[ -z "${value}" ]] && { warn "IPv4 address is required."; continue; }
+
+                    if ! valid_ipv4 "${value}" || [[ "${value}" == "0.0.0.0" ]]; then
+                        validation_error_block \
+                            "INVALID PEER IPV4" \
+                            "Entered:  ${value}" \
+                            "Enter the public IPv4 address used by the UniFi peer."
+                        continue
+                    fi
+
+                    PROMPT_PEER_MODE="static"
+                    PROMPT_PEER_ADDRESS="${value}"
+                    return 0
+                done
+                ;;
+            3)
+                echo
+                while :; do
+                    read -r -p "UniFi hostname / Dynamic DNS name: " value
+                    [[ -z "${value}" ]] && { warn "Hostname is required."; continue; }
+
+                    if ! valid_hostname "${value}"; then
+                        validation_error_block \
+                            "INVALID PEER HOSTNAME" \
+                            "Entered:  ${value}" \
+                            "Use a valid DNS hostname without spaces."
+                        continue
+                    fi
+
+                    PEER_RESOLVED_IP=""
+                    PEER_RESOLVE_MULTIPLE=""
+                    resolve_peer_hostname "${value}"
+                    rc=$?
+
+                    case "${rc}" in
+                        0)
+                            validation_success "Hostname currently resolves to ${PEER_RESOLVED_IP}"
+                            ;;
+                        1)
+                            warn "Hostname is valid but currently does not resolve to IPv4."
+                            echo "The definition may still be saved, but installation will be blocked"
+                            echo "until the hostname resolves."
+                            ;;
+                        2)
+                            warn "getent is unavailable, so DNS cannot currently be checked."
+                            ;;
+                        3)
+                            validation_error_block \
+                                "MULTIPLE IPV4 ADDRESSES" \
+                                "Hostname:  ${value}" \
+                                "IPv4s:     ${PEER_RESOLVE_MULTIPLE}" \
+                                "A classic VTI requires one concrete remote endpoint."
+                            continue
+                            ;;
+                    esac
+
+                    PROMPT_PEER_MODE="dns"
+                    PROMPT_PEER_ADDRESS="${value}"
+                    return 0
+                done
+                ;;
+            b|B|0) return 1 ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) validation_error_block "INVALID SELECTION" "Choose 1, 2 or 3." ;;
+        esac
+    done
+}
+
 prompt_auth_id() {
     local suggested="$1" value
     while :; do
@@ -1827,9 +1993,15 @@ render_strongswan_config_to_file() {
     local target="$2"
     load_tunnel "${name}" || return 1
 
-    local psk escaped_psk
+    local psk escaped_psk remote_addrs
     psk="$(read_psk "${name}")" || return 1
     escaped_psk="$(strongswan_escape_string "${psk}")"
+
+    case "${PEER_MODE}" in
+        dynamic) remote_addrs="%any" ;;
+        static|dns) remote_addrs="${PEER_ADDRESS}" ;;
+        *) return 1 ;;
+    esac
 
     mkdir -p "$(dirname "${target}")"
 
@@ -1838,7 +2010,7 @@ connections {
     ${MANAGED_PREFIX}-${NAME} {
         version = 2
         local_addrs = ${PUBLIC_IP}
-        remote_addrs = %any
+        remote_addrs = ${remote_addrs}
         encap = yes
 
         proposals = aes256-sha256-modp2048
@@ -1913,10 +2085,62 @@ render_vti_script() {
 #!/usr/bin/env bash
 set -e
 
+PEER_MODE=$(printf '%q' "${PEER_MODE}")
+PEER_ADDRESS=$(printf '%q' "${PEER_ADDRESS}")
+REMOTE_ENDPOINT="0.0.0.0"
+
+if [[ "\${PEER_MODE}" == "static" ]]; then
+    REMOTE_ENDPOINT="\${PEER_ADDRESS}"
+elif [[ "\${PEER_MODE}" == "dns" ]]; then
+    command -v getent >/dev/null 2>&1 || {
+        echo "getent is required to resolve VTI peer hostname '\${PEER_ADDRESS}'" >&2
+        exit 1
+    }
+
+    mapfile -t REMOTE_IPS < <(
+        getent ahostsv4 "\${PEER_ADDRESS}" 2>/dev/null |
+        awk '{print \$1}' |
+        sort -u
+    )
+
+    if (( \${#REMOTE_IPS[@]} == 0 )); then
+        echo "Could not resolve VTI peer hostname '\${PEER_ADDRESS}' to IPv4" >&2
+        exit 1
+    fi
+
+    if (( \${#REMOTE_IPS[@]} > 1 )); then
+        echo "Peer hostname '\${PEER_ADDRESS}' resolves to multiple IPv4 addresses:" >&2
+        printf '  %s\\n' "\${REMOTE_IPS[@]}" >&2
+        echo "Classic VTI requires exactly one remote endpoint." >&2
+        exit 1
+    fi
+
+    REMOTE_ENDPOINT="\${REMOTE_IPS[0]}"
+fi
+
+if ip link show ${VTI_INTERFACE} >/dev/null 2>&1; then
+    if [[ "\${PEER_MODE}" != "dynamic" ]]; then
+        CURRENT_REMOTE="\$(
+            ip -d link show ${VTI_INTERFACE} 2>/dev/null |
+            awk '/vti / {
+                for (i=1; i<=NF; i++) {
+                    if (\$i=="remote" && (i+1)<=NF) { print \$(i+1); exit }
+                }
+            }'
+        )"
+
+        [[ "\${CURRENT_REMOTE}" == "any" ]] && CURRENT_REMOTE="0.0.0.0"
+
+        if [[ -n "\${CURRENT_REMOTE}" && "\${CURRENT_REMOTE}" != "\${REMOTE_ENDPOINT}" ]]; then
+            ip link del ${VTI_INTERFACE}
+        fi
+    fi
+fi
+
 ip link show ${VTI_INTERFACE} >/dev/null 2>&1 || \\
 ip tunnel add ${VTI_INTERFACE} \\
     local ${PUBLIC_IP} \\
-    remote 0.0.0.0 \\
+    remote "\${REMOTE_ENDPOINT}" \\
     mode vti \\
     key ${VTI_KEY}
 
@@ -1970,7 +2194,7 @@ mark_tunnel_installed() {
 
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
-        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"         "${PEER_MODE}" "${PEER_ADDRESS}"
 }
 
 mark_tunnel_defined() {
@@ -1979,7 +2203,7 @@ mark_tunnel_defined() {
 
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
-        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0"
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0"         "${PEER_MODE}" "${PEER_ADDRESS}"
 }
 
 
@@ -2117,25 +2341,114 @@ find_wildcard_vti_conflict() {
     return 1
 }
 
+find_specific_vti_conflict() {
+    local public_ip="$1"
+    local remote_ip="$2"
+    local ignore_interface="${3:-}"
+    local current_iface="" line
+
+    VTI_TOPOLOGY_CONFLICT_INTERFACE=""
+
+    command_available ip || return 1
+
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^[0-9]+:\ ([^:@]+) ]]; then
+            current_iface="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        [[ -z "${current_iface}" ]] && continue
+        [[ -n "${ignore_interface}" && "${current_iface}" == "${ignore_interface}" ]] && continue
+
+        if [[ "${line}" == *"vti remote ${remote_ip} local ${public_ip}"* ]]; then
+            VTI_TOPOLOGY_CONFLICT_INTERFACE="${current_iface}"
+            return 0
+        fi
+    done < <(ip -d link show type vti 2>/dev/null)
+
+    return 1
+}
+
 check_vti_install_topology() {
     local name="$1"
     load_tunnel "${name}" || return 1
 
-    if find_wildcard_vti_conflict "${PUBLIC_IP}" "${VTI_INTERFACE}"; then
+    local remote_ip=""
+
+    case "${PEER_MODE}" in
+        dynamic)
+            if find_wildcard_vti_conflict "${PUBLIC_IP}" "${VTI_INTERFACE}"; then
+                validation_error_block \
+                    "VTI TOPOLOGY CONFLICT" \
+                    "Peer mode:            Dynamic / unknown" \
+                    "Requested interface:  ${VTI_INTERFACE}" \
+                    "Local public IP:      ${PUBLIC_IP}" \
+                    "Existing VTI:         ${VTI_TOPOLOGY_CONFLICT_INTERFACE}" \
+                    "Reason:               another wildcard-remote VTI already uses this local endpoint" \
+                    "" \
+                    "Use a Static IPv4 or Dynamic DNS peer for an additional VTI tunnel," \
+                    "or keep this tunnel definition uninstalled."
+                return 1
+            fi
+            ;;
+        static)
+            remote_ip="${PEER_ADDRESS}"
+            ;;
+        dns)
+            PEER_RESOLVED_IP=""
+            PEER_RESOLVE_MULTIPLE=""
+            resolve_peer_hostname "${PEER_ADDRESS}"
+            case "$?" in
+                0)
+                    remote_ip="${PEER_RESOLVED_IP}"
+                    ;;
+                1)
+                    validation_error_block \
+                        "PEER DNS RESOLUTION FAILED" \
+                        "Hostname:  ${PEER_ADDRESS}" \
+                        "The hostname currently has no resolvable IPv4 address." \
+                        "No installation changes were applied."
+                    return 1
+                    ;;
+                2)
+                    validation_error_block \
+                        "DNS CHECK UNAVAILABLE" \
+                        "The 'getent' command is unavailable." \
+                        "It is required for Dynamic DNS VTI endpoints."
+                    return 1
+                    ;;
+                3)
+                    validation_error_block \
+                        "MULTIPLE PEER IPV4 ADDRESSES" \
+                        "Hostname:  ${PEER_ADDRESS}" \
+                        "IPv4s:     ${PEER_RESOLVE_MULTIPLE}" \
+                        "Classic VTI requires exactly one remote endpoint."
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            error "Unknown peer mode '${PEER_MODE}'."
+            return 1
+            ;;
+    esac
+
+    if [[ -n "${remote_ip}" ]] &&
+       find_specific_vti_conflict "${PUBLIC_IP}" "${remote_ip}" "${VTI_INTERFACE}"; then
         validation_error_block \
-            "VTI TOPOLOGY CONFLICT" \
+            "VTI ENDPOINT CONFLICT" \
             "Requested interface:  ${VTI_INTERFACE}" \
             "Local public IP:      ${PUBLIC_IP}" \
+            "Peer endpoint:        ${remote_ip}" \
             "Existing VTI:         ${VTI_TOPOLOGY_CONFLICT_INTERFACE}" \
-            "Reason:               another wildcard-remote VTI already uses this local endpoint" \
+            "Reason:               this local/remote endpoint pair is already used" \
             "" \
-            "The missing UniFi peer is NOT the cause." \
-            "With the current wildcard VTI design, a second VTI on the same public IP" \
-            "cannot be installed safely." \
-            "No new tunnel installation changes were applied."
+            "Different DNS names that resolve to the same IPv4 address do not create" \
+            "different VTI endpoints."
         return 1
     fi
 
+    INSTALL_PEER_RESOLVED_IP="${remote_ip}"
     return 0
 }
 
@@ -2179,6 +2492,10 @@ install_tunnel_system_config() {
     printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
     printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+    printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${PEER_MODE}")"
+    if [[ "${PEER_MODE}" != "dynamic" ]]; then
+        printf '%-28s %s\n' "Peer address:" "${PEER_ADDRESS}"
+    fi
 
     echo
     echo "Peer / connection behavior:"
@@ -2206,6 +2523,10 @@ install_tunnel_system_config() {
     fi
 
     validation_success "Local VTI topology check passed"
+    if [[ "${PEER_MODE}" == "dns" ]]; then
+        printf '%-28s %s\n' "Resolved peer IPv4:" "${INSTALL_PEER_RESOLVED_IP}"
+        info "If this DNS address changes later, Re-apply the tunnel to update the VTI endpoint."
+    fi
 
     confirm_yes_no "Install this tunnel on the Debian system?" "N" || return
 
@@ -3623,7 +3944,7 @@ takeover_imported_tunnel() {
 
     save_tunnel \
         "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
-        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "1"         "${PEER_MODE}" "${PEER_ADDRESS}"
 
     cat >> "$(tunnel_config_file "${name}")" <<EOF
 TAKEOVER_BACKUP_DIR=$(printf '%q' "${backup_root}")
@@ -3661,15 +3982,15 @@ add_tunnel_definition() {
     suggested_name="home"
     (( tunnel_number > 1 )) && suggested_name="s2s-${tunnel_number}"
 
-    section "STEP 1/6  Tunnel Name"
+    section "STEP 1/7  Tunnel Name"
     prompt_tunnel_name "${suggested_name}"
     local name="${PROMPT_RESULT}"
 
-    section "STEP 2/6  Debian Public IP"
+    section "STEP 2/7  Debian Public IP"
     prompt_public_ip "${detected_ip}"
     local public_ip="${PROMPT_RESULT}"
 
-    section "STEP 3/6  Site-to-Site Tunnel Network"
+    section "STEP 3/7  Site-to-Site Tunnel Network"
     local suggested_network
     suggested_network="$(next_vti_network)"
     prompt_tunnel_network "${suggested_network}" || return
@@ -3678,15 +3999,20 @@ add_tunnel_definition() {
     local debian_ip="${PROMPT_DEBIAN_IP}"
     local unifi_ip="${PROMPT_UNIFI_IP}"
 
-    section "STEP 4/6  UniFi Authentication ID"
+    section "STEP 4/7  UniFi Peer Endpoint"
+    prompt_peer_endpoint || return
+    local peer_mode="${PROMPT_PEER_MODE}"
+    local peer_address="${PROMPT_PEER_ADDRESS}"
+
+    section "STEP 5/7  UniFi Authentication ID"
     prompt_auth_id "unifi-${name}"
     local auth_id="${PROMPT_RESULT}"
 
-    section "STEP 5/6  Remote Networks"
+    section "STEP 6/7  Remote Networks"
     prompt_remote_networks "${network}" || return
     local -a routes=("${PROMPT_ROUTES[@]:-}")
 
-    section "STEP 6/6  Pre-Shared Key"
+    section "STEP 7/7  Pre-Shared Key"
     prompt_psk || return
     local psk="${PROMPT_PSK}"
 
@@ -3700,6 +4026,10 @@ add_tunnel_definition() {
     printf '%-28s %s\n' "Tunnel name:" "${name}"
     printf '%-28s %s\n' "Debian public IP:" "${public_ip}"
     printf '%-28s %s\n' "Authentication ID:" "${auth_id}"
+    printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${peer_mode}")"
+    if [[ "${peer_mode}" != "dynamic" ]]; then
+        printf '%-28s %s\n' "Peer address:" "${peer_address}"
+    fi
     printf '%-28s %s\n' "VTI interface:" "${interface}"
     printf '%-28s %s\n' "VTI key / mark:" "${key}"
     printf '%-28s %s\n' "Tunnel network:" "${network}"
@@ -3724,7 +4054,7 @@ add_tunnel_definition() {
     confirm_yes_no "Save tunnel definition?" "N" || return
 
     save_tunnel "${name}" "${public_ip}" "${auth_id}" "${interface}" "${key}" \
-        "${network}" "${debian_ip}" "${unifi_ip}" "0"
+        "${network}" "${debian_ip}" "${unifi_ip}" "0" "${peer_mode}" "${peer_address}"
     write_routes "${name}" "${routes[@]:-}"
     save_psk "${name}" "${psk}"
 
@@ -3972,6 +4302,10 @@ show_tunnel_details() {
     fi
     printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+    printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${PEER_MODE}")"
+    if [[ "${PEER_MODE}" != "dynamic" ]]; then
+        printf '%-28s %s\n' "Peer address:" "${PEER_ADDRESS}"
+    fi
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-28s %s\n' "VTI key / mark:" "${VTI_KEY}"
     printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
@@ -4023,6 +4357,10 @@ print_unifi_config() {
     section "CONNECTION"
     printf '%-32s %s\n' "Local IP:" "Select UniFi WAN interface"
     printf '%-32s %s\n' "Remote IP / Hostname:" "${PUBLIC_IP}"
+    printf '%-32s %s\n' "Debian peer mode:" "$(peer_mode_label "${PEER_MODE}")"
+    if [[ "${PEER_MODE}" != "dynamic" ]]; then
+        printf '%-32s %s\n' "Expected UniFi WAN endpoint:" "${PEER_ADDRESS}"
+    fi
 
     section "NETWORK CONFIGURATION"
     printf '%-32s %s\n' "VPN Method:" "Route Based"
