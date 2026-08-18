@@ -27,13 +27,14 @@
 set -u
 set -o pipefail
 
-VERSION="0.38-test"
+VERSION="0.39-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
 ROUTE_DIR="${STATE_DIR}/routes"
 SECRET_DIR="${STATE_DIR}/secrets"
 BACKUP_DIR="${STATE_DIR}/backups"
+EXPORT_DIR="${STATE_DIR}/exports"
 
 SWANCTL_DIR="/etc/swanctl/conf.d"
 MANAGED_PREFIX="s2s-manager"
@@ -217,8 +218,8 @@ ensure_root() {
 }
 
 init_state_dirs() {
-    mkdir -p "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}"
-    chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}"
+    mkdir -p "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}" "${EXPORT_DIR}"
+    chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}" "${EXPORT_DIR}"
 }
 
 debian_major_version() {
@@ -725,11 +726,19 @@ tunnel_exists() {
 }
 
 list_tunnel_names() {
-    local file
+    # Sort by the visible display name. Older definitions without DISPLAY_NAME
+    # automatically fall back to their internal NAME via load_tunnel().
+    local file name sort_name
     shopt -s nullglob
     for file in "${TUNNEL_DIR}"/*.conf; do
-        basename "${file}" .conf
-    done
+        name="$(basename "${file}" .conf)"
+        if load_tunnel "${name}" >/dev/null 2>&1; then
+            sort_name="${DISPLAY_NAME:-${NAME:-${name}}}"
+        else
+            sort_name="${name}"
+        fi
+        printf '%s\t%s\n' "${sort_name,,}" "${name}"
+    done | sort -f -t $'\t' -k1,1 -k2,2 | cut -f2-
     shopt -u nullglob
 }
 
@@ -5539,6 +5548,328 @@ show_tunnel_diagnostics() {
     done
 }
 
+# ============================================================================== 
+# Export / Debian peer bundles
+# ============================================================================== 
+
+safe_export_component() {
+    local value="$1"
+    value="${value// /-}"
+    value="$(printf '%s' "${value}" | tr -cd 'A-Za-z0-9._-')"
+    [[ -n "${value}" ]] || value="tunnel"
+    printf '%s' "${value}"
+}
+
+export_tunnel_backup() {
+    banner
+    section "EXPORT TUNNEL BACKUP"
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+    local stamp base archive tmpdir
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    base="$(safe_export_component "${DISPLAY_NAME}")-${stamp}"
+    archive="${EXPORT_DIR}/${base}.s2s-backup.tar.gz"
+    tmpdir="$(mktemp -d)"
+
+    mkdir -p "${tmpdir}/tunnel"
+    cp -a "$(tunnel_config_file "${name}")" "${tmpdir}/tunnel/"
+    [[ -f "$(tunnel_route_file "${name}")" ]] && cp -a "$(tunnel_route_file "${name}")" "${tmpdir}/tunnel/"
+    [[ -f "$(tunnel_secret_file "${name}")" ]] && cp -a "$(tunnel_secret_file "${name}")" "${tmpdir}/tunnel/"
+    cat > "${tmpdir}/BACKUP-INFO.txt" <<EOF
+S2S Manager tunnel backup
+Manager version: ${VERSION}
+Created: $(date -Is)
+Display name: ${DISPLAY_NAME}
+Internal name: ${NAME}
+Contains PSK: $([[ -f "$(tunnel_secret_file "${name}")" ]] && echo yes || echo no)
+EOF
+    tar -C "${tmpdir}" -czf "${archive}" .
+    chmod 600 "${archive}"
+    rm -rf "${tmpdir}"
+
+    ok "Tunnel backup created."
+    printf '%-28s %s\n' "File:" "${archive}"
+    warn "This backup contains sensitive tunnel data and may contain the PSK."
+    pause
+}
+
+resolve_tunnel_peer_ipv4() {
+    local mode="$1" address="$2"
+    case "${mode}" in
+        static)
+            valid_ipv4 "${address}" || return 1
+            printf '%s' "${address}"
+            ;;
+        dns)
+            PEER_RESOLVED_IP=""
+            PEER_RESOLVE_MULTIPLE=""
+            resolve_peer_hostname "${address}" >/dev/null 2>&1 || return 1
+            printf '%s' "${PEER_RESOLVED_IP}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+create_debian_peer_bundle() {
+    banner
+    section "CREATE DEBIAN PEER BUNDLE"
+    select_tunnel || return
+
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${name}"
+        pause
+        return
+    fi
+    if [[ "${PEER_MODE}" == "dynamic" ]]; then
+        error "A Debian peer bundle requires a fixed peer endpoint."
+        echo "Use Static IPv4 or Hostname / Dynamic DNS for Debian-to-Debian tunnels."
+        pause
+        return
+    fi
+
+    local peer_public_ip
+    peer_public_ip="$(resolve_tunnel_peer_ipv4 "${PEER_MODE}" "${PEER_ADDRESS}" 2>/dev/null || true)"
+    if [[ -z "${peer_public_ip}" ]]; then
+        error "The peer endpoint could not be resolved to exactly one IPv4 address."
+        pause
+        return
+    fi
+
+    local psk
+    psk="$(read_psk "${name}" 2>/dev/null || true)"
+    if [[ -z "${psk}" ]]; then
+        error "Stored PSK not found."
+        pause
+        return
+    fi
+
+    if [[ "${AUTH_ID}" != "${peer_public_ip}" ]]; then
+        validation_error_block \
+            "DEBIAN PEER AUTHENTICATION ID MISMATCH" \
+            "Current Authentication ID: ${AUTH_ID}" \
+            "Peer public IPv4:          ${peer_public_ip}" \
+            "" \
+            "For a mirrored Debian peer, the current tunnel must expect the" \
+            "peer Debian server's public IPv4 as its remote Authentication ID." \
+            "Create/correct the tunnel with Authentication ID ${peer_public_ip}."
+        pause
+        return
+    fi
+
+    local suggested_display peer_display bundle stamp
+    suggested_display="${DISPLAY_NAME} - Peer"
+    echo "The peer bundle creates the mirrored tunnel on the other Debian server."
+    echo "It contains the PSK and must be treated as sensitive."
+    echo
+    printf 'Peer display name [%s]: ' "${suggested_display}"
+    read -r peer_display
+    [[ -n "${peer_display}" ]] || peer_display="${suggested_display}"
+    if ! valid_display_name "${peer_display}"; then
+        error "Invalid display name."
+        pause
+        return
+    fi
+
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    bundle="${EXPORT_DIR}/$(safe_export_component "${DISPLAY_NAME}")-${stamp}.s2s-peer"
+
+    cat > "${bundle}" <<EOF
+S2S_PEER_BUNDLE_VERSION=1
+CREATED_BY_VERSION=$(printf '%q' "${VERSION}")
+CREATED_AT=$(printf '%q' "$(date -Is)")
+SOURCE_DISPLAY_NAME=$(printf '%q' "${DISPLAY_NAME}")
+PEER_DISPLAY_NAME=$(printf '%q' "${peer_display}")
+PUBLIC_IP=$(printf '%q' "${peer_public_ip}")
+REMOTE_PUBLIC_IP=$(printf '%q' "${PUBLIC_IP}")
+AUTH_ID=$(printf '%q' "${PUBLIC_IP}")
+VTI_NETWORK=$(printf '%q' "${VTI_NETWORK}")
+LOCAL_VTI_IP=$(printf '%q' "${UNIFI_VTI_IP}")
+REMOTE_VTI_IP=$(printf '%q' "${DEBIAN_VTI_IP}")
+PSK=$(printf '%q' "${psk}")
+EOF
+    chmod 600 "${bundle}"
+
+    echo
+    ok "Debian peer bundle created."
+    printf '%-28s %s\n' "File:" "${bundle}"
+    printf '%-28s %s\n' "Peer public IP:" "${peer_public_ip}"
+    printf '%-28s %s\n' "Peer VTI IP:" "${UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "Remote VTI IP:" "${DEBIAN_VTI_IP}"
+    echo
+    info "You can transfer this bundle later with 'Transfer Debian peer bundle'."
+    echo
+    if confirm_yes_no "Transfer it now via SCP?" "N"; then
+        transfer_debian_peer_bundle "${bundle}"
+        return
+    fi
+    pause
+}
+
+list_peer_bundles() {
+    find "${EXPORT_DIR}" -maxdepth 1 -type f -name '*.s2s-peer' -printf '%p\n' 2>/dev/null | sort
+}
+
+select_peer_bundle() {
+    local -a bundles=()
+    local f choice i
+    while read -r f; do [[ -n "${f}" ]] && bundles+=("${f}"); done < <(list_peer_bundles)
+    if (( ${#bundles[@]} == 0 )); then
+        warn "No Debian peer bundles found in ${EXPORT_DIR}."
+        return 1
+    fi
+    echo
+    for i in "${!bundles[@]}"; do printf '  [%d] %s\n' "$((i+1))" "$(basename "${bundles[$i]}")"; done
+    echo
+    echo "B = Back    E = Exit"
+    read -r -p "Selection: " choice
+    case "${choice}" in
+        b|B|0|"") return 1 ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
+    [[ "${choice}" =~ ^[0-9]+$ ]] || return 1
+    (( choice >= 1 && choice <= ${#bundles[@]} )) || return 1
+    SELECTED_BUNDLE="${bundles[$((choice-1))]}"
+}
+
+transfer_debian_peer_bundle() {
+    local bundle="${1:-}"
+    banner
+    section "TRANSFER DEBIAN PEER BUNDLE VIA SCP"
+    if [[ -z "${bundle}" ]]; then
+        select_peer_bundle || return
+        bundle="${SELECTED_BUNDLE}"
+    fi
+    command_available scp || { error "scp is not installed."; pause; return; }
+
+    local host user port remote_dir target
+    read -r -p "Peer SSH hostname / IPv4: " host
+    [[ -n "${host}" ]] || { error "Peer host is required."; pause; return; }
+    read -r -p "SSH user [root]: " user
+    [[ -n "${user}" ]] || user="root"
+    read -r -p "SSH port [22]: " port
+    [[ -n "${port}" ]] || port="22"
+    [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { error "Invalid SSH port."; pause; return; }
+    read -r -p "Remote directory [/root/s2s-manager-import]: " remote_dir
+    [[ -n "${remote_dir}" ]] || remote_dir="/root/s2s-manager-import"
+
+    echo
+    printf '%-28s %s\n' "Bundle:" "${bundle}"
+    printf '%-28s %s\n' "Destination:" "${user}@${host}:${remote_dir}/"
+    echo
+    warn "The bundle contains the tunnel PSK. SCP encrypts the transfer over SSH."
+    confirm_yes_no "Transfer this bundle now?" "N" || return
+
+    if ! ssh -p "${port}" "${user}@${host}" "mkdir -p -- $(printf '%q' "${remote_dir}") && chmod 700 -- $(printf '%q' "${remote_dir}")"; then
+        error "Could not prepare the remote import directory."
+        pause
+        return
+    fi
+    if scp -P "${port}" -- "${bundle}" "${user}@${host}:${remote_dir}/"; then
+        target="${remote_dir}/$(basename "${bundle}")"
+        echo
+        ok "Peer bundle transferred successfully."
+        printf '%-28s %s\n' "Remote file:" "${target}"
+        info "Run S2S Manager on the peer and choose 'Import Debian peer bundle'."
+    else
+        error "SCP transfer failed. The local bundle was kept unchanged."
+    fi
+    pause
+}
+
+read_peer_bundle() {
+    local file="$1"
+    [[ -f "${file}" ]] || return 1
+    unset S2S_PEER_BUNDLE_VERSION CREATED_BY_VERSION CREATED_AT SOURCE_DISPLAY_NAME PEER_DISPLAY_NAME
+    unset PUBLIC_IP REMOTE_PUBLIC_IP AUTH_ID VTI_NETWORK LOCAL_VTI_IP REMOTE_VTI_IP PSK
+    # shellcheck disable=SC1090
+    source "${file}" || return 1
+    [[ "${S2S_PEER_BUNDLE_VERSION:-}" == "1" ]] || return 1
+    valid_ipv4 "${PUBLIC_IP:-}" || return 1
+    valid_ipv4 "${REMOTE_PUBLIC_IP:-}" || return 1
+    valid_auth_id "${AUTH_ID:-}" || return 1
+    [[ "${VTI_NETWORK:-}" =~ /30$ ]] || return 1
+    valid_ipv4 "${LOCAL_VTI_IP:-}" || return 1
+    valid_ipv4 "${REMOTE_VTI_IP:-}" || return 1
+    [[ -n "${PSK:-}" ]] || return 1
+}
+
+import_debian_peer_bundle() {
+    banner
+    section "IMPORT DEBIAN PEER BUNDLE"
+    local default_dir="/root/s2s-manager-import" file
+    echo "Enter the peer bundle path."
+    echo "SCP transfers default to: ${default_dir}"
+    echo
+    read -r -p "Bundle file: " file
+    [[ -n "${file}" ]] || return
+    if ! read_peer_bundle "${file}"; then
+        error "Invalid or unsupported Debian peer bundle."
+        pause
+        return
+    fi
+
+    local peer_display="${PEER_DISPLAY_NAME:-${SOURCE_DISPLAY_NAME:-Debian-Peer}}"
+    local internal idx interface key normalized
+    normalized="$(normalize_30_network "${VTI_NETWORK}" 2>/dev/null || true)"
+    if [[ -z "${normalized}" || "${normalized}" != "${VTI_NETWORK}" ]]; then
+        error "Bundle contains an invalid /30 tunnel network."
+        pause
+        return
+    fi
+    if check_network_conflict "${VTI_NETWORK}"; then
+        show_network_conflict "${VTI_NETWORK}"
+        pause
+        return
+    fi
+    if display_name_in_use "${peer_display}"; then
+        warn "Display name '${peer_display}' already exists."
+        prompt_display_name "${peer_display}"
+        peer_display="${PROMPT_RESULT}"
+    fi
+    internal="$(next_internal_name_for_display "${peer_display}")"
+    idx="$(next_interface_index)"
+    interface="ipsec${idx}"
+    key=$((DEFAULT_VTI_KEY + idx))
+
+    echo
+    section "PEER IMPORT PREVIEW"
+    printf '%-28s %s\n' "Display name:" "${peer_display}"
+    printf '%-28s %s\n' "Internal name:" "${internal}"
+    printf '%-28s %s\n' "Local public IP:" "${PUBLIC_IP}"
+    printf '%-28s %s\n' "Remote public IP:" "${REMOTE_PUBLIC_IP}"
+    printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
+    printf '%-28s %s\n' "VTI interface:" "${interface}"
+    printf '%-28s %s\n' "VTI key / mark:" "${key}"
+    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+    printf '%-28s %s\n' "Local VTI IP:" "${LOCAL_VTI_IP}"
+    printf '%-28s %s\n' "Remote VTI IP:" "${REMOTE_VTI_IP}"
+    echo
+    warn "The bundle contains and will store the shared PSK."
+    confirm_yes_no "Import this Debian peer tunnel definition?" "N" || return
+
+    save_tunnel "${internal}" "${PUBLIC_IP}" "${AUTH_ID}" "${interface}" "${key}" \
+        "${VTI_NETWORK}" "${LOCAL_VTI_IP}" "${REMOTE_VTI_IP}" "0" "static" "${REMOTE_PUBLIC_IP}" "${peer_display}"
+    write_routes "${internal}"
+    save_psk "${internal}" "${PSK}"
+    ok "Debian peer tunnel definition imported."
+    info "The tunnel is defined but not installed yet."
+    echo
+    if confirm_yes_no "Install this tunnel on Debian now?" "N"; then
+        install_tunnel_system_config "${internal}"
+    else
+        info "You can install it later with 'Install tunnel on Debian'."
+        if confirm_yes_no "Delete the imported bundle file now?" "N"; then
+            rm -f -- "${file}"
+            ok "Imported bundle file deleted."
+        fi
+        pause
+    fi
+}
+
 # ==============================================================================
 # Menus
 # ==============================================================================
@@ -5604,8 +5935,14 @@ main_menu() {
         echo "  [14] Take over imported tunnel"
         echo "  [15] Show Take Over backups"
 
+        menu_group_header "EXPORT / TRANSFER" "${C_GREEN}"
+        echo "  [16] Export tunnel backup"
+        echo "  [17] Create Debian peer bundle"
+        echo "  [18] Transfer Debian peer bundle via SCP"
+        echo "  [19] Import Debian peer bundle"
+
         menu_group_header "SYSTEM" "${C_CYAN}"
-        echo "  [16] Show system status"
+        echo "  [20] Show system status"
 
         echo
         echo "  [E] Exit"
@@ -5630,7 +5967,11 @@ main_menu() {
             13) discover_existing_tunnels ;;
             14) takeover_imported_tunnel ;;
             15) show_takeover_backups ;;
-            16) show_system_status ;;
+            16) export_tunnel_backup ;;
+            17) create_debian_peer_bundle ;;
+            18) transfer_debian_peer_bundle ;;
+            19) import_debian_peer_bundle ;;
+            20) show_system_status ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
