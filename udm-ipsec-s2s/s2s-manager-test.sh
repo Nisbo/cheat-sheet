@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.34-test"
+VERSION="0.35-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1183,11 +1183,155 @@ dns_peer_endpoint_status() {
     fi
 }
 
+get_vti_remote_endpoint() {
+    local iface="$1"
+
+    command_available ip || return 1
+    ip link show "${iface}" >/dev/null 2>&1 || return 1
+
+    local remote
+    remote="$(
+        ip -d link show "${iface}" 2>/dev/null |
+        awk '/vti / {
+            for (i=1; i<=NF; i++) {
+                if ($i=="remote" && (i+1)<=NF) { print $(i+1); exit }
+            }
+        }'
+    )"
+
+    [[ "${remote}" == "any" ]] && remote="0.0.0.0"
+    [[ -n "${remote}" ]] || return 1
+
+    printf '%s' "${remote}"
+}
+
+dns_peer_status() {
+    local name="$1"
+    load_tunnel "${name}" || return 1
+
+    DNS_STATUS="NOT_DNS"
+    DNS_CURRENT_IP=""
+    DNS_VTI_IP=""
+    DNS_STATUS_DETAIL=""
+
+    [[ "${PEER_MODE}" == "dns" ]] || return 0
+
+    PEER_RESOLVED_IP=""
+    PEER_RESOLVE_MULTIPLE=""
+    resolve_peer_hostname "${PEER_ADDRESS}"
+    case "$?" in
+        0)
+            DNS_CURRENT_IP="${PEER_RESOLVED_IP}"
+            ;;
+        1)
+            DNS_STATUS="UNRESOLVED"
+            DNS_STATUS_DETAIL="hostname currently has no resolvable IPv4 address"
+            return 0
+            ;;
+        2)
+            DNS_STATUS="CHECK_UNAVAILABLE"
+            DNS_STATUS_DETAIL="getent is unavailable"
+            return 0
+            ;;
+        3)
+            DNS_STATUS="MULTIPLE"
+            DNS_STATUS_DETAIL="hostname resolves to multiple IPv4 addresses: ${PEER_RESOLVE_MULTIPLE}"
+            return 0
+            ;;
+    esac
+
+    if ! DNS_VTI_IP="$(get_vti_remote_endpoint "${VTI_INTERFACE}" 2>/dev/null)"; then
+        DNS_STATUS="NO_VTI"
+        DNS_STATUS_DETAIL="VTI interface is not currently present"
+        return 0
+    fi
+
+    if [[ "${DNS_CURRENT_IP}" == "${DNS_VTI_IP}" ]]; then
+        DNS_STATUS="CURRENT"
+        DNS_STATUS_DETAIL="DNS IPv4 matches the current VTI endpoint"
+    else
+        DNS_STATUS="OUTDATED"
+        DNS_STATUS_DETAIL="DNS IPv4 differs from the current VTI endpoint"
+    fi
+}
+
+show_dns_summary_warnings() {
+    local name found=0
+    while read -r name; do
+        [[ -z "${name}" ]] && continue
+        load_tunnel "${name}" || continue
+        [[ "${INSTALLED}" == "1" && "${PEER_MODE}" == "dns" ]] || continue
+
+        dns_peer_status "${name}" || continue
+        case "${DNS_STATUS}" in
+            OUTDATED)
+                (( found == 0 )) && echo
+                found=1
+                warn "Tunnel '${NAME}' has a changed Dynamic DNS endpoint."
+                printf '    Hostname:      %s\n' "${PEER_ADDRESS}"
+                printf '    Current DNS:   %s\n' "${DNS_CURRENT_IP}"
+                printf '    VTI endpoint:  %s\n' "${DNS_VTI_IP}"
+                echo "    Action: Run Re-apply tunnel configuration."
+                ;;
+            UNRESOLVED|MULTIPLE|CHECK_UNAVAILABLE)
+                (( found == 0 )) && echo
+                found=1
+                warn "Tunnel '${NAME}' has a Dynamic DNS problem."
+                printf '    Hostname:      %s\n' "${PEER_ADDRESS}"
+                printf '    Reason:        %s\n' "${DNS_STATUS_DETAIL}"
+                ;;
+        esac
+    done < <(list_tunnel_names)
+}
+
+peer_ip_used_by_other_tunnel() {
+    local candidate_ip="$1"
+    local ignore_name="${2:-}"
+    local name other_ip
+
+    while read -r name; do
+        [[ -z "${name}" || "${name}" == "${ignore_name}" ]] && continue
+        load_tunnel "${name}" || continue
+
+        case "${PEER_MODE}" in
+            static)
+                other_ip="${PEER_ADDRESS}"
+                ;;
+            dns)
+                PEER_RESOLVED_IP=""
+                PEER_RESOLVE_MULTIPLE=""
+                if resolve_peer_hostname "${PEER_ADDRESS}" >/dev/null 2>&1; then
+                    other_ip="${PEER_RESOLVED_IP}"
+                else
+                    other_ip=""
+                fi
+                ;;
+            dynamic)
+                # A wildcard VTI may currently be connected to this IP, but that is
+                # not represented as a fixed manager endpoint. Do not treat it as a
+                # configuration conflict.
+                other_ip=""
+                ;;
+            *)
+                other_ip=""
+                ;;
+        esac
+
+        if [[ -n "${other_ip}" && "${other_ip}" == "${candidate_ip}" ]]; then
+            PEER_IP_MATCH_TUNNEL="${NAME}"
+            PEER_IP_MATCH_MODE="${PEER_MODE}"
+            return 0
+        fi
+    done < <(list_tunnel_names)
+
+    return 1
+}
+
 tunnel_connection_state() {
     local name="$1"
     local conn
     conn="$(tunnel_connection_name "${name}")" || { printf 'UNKNOWN'; return; }
-    local sa
+    local sa base_state
 
     if ! command_available swanctl; then
         printf 'UNKNOWN'
@@ -1203,10 +1347,27 @@ tunnel_connection_state() {
            show && /INSTALLED/ {found=1; exit}
            END {exit found ? 0 : 1}
        ' <<< "${sa}"; then
-        printf 'CONNECTED'
+        base_state="CONNECTED"
     else
-        printf 'DISCONNECTED'
+        base_state="DISCONNECTED"
     fi
+
+    load_tunnel "${name}" >/dev/null 2>&1 || {
+        printf '%s' "${base_state}"
+        return
+    }
+
+    if [[ "${PEER_MODE}" == "dns" && "${INSTALLED}" == "1" ]]; then
+        dns_peer_status "${name}" || true
+        case "${DNS_STATUS}" in
+            OUTDATED|UNRESOLVED|MULTIPLE|CHECK_UNAVAILABLE)
+                printf 'DISCONNECTED (DNS)'
+                return
+                ;;
+        esac
+    fi
+
+    printf '%s' "${base_state}"
 }
 
 # ==============================================================================
@@ -1669,14 +1830,28 @@ prompt_peer_endpoint() {
             3)
                 echo
                 while :; do
+                    echo "Enter only the hostname / FQDN."
+                    echo "Do NOT include http://, https://, a port or a path."
+                    echo "Example: my-unifi.example.com"
+                    echo
                     read -r -p "UniFi hostname / Dynamic DNS name: " value
                     [[ -z "${value}" ]] && { warn "Hostname is required."; continue; }
+
+                    if [[ "${value}" == *"://"* || "${value}" == */* || "${value}" == *:* ]]; then
+                        validation_error_block \
+                            "HOSTNAME ONLY - NOT A URL" \
+                            "Entered:  ${value}" \
+                            "Use only the hostname / FQDN." \
+                            "Example:  my-unifi.example.com" \
+                            "Do not include http://, https://, ports or paths."
+                        continue
+                    fi
 
                     if ! valid_hostname "${value}"; then
                         validation_error_block \
                             "INVALID PEER HOSTNAME" \
                             "Entered:  ${value}" \
-                            "Use a valid DNS hostname without spaces."
+                            "Use a valid hostname such as my-unifi.example.com."
                         continue
                     fi
 
@@ -1688,6 +1863,12 @@ prompt_peer_endpoint() {
                     case "${rc}" in
                         0)
                             validation_success "Hostname currently resolves to ${PEER_RESOLVED_IP}"
+                            PEER_IP_MATCH_TUNNEL=""
+                            PEER_IP_MATCH_MODE=""
+                            if peer_ip_used_by_other_tunnel "${PEER_RESOLVED_IP}"; then
+                                info "This IPv4 is also used by tunnel '${PEER_IP_MATCH_TUNNEL}'."
+                                echo "    This is allowed for peer-specific VTI tunnels."
+                            fi
                             ;;
                         1)
                             warn "Hostname is valid but currently does not resolve to IPv4."
@@ -4129,6 +4310,8 @@ add_tunnel_definition() {
     section "STEP 3/7  Debian Public IP"
     prompt_public_ip "${detected_ip}"
     local public_ip="${PROMPT_RESULT}"
+    local install_topology_conflict=0
+    local install_topology_conflict_detail=""
 
     # Warn immediately if this definition uses a wildcard VTI that cannot later
     # be installed alongside an existing wildcard VTI on the same local endpoint.
@@ -4138,6 +4321,8 @@ add_tunnel_definition() {
             wildcard_conflict="${VTI_TOPOLOGY_CONFLICT_INTERFACE}"
         fi
         if [[ -n "${wildcard_conflict}" ]]; then
+            install_topology_conflict=1
+            install_topology_conflict_detail="wildcard VTI conflict with ${wildcard_conflict}"
             echo
             printf '%b\n' "${C_BOLD}${C_RED}──────────────────────────────────────────────────────────────${C_RESET}"
             printf '%b\n' "${C_BOLD}${C_RED}  ✗ DYNAMIC ENDPOINT CONFLICT${C_RESET}"
@@ -4194,17 +4379,28 @@ add_tunnel_definition() {
     printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_ip}"
 
     echo
-    ok "Conflict validation passed"
+    if (( install_topology_conflict == 1 )); then
+        warn "Definition validation passed, but installation topology has a conflict."
+        printf '%-28s %s\n' "Installation status:" "CANNOT ACTIVATE"
+        printf '%-28s %s\n' "Reason:" "${install_topology_conflict_detail}"
+    else
+        ok "Conflict validation passed"
+    fi
     printf '%-28s %s\n' "Interface allocation:" "${interface} (free)"
     printf '%-28s %s\n' "VTI key / mark allocation:" "${key} (free)"
 
     echo
     echo "Remote networks:"
-    if (( ${#routes[@]} == 0 )); then
+    local nonempty_routes=0 r
+    for r in "${routes[@]:-}"; do
+        [[ -n "${r}" ]] && ((nonempty_routes += 1))
+    done
+    if (( nonempty_routes == 0 )); then
         echo "  None"
     else
-        local r
-        for r in "${routes[@]}"; do printf '  • %s\n' "${r}"; done
+        for r in "${routes[@]:-}"; do
+            [[ -n "${r}" ]] && printf '  • %s\n' "${r}"
+        done
     fi
 
     echo
@@ -5006,7 +5202,33 @@ show_tunnel_diagnostics() {
 
     while :; do
         echo
-        section "OPTIONAL TESTS"
+        if [[ "${PEER_MODE}" == "dns" ]]; then
+        section "DYNAMIC DNS"
+        dns_peer_status "${name}" || true
+        printf '%-28s %s\n' "Hostname:" "${PEER_ADDRESS}"
+        case "${DNS_STATUS}" in
+            CURRENT)
+                ok "Dynamic DNS endpoint is current"
+                printf '%-28s %s\n' "Current DNS IPv4:" "${DNS_CURRENT_IP}"
+                printf '%-28s %s\n' "VTI remote IPv4:" "${DNS_VTI_IP}"
+                ;;
+            OUTDATED)
+                error "Dynamic DNS endpoint is outdated"
+                printf '%-28s %s\n' "Current DNS IPv4:" "${DNS_CURRENT_IP}"
+                printf '%-28s %s\n' "VTI remote IPv4:" "${DNS_VTI_IP}"
+                echo
+                warn "Run Re-apply tunnel configuration to update the VTI endpoint."
+                ;;
+            UNRESOLVED|MULTIPLE|CHECK_UNAVAILABLE|NO_VTI)
+                error "Dynamic DNS check failed"
+                printf '%-28s %s\n' "Reason:" "${DNS_STATUS_DETAIL}"
+                [[ -n "${DNS_CURRENT_IP}" ]] && printf '%-28s %s\n' "Current DNS IPv4:" "${DNS_CURRENT_IP}"
+                [[ -n "${DNS_VTI_IP}" ]] && printf '%-28s %s\n' "VTI remote IPv4:" "${DNS_VTI_IP}"
+                ;;
+        esac
+    fi
+
+    section "OPTIONAL TESTS"
 
         echo "  [1] Ping UniFi VTI address"
         echo "      Test connectivity to ${UNIFI_VTI_IP}"
@@ -5121,6 +5343,7 @@ main_menu() {
 
         section "CONFIGURED TUNNELS"
         show_existing_tunnels
+        show_dns_summary_warnings
 
         # General visual separator between the tunnel table and the menu groups.
         echo
