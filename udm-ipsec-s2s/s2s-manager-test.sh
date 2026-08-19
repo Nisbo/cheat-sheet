@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.2-test"
+VERSION="1.2.3-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -7266,57 +7266,58 @@ wireguard_clients_menu() {
 
     load_wireguard_server || return
 
-    if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
-        banner
-        section "WIREGUARD CLIENTS"
+    banner
+    section "WIREGUARD CLIENTS"
 
+    if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
         echo "The WireGuard server is imported READ-ONLY."
         echo "Existing peers are shown below, but client changes require migration."
-        echo
+    else
+        echo "Manage full-tunnel WireGuard clients."
+    fi
+    echo
 
-        local id count=0 dump peer handshake rx tx now age hs
-        dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
-        now="$(date +%s)"
+    local id count=0 dump peer handshake now age hs type
+    dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
+    now="$(date +%s)"
 
-        printf '%-4s %-24s %-15s %-18s %-12s %-12s\n' \
-            "#" "Name" "VPN IP" "Handshake" "RX" "TX"
-        printf '%-4s %-24s %-15s %-18s %-12s %-12s\n' \
-            "──" "──────────────────────" "──────────────" "────────────────" "──────────" "──────────"
+    printf '%-4s %-24s %-15s %-12s %-18s\n' \
+        "#" "Name" "VPN IP" "Type" "Handshake"
+    printf '%-4s %-24s %-15s %-12s %-18s\n' \
+        "──" "──────────────────────" "──────────────" "──────────" "────────────────"
 
-        while read -r id; do
-            [[ -n "${id}" ]] || continue
-            load_wireguard_client "${id}" || continue
+    while read -r id; do
+        [[ -n "${id}" ]] || continue
+        load_wireguard_client "${id}" || continue
+        ((count += 1))
 
-            ((count += 1))
-            peer="$(awk -F'\t' -v p="${WG_CLIENT_PUBLIC_KEY}" '$1==p {print; exit}' <<< "${dump}")"
-
-            handshake=0
-            rx=0
-            tx=0
-            if [[ -n "${peer}" ]]; then
-                handshake="$(cut -f5 <<< "${peer}")"
-                rx="$(cut -f6 <<< "${peer}")"
-                tx="$(cut -f7 <<< "${peer}")"
-            fi
-
-            if [[ "${handshake}" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
-                age=$((now - handshake))
-                hs="$(human_duration "${age}") ago"
-            else
-                hs="Never"
-            fi
-
-            printf '%-4s %-24s %-15s %-18s %-12s %-12s\n' \
-                "${count}" "${WG_CLIENT_NAME:0:24}" "${WG_CLIENT_IP}" "${hs}" \
-                "$(human_bytes "${rx}")" "$(human_bytes "${tx}")"
-        done < <(list_wireguard_client_ids)
-
-        if (( count == 0 )); then
-            echo
-            warn "No peers were imported from the existing WireGuard configuration."
+        if [[ -n "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
+            type="MANAGED"
+        else
+            type="IMPORTED"
         fi
 
-        echo
+        peer="$(awk -F'\t' -v p="${WG_CLIENT_PUBLIC_KEY}" '$1==p {print; exit}' <<< "${dump}")"
+        handshake=0
+        [[ -n "${peer}" ]] && handshake="$(cut -f5 <<< "${peer}")"
+
+        if [[ "${handshake}" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
+            age=$((now - handshake))
+            hs="$(human_duration "${age}") ago"
+        else
+            hs="Never"
+        fi
+
+        printf '%-4s %-24s %-15s %-12s %-18s\n' \
+            "${count}" "${WG_CLIENT_NAME:0:24}" "${WG_CLIENT_IP}" "${type}" "${hs}"
+    done < <(list_wireguard_client_ids)
+
+    if (( count == 0 )); then
+        printf '%s\n' "     No WireGuard clients configured."
+    fi
+
+    echo
+    if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
         info "Imported peers are read-only."
         info "Their client private keys are not stored on the server, so complete configs/QR codes cannot be recreated."
         info "Use 'WireGuard server setup' -> 'Migrate / take over imported WireGuard server' to manage the server."
@@ -7324,10 +7325,6 @@ wireguard_clients_menu() {
         return
     fi
 
-    banner
-    section "WIREGUARD CLIENTS"
-    echo "Manage full-tunnel WireGuard clients."
-    echo
     echo "  [1] Add client"
     echo "  [2] Show client configuration"
     echo "  [3] Show client QR code"
