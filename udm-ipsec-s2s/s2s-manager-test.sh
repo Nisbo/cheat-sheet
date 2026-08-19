@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.51-test"
+VERSION="0.52-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -235,37 +235,35 @@ render_menu_pair() {
     local -n left_items="${left_items_name}"
     local -n right_items="${right_items_name}"
 
-    local col_width=58
-    local gap="    "
+    # Fixed terminal columns. The right block always begins at column 65,
+    # so long left-hand labels can never shift [13], [14], etc.
+    local right_col=65
+    local rule_width=56
     local rows i left right
 
     (( ${#left_items[@]} > ${#right_items[@]} )) && rows=${#left_items[@]} || rows=${#right_items[@]}
 
     echo
 
-    local left_header right_header
-    left_header="${C_BOLD}${left_color}  ${left_title}${C_RESET}"
-    right_header="${C_BOLD}${right_color}  ${right_title}${C_RESET}"
-    pad_ansi_right "${left_header}" "${col_width}"
-    printf '%s' "${gap}"
-    pad_ansi_right "${right_header}" "${col_width}"
-    printf '\n'
+    printf '%b  %s%b' "${C_BOLD}${left_color}" "${left_title}" "${C_RESET}"
+    printf '\033[%dG' "${right_col}"
+    printf '%b  %s%b\n' "${C_BOLD}${right_color}" "${right_title}" "${C_RESET}"
 
-    local left_rule right_rule
-    left_rule="${left_color}  $(printf '─%.0s' $(seq 1 $((col_width - 2))))${C_RESET}"
-    right_rule="${right_color}  $(printf '─%.0s' $(seq 1 $((col_width - 2))))${C_RESET}"
-    pad_ansi_right "${left_rule}" "${col_width}"
-    printf '%s' "${gap}"
-    pad_ansi_right "${right_rule}" "${col_width}"
-    printf '\n'
+    printf '  %b' "${left_color}"
+    table_divider_segment "${rule_width}"
+    printf '%b' "${C_RESET}"
+    printf '\033[%dG' "${right_col}"
+    printf '  %b' "${right_color}"
+    table_divider_segment "${rule_width}"
+    printf '%b\n' "${C_RESET}"
 
     for ((i=0; i<rows; i++)); do
         left="${left_items[$i]:-}"
         right="${right_items[$i]:-}"
-        pad_ansi_right "${left}" "${col_width}"
-        printf '%s' "${gap}"
-        pad_ansi_right "${right}" "${col_width}"
-        printf '\n'
+
+        printf '%s' "${left}"
+        printf '\033[%dG' "${right_col}"
+        printf '%s\n' "${right}"
     done
 }
 
@@ -6206,6 +6204,11 @@ safe_export_component() {
 export_tunnel_backup() {
     banner
     section "EXPORT TUNNEL BACKUP"
+
+    echo "Creates a backup file of an existing tunnel definition."
+    echo "Use it to archive or manually move a tunnel configuration."
+    echo "The backup contains the tunnel settings and stored PSK, so keep it secure."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -6258,6 +6261,11 @@ resolve_tunnel_peer_ipv4() {
 create_debian_peer_bundle() {
     banner
     section "CREATE DEBIAN PEER BUNDLE"
+
+    echo "Creates the mirrored configuration for the other Debian / strongSwan server."
+    echo "The bundle contains the matching endpoint/VTI settings and the same PSK."
+    echo "Create it on one side, then transfer and import it on the peer server."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -6382,6 +6390,11 @@ transfer_debian_peer_bundle() {
     local bundle="${1:-}"
     banner
     section "TRANSFER DEBIAN PEER BUNDLE VIA SCP"
+
+    echo "Transfers an already created Debian peer bundle directly to the remote server via SCP."
+    echo "The transfer is encrypted over SSH; your local computer is not used as an intermediate hop."
+    echo "On the remote server, import the transferred file with 'Import Debian peer bundle'."
+    echo
     if [[ -z "${bundle}" ]]; then
         select_peer_bundle || return
         bundle="${SELECTED_BUNDLE}"
@@ -6482,6 +6495,11 @@ read_peer_bundle() {
 import_debian_peer_bundle() {
     banner
     section "IMPORT DEBIAN PEER BUNDLE"
+
+    echo "Imports a Debian peer bundle created on the other S2S Manager server."
+    echo "It creates the mirrored local tunnel definition and stores the included PSK."
+    echo "After the preview and conflict checks, the tunnel can be installed on this Debian server."
+    echo
 
     local default_dir="/root/s2s-manager-import"
     local -a bundles=()
