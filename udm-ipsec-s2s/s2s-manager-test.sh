@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.43-test"
+VERSION="0.44-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -137,7 +137,7 @@ banner() {
     clear_screen
 
     local width=62
-    local title="UniFi IPsec S2S Manager"
+    local title="IPsec S2S Manager"
     local version_text="Version ${VERSION}"
     local left right
 
@@ -760,7 +760,7 @@ load_tunnel() {
     unset VTI_NETWORK DEBIAN_VTI_IP UNIFI_VTI_IP CREATED_AT INSTALLED
     unset MANAGEMENT SOURCE_CONN_NAME SOURCE_SWAN_FILE SOURCE_VTI_SCRIPT
     unset SOURCE_SERVICE SOURCE_FORCED_NATT
-    unset PEER_MODE PEER_ADDRESS DISPLAY_NAME
+    unset PEER_MODE PEER_ADDRESS DISPLAY_NAME PEER_TYPE
 
     # shellcheck disable=SC1090
     source "${file}"
@@ -1570,7 +1570,11 @@ select_tunnel() {
 
     echo
     for i in "${!names[@]}"; do
-        printf '  [%d] %s\n' "$((i + 1))" "${names[$i]}"
+        if load_tunnel "${names[$i]}"; then
+            printf '  [%d] %s\n' "$((i + 1))" "${DISPLAY_NAME:-${NAME}}"
+        else
+            printf '  [%d] %s\n' "$((i + 1))" "${names[$i]}"
+        fi
     done
     echo
     echo "Enter tunnel number and press ENTER."
@@ -1718,6 +1722,28 @@ set_tunnel_display_name() {
     mv -f "${tmp}" "${file}"
 }
 
+peer_type_label() {
+    case "${1:-unifi}" in
+        debian) printf '%s' "Debian / strongSwan" ;;
+        unifi)  printf '%s' "UniFi Gateway" ;;
+        *)      printf '%s' "${1}" ;;
+    esac
+}
+
+peer_vti_label() {
+    case "${1:-unifi}" in
+        debian) printf '%s' "Remote Debian VTI IP:" ;;
+        *)      printf '%s' "UniFi VTI IP:" ;;
+    esac
+}
+
+peer_endpoint_label() {
+    case "${1:-unifi}" in
+        debian) printf '%s' "Remote Debian public IP:" ;;
+        *)      printf '%s' "Peer address:" ;;
+    esac
+}
+
 prompt_tunnel_name() {
     local suggested="$1" value
     while :; do
@@ -1761,14 +1787,22 @@ prompt_tunnel_name() {
 }
 
 prompt_public_ip() {
-    local suggested="$1" value
+    local suggested="$1"
+    local peer_type="${2:-unifi}"
+    local value
+
     while :; do
-        echo "This is the public IPv4 address of the Debian server."
-        echo "It will be used as the local IPsec endpoint and UniFi remote gateway."
+        echo "This is the public IPv4 address of THIS Debian server."
+        echo "It is the local IPsec endpoint used by this S2S Manager."
+        if [[ "${peer_type}" == "unifi" ]]; then
+            echo "UniFi uses this address as its remote VPN gateway."
+        else
+            echo "The remote Debian peer uses this address as its remote IPsec endpoint."
+        fi
         echo
         echo "Press ENTER to accept the suggested value or enter another value."
         echo
-        read -r -p "Debian public IP [${suggested}]: " value
+        read -r -p "Local Debian public IP [${suggested}]: " value
         value="${value:-${suggested}}"
         valid_ipv4 "${value}" || { error "Invalid IPv4 address."; echo; continue; }
         PROMPT_RESULT="${value}"
@@ -1778,6 +1812,7 @@ prompt_public_ip() {
 
 prompt_tunnel_network() {
     local suggested="$1"
+    local peer_type="${2:-unifi}"
     local value normalized rc choice
 
     while :; do
@@ -1834,7 +1869,7 @@ prompt_tunnel_network() {
 
         if ! network_is_exact_base "${value}"; then
             calculate_30_addresses "${normalized}"
-            validation_error_block                 "HOST ADDRESS ENTERED"                 "${value%%/*} is not the base address of a /30 network."                 "Calculated network:  ${CALC_NETWORK}"                 "Debian IP:           ${CALC_DEBIAN}"                 "UniFi IP:            ${CALC_UNIFI}"                 "Broadcast:           ${CALC_BROADCAST}"
+            validation_error_block                 "HOST ADDRESS ENTERED"                 "${value%%/*} is not the base address of a /30 network."                 "Calculated network:  ${CALC_NETWORK}"                 "Local Debian IP:     ${CALC_DEBIAN}"                 "$([[ "${peer_type}" == "debian" ]] && echo "Remote Debian IP:    ${CALC_UNIFI}" || echo "UniFi IP:            ${CALC_UNIFI}")"                 "Broadcast:           ${CALC_BROADCAST}"
             echo
             confirm_yes_no "Use this calculated /30 network?" "N" || continue
         fi
@@ -1849,8 +1884,12 @@ prompt_tunnel_network() {
 
         validation_success "Tunnel network available: ${CALC_NETWORK}"
         printf '%-14s %s\n' "Network:" "${CALC_NETWORK}"
-        printf '%-14s %s\n' "Debian IP:" "${CALC_DEBIAN}"
-        printf '%-14s %s\n' "UniFi IP:" "${CALC_UNIFI}"
+        printf '%-20s %s\n' "Local Debian IP:" "${CALC_DEBIAN}"
+        if [[ "${peer_type}" == "debian" ]]; then
+            printf '%-20s %s\n' "Remote Debian IP:" "${CALC_UNIFI}"
+        else
+            printf '%-20s %s\n' "UniFi IP:" "${CALC_UNIFI}"
+        fi
         printf '%-14s %s\n' "Broadcast:" "${CALC_BROADCAST}"
         echo
 
@@ -2080,13 +2119,22 @@ prompt_auth_id() {
 
 prompt_remote_networks() {
     local own_tunnel_network="${1:-}"
+    local peer_type="${2:-unifi}"
 
     PROMPT_ROUTES=()
-    echo "Enter UniFi-side networks that Debian must return through the S2S tunnel."
-    echo
-    echo "Examples:"
-    echo "  192.168.178.0/23   Main LAN"
-    echo "  192.168.4.0/24     UniFi Teleport"
+    if [[ "${peer_type}" == "debian" ]]; then
+        echo "Enter networks behind the remote Debian peer that this server must reach through the S2S tunnel."
+        echo
+        echo "Examples:"
+        echo "  10.50.0.0/24       Remote server-side network"
+        echo "  172.20.0.0/16      Remote routed network"
+    else
+        echo "Enter UniFi-side networks that Debian must return through the S2S tunnel."
+        echo
+        echo "Examples:"
+        echo "  192.168.178.0/23   Main LAN"
+        echo "  192.168.4.0/24     UniFi Teleport"
+    fi
     echo
     echo "Networks are checked for overlaps with tunnel networks,"
     echo "other remote networks and live Debian routes (LAN/VPN/WireGuard/etc.)."
@@ -2171,8 +2219,14 @@ prompt_remote_networks() {
 }
 
 prompt_psk() {
+    local peer_type="${1:-unifi}"
     local choice value
-    echo "The same Pre-Shared Key must later be entered in UniFi."
+    if [[ "${peer_type}" == "debian" ]]; then
+        echo "The same Pre-Shared Key will be included in the Debian peer bundle."
+        echo "The bundle is sensitive and should only be transferred securely."
+    else
+        echo "The same Pre-Shared Key must later be entered in UniFi."
+    fi
     echo
     echo "  [1] Generate a secure random PSK"
     echo "  [2] Enter my own PSK"
@@ -2421,7 +2475,7 @@ render_strongswan_config_to_file() {
     local target="$2"
     load_tunnel "${name}" || return 1
 
-    local psk escaped_psk remote_addrs
+    local psk escaped_psk remote_addrs start_action
     psk="$(read_psk "${name}")" || return 1
     escaped_psk="$(strongswan_escape_string "${psk}")"
 
@@ -2430,6 +2484,11 @@ render_strongswan_config_to_file() {
         static|dns) remote_addrs="${PEER_ADDRESS}" ;;
         *) return 1 ;;
     esac
+
+    # Debian <-> Debian peers should establish themselves after load/restart.
+    # UniFi tunnels keep the established behavior where UniFi may initiate.
+    start_action="none"
+    [[ "${PEER_TYPE}" == "debian" ]] && start_action="start"
 
     mkdir -p "$(dirname "${target}")"
 
@@ -2475,7 +2534,7 @@ connections {
                 mark_in = ${VTI_KEY}
                 mark_out = ${VTI_KEY}
 
-                start_action = none
+                start_action = ${start_action}
                 dpd_action = restart
             }
         }
@@ -2913,12 +2972,18 @@ install_tunnel_system_config() {
 
     section "INSTALLATION PLAN"
 
-    printf '%-28s %s\n' "Tunnel:" "${NAME}"
-    printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
+    printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
+    printf '%-28s %s\n' "Peer type:" "$(peer_type_label "${PEER_TYPE}")"
+    printf '%-28s %s\n' "Local Debian public IP:" "${PUBLIC_IP}"
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-28s %s\n' "VTI network:" "${VTI_NETWORK}"
-    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
-    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "Local Debian VTI IP:" "${DEBIAN_VTI_IP}"
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        printf '%-28s %s\n' "Remote Debian VTI IP:" "${UNIFI_VTI_IP}"
+    else
+        printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    fi
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
     printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${PEER_MODE}")"
     if [[ "${PEER_MODE}" != "dynamic" ]]; then
@@ -2927,10 +2992,17 @@ install_tunnel_system_config() {
 
     echo
     echo "Peer / connection behavior:"
-    echo "  • The UniFi side does NOT need to be configured yet."
-    echo "  • Local Debian installation should still complete successfully."
-    echo "  • Until UniFi is configured, DISCONNECTED is an expected state."
-    echo "  • A local VTI/systemd failure is NOT caused by a missing UniFi peer."
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        echo "  • This Debian server will automatically initiate the IPsec connection."
+        echo "  • The remote Debian peer must have the mirrored configuration installed."
+        echo "  • If the remote peer is not ready yet, DISCONNECTED is expected."
+        echo "  • A local VTI/systemd failure is not caused by a missing remote peer."
+    else
+        echo "  • The UniFi side does NOT need to be configured yet."
+        echo "  • Local Debian installation should still complete successfully."
+        echo "  • Until UniFi is configured, DISCONNECTED is an expected state."
+        echo "  • A local VTI/systemd failure is NOT caused by a missing UniFi peer."
+    fi
     echo
     echo "System changes:"
     echo "  + managed strongSwan connection"
@@ -3044,9 +3116,14 @@ install_tunnel_system_config() {
     mark_tunnel_installed "${name}"
 
     echo
-    ok "Tunnel '${name}' is installed on Debian."
-    info "The UniFi peer may be configured later."
-    info "Until then, DISCONNECTED is expected and does not mean installation failed."
+    ok "Tunnel '${DISPLAY_NAME}' is installed on Debian."
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        info "This Debian peer is configured to initiate the IPsec connection automatically."
+        info "If the remote Debian peer is not ready yet, DISCONNECTED is expected."
+    else
+        info "The UniFi peer may be configured later."
+        info "Until then, DISCONNECTED is expected and does not mean installation failed."
+    fi
     pause
 }
 
@@ -4473,7 +4550,7 @@ add_tunnel_definition() {
     local peer_address="${PROMPT_PEER_ADDRESS}"
 
     section "STEP 4/8  Debian Public IP"
-    prompt_public_ip "${detected_ip}"
+    prompt_public_ip "${detected_ip}" "${peer_type}"
     local public_ip="${PROMPT_RESULT}"
     local install_topology_conflict=0
     local install_topology_conflict_detail=""
@@ -4555,7 +4632,7 @@ add_tunnel_definition() {
     section "STEP 5/8  Site-to-Site Tunnel Network"
     local suggested_network
     suggested_network="$(next_vti_network)"
-    prompt_tunnel_network "${suggested_network}" || return
+    prompt_tunnel_network "${suggested_network}" "${peer_type}" || return
     local network="${PROMPT_NETWORK}"
     local debian_ip="${PROMPT_DEBIAN_IP}"
     local unifi_ip="${PROMPT_UNIFI_IP}"
@@ -4579,11 +4656,11 @@ add_tunnel_definition() {
     fi
 
     section "STEP 7/8  Remote Networks"
-    prompt_remote_networks "${network}" || return
+    prompt_remote_networks "${network}" "${peer_type}" || return
     local -a routes=("${PROMPT_ROUTES[@]:-}")
 
     section "STEP 8/8  Pre-Shared Key"
-    prompt_psk || return
+    prompt_psk "${peer_type}" || return
     local psk="${PROMPT_PSK}"
 
     local idx interface key
@@ -4595,16 +4672,16 @@ add_tunnel_definition() {
     printf '%-28s %s\n' "Display name:" "${display_name}"
     printf '%-28s %s\n' "Internal name:" "${name}"
     printf '%-28s %s\n' "Peer type:" "$([[ "${peer_type}" == "debian" ]] && echo 'Debian / strongSwan' || echo 'UniFi Gateway')"
-    printf '%-28s %s\n' "Debian public IP:" "${public_ip}"
+    printf '%-28s %s\n' "Local Debian public IP:" "${public_ip}"
     printf '%-28s %s\n' "Authentication ID:" "${auth_id}"
     printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${peer_mode}")"
     [[ "${peer_mode}" != "dynamic" ]] && printf '%-28s %s\n' "Peer address:" "${peer_address}"
     printf '%-28s %s\n' "VTI interface:" "${interface}"
     printf '%-28s %s\n' "VTI key / mark:" "${key}"
     printf '%-28s %s\n' "Tunnel network:" "${network}"
-    printf '%-28s %s\n' "Local VTI IP:" "${debian_ip}"
+    printf '%-28s %s\n' "Local Debian VTI IP:" "${debian_ip}"
     if [[ "${peer_type}" == "debian" ]]; then
-        printf '%-28s %s\n' "Peer VTI IP:" "${unifi_ip}"
+        printf '%-28s %s\n' "Remote Debian VTI IP:" "${unifi_ip}"
     else
         printf '%-28s %s\n' "UniFi VTI IP:" "${unifi_ip}"
     fi
@@ -4944,6 +5021,7 @@ show_tunnel_details() {
 
     printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
     printf '%-28s %s\n' "Internal name:" "${NAME}"
+    printf '%-28s %s\n' "Peer type:" "$(peer_type_label "${PEER_TYPE}")"
     if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
         printf '%-28s %s\n' "Management:" "IMPORTED / READ-ONLY"
         printf '%-28s %s\n' "Connection:" "$(tunnel_connection_state "${NAME}")"
@@ -4952,17 +5030,25 @@ show_tunnel_details() {
         printf '%-28s %s\n' "Management:" "$([[ "${INSTALLED}" == "1" ]] && echo MANAGED || echo 'DEFINED / MANAGED')"
         printf '%-28s %s\n' "Connection:" "$([[ "${INSTALLED}" == "1" ]] && tunnel_connection_state "${NAME}" || echo '-')"
     fi
-    printf '%-28s %s\n' "Debian public IP:" "${PUBLIC_IP}"
+    printf '%-28s %s\n' "Local Debian public IP:" "${PUBLIC_IP}"
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
     printf '%-28s %s\n' "Peer mode:" "$(peer_mode_label "${PEER_MODE}")"
     if [[ "${PEER_MODE}" != "dynamic" ]]; then
-        printf '%-28s %s\n' "Peer address:" "${PEER_ADDRESS}"
+        if [[ "${PEER_TYPE}" == "debian" ]]; then
+            printf '%-28s %s\n' "Remote Debian public IP:" "${PEER_ADDRESS}"
+        else
+            printf '%-28s %s\n' "Peer address:" "${PEER_ADDRESS}"
+        fi
     fi
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-28s %s\n' "VTI key / mark:" "${VTI_KEY}"
     printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
-    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
-    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "Local Debian VTI IP:" "${DEBIAN_VTI_IP}"
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        printf '%-28s %s\n' "Remote Debian VTI IP:" "${UNIFI_VTI_IP}"
+    else
+        printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    fi
 
     echo
     echo "Remote networks:"
@@ -5093,6 +5179,13 @@ show_unifi_configuration() {
 
     local tunnel="${SELECTED_TUNNEL}"
     load_tunnel "${tunnel}" || return
+
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        warn "This tunnel uses a Debian / strongSwan peer."
+        echo "UniFi configuration is not applicable to this tunnel."
+        pause
+        return
+    fi
     if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
         warn "UniFi configuration display is not generated for imported tunnels."
         echo "The existing external tunnel keeps its original UniFi/IPsec settings."
@@ -5358,11 +5451,17 @@ show_tunnel_diagnostics() {
         service="$(managed_service_name "${name}")"
     fi
 
-    printf '%-28s %s\n' "Tunnel:" "${NAME}"
+    printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
+    printf '%-28s %s\n' "Peer type:" "$(peer_type_label "${PEER_TYPE}")"
     printf '%-28s %s\n' "Management:" "$([[ "${MANAGEMENT}" == "IMPORTED" ]] && echo 'IMPORTED / READ-ONLY' || { [[ "${INSTALLED}" == "1" ]] && echo MANAGED || echo 'DEFINED / MANAGED'; })"
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
-    printf '%-28s %s\n' "Debian VTI IP:" "${DEBIAN_VTI_IP}"
-    printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    printf '%-28s %s\n' "Local Debian VTI IP:" "${DEBIAN_VTI_IP}"
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        printf '%-28s %s\n' "Remote Debian VTI IP:" "${UNIFI_VTI_IP}"
+    else
+        printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+    fi
     printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
     printf '%-28s %s\n' "Authentication ID:" "${AUTH_ID}"
 
@@ -5497,7 +5596,11 @@ show_tunnel_diagnostics() {
 
     section "OPTIONAL TESTS"
 
-        echo "  [1] Ping UniFi VTI address"
+        if [[ "${PEER_TYPE}" == "debian" ]]; then
+            echo "  [1] Ping remote Debian VTI address"
+        else
+            echo "  [1] Ping UniFi VTI address"
+        fi
         echo "      Test connectivity to ${UNIFI_VTI_IP}"
         echo
         echo "  [2] Analyze connection uptime"
@@ -5517,7 +5620,11 @@ show_tunnel_diagnostics() {
             1)
                 echo
                 section "CONNECTIVITY TEST"
-                echo "Pinging UniFi VTI address ${UNIFI_VTI_IP}..."
+                if [[ "${PEER_TYPE}" == "debian" ]]; then
+                    echo "Pinging remote Debian VTI address ${UNIFI_VTI_IP}..."
+                else
+                    echo "Pinging UniFi VTI address ${UNIFI_VTI_IP}..."
+                fi
                 echo
 
                 if ping -c 3 -W 2 "${UNIFI_VTI_IP}" >/tmp/s2s-manager-diag-ping.log 2>&1; then
