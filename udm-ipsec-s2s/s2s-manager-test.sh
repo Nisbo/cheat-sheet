@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.5-test"
+VERSION="1.2.6-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -6498,7 +6498,7 @@ render_wireguard_server_config() {
         printf 'ListenPort = %s\n' "${WG_PORT}"
         printf 'PrivateKey = %s\n' "${private}"
         printf 'PostUp = iptables -A FORWARD -i %%i -j ACCEPT; iptables -A FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route replace %s dev %%i table 220; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
-        printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT; iptables -D FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route del %s dev %%i table 220 2>/dev/null || true; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
+        printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE 2>/dev/null || true; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route del %s dev %%i table 220 2>/dev/null || true; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
         while read -r id; do
             [[ -n "${id}" ]] || continue
             load_wireguard_client "${id}" || continue
@@ -6506,7 +6506,9 @@ render_wireguard_server_config() {
             printf '# Client: %s\n' "${WG_CLIENT_NAME}"
             echo "[Peer]"
             printf 'PublicKey = %s\n' "${WG_CLIENT_PUBLIC_KEY}"
-            printf 'PresharedKey = %s\n' "${WG_CLIENT_PRESHARED_KEY}"
+            if [[ -n "${WG_CLIENT_PRESHARED_KEY}" ]]; then
+                printf 'PresharedKey = %s\n' "${WG_CLIENT_PRESHARED_KEY}"
+            fi
             printf 'AllowedIPs = %s/32\n' "${WG_CLIENT_IP}"
         done < <(list_wireguard_client_ids)
     } > "${tmp}"
@@ -6573,7 +6575,9 @@ wireguard_render_client_export() {
         echo
         echo "[Peer]"
         printf 'PublicKey = %s\n' "${server_public}"
-        printf 'PresharedKey = %s\n' "${WG_CLIENT_PRESHARED_KEY}"
+        if [[ -n "${WG_CLIENT_PRESHARED_KEY}" ]]; then
+            printf 'PresharedKey = %s\n' "${WG_CLIENT_PRESHARED_KEY}"
+        fi
         printf 'Endpoint = %s:%s\n' "${WG_ENDPOINT}" "${WG_PORT}"
         echo 'AllowedIPs = 0.0.0.0/0'
         echo 'PersistentKeepalive = 25'
@@ -6942,6 +6946,9 @@ wireguard_migrate_existing_config() {
     echo
     warn "Any custom PostUp/PostDown commands in the old config are NOT copied into the managed config."
     echo
+    info "If the managed configuration fails to start, the manager automatically restores"
+    info "the configuration backed up immediately before migration and restarts the old setup."
+    echo
     confirm_yes_no "Migrate this WireGuard server to manager ownership?" "N" || return
 
     wireguard_backup_existing_config "${file}" "${DISC_WG_INTERFACE}" || {
@@ -6983,10 +6990,36 @@ wireguard_migrate_existing_config() {
     else
         error "Managed WireGuard configuration did not start."
         echo
-        info "The original configuration backup is available at:"
-        echo "  ${WG_LAST_MIGRATION_BACKUP}"
-        echo
-        echo "The manager did not automatically overwrite the backup."
+        warn "Migration failed. Restoring the WireGuard configuration saved immediately before migration..."
+
+        local backup_config="${WG_LAST_MIGRATION_BACKUP}/$(basename "${file}")"
+        local rollback_ok=1
+
+        if [[ -f "${backup_config}" ]]; then
+            cp -a -- "${backup_config}" "${file}" || rollback_ok=0
+            chmod 600 "${file}" 2>/dev/null || true
+        else
+            rollback_ok=0
+        fi
+
+        # Return manager metadata to the read-only state that existed before migration.
+        save_wireguard_server_state \
+            "IMPORTED" "${DISC_WG_INTERFACE}" "${DISC_WG_NETWORK}" "${DISC_WG_SERVER_IP}" \
+            "${DISC_WG_PREFIX}" "${DISC_WG_PORT}" "${endpoint}" "${dns}" "${egress}" "${file}"
+        wireguard_import_existing_peers_readonly
+        rm -f "${WG_SERVER_KEY}" 2>/dev/null || true
+
+        systemctl reset-failed "wg-quick@${DISC_WG_INTERFACE}" >/dev/null 2>&1 || true
+        if (( rollback_ok == 1 )) && systemctl restart "wg-quick@${DISC_WG_INTERFACE}" >/tmp/s2s-manager-wireguard-rollback.log 2>&1; then
+            ok "Rollback successful. The previous WireGuard configuration is active again."
+            info "Manager state returned to IMPORTED / READ-ONLY."
+            info "Backup kept at: ${WG_LAST_MIGRATION_BACKUP}"
+        else
+            error "Automatic rollback FAILED."
+            info "Backup kept at: ${WG_LAST_MIGRATION_BACKUP}"
+            info "Rollback log: /tmp/s2s-manager-wireguard-rollback.log"
+            warn "WireGuard may currently be offline. Restore the backup manually before retrying."
+        fi
     fi
     pause
 }
@@ -7221,6 +7254,33 @@ wireguard_server_menu() {
         1) wireguard_change_server_settings ;;
         2) wireguard_apply && ok "WireGuard restarted." || error "Restart failed."; pause ;;
     esac
+}
+
+wireguard_menu() {
+    while :; do
+        banner
+        section "WIREGUARD"
+
+        echo "Set up and manage the local full-tunnel WireGuard VPN server."
+        echo
+        echo "  [1] WireGuard server setup"
+        echo "  [2] Manage WireGuard clients"
+        echo "  [3] WireGuard status / diagnostics"
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+
+        local c
+        read -r -p "Selection: " c
+        case "${c}" in
+            1) wireguard_server_menu ;;
+            2) wireguard_clients_menu ;;
+            3) wireguard_status ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
+        esac
+    done
 }
 
 wireguard_add_client() {
@@ -8901,9 +8961,7 @@ main_menu() {
 
         local -a menu_system=(
             "  [20] Show system status"
-            "  [21] WireGuard server setup"
-            "  [22] Manage WireGuard clients"
-            "  [23] WireGuard status / diagnostics"
+            "  [21] WireGuard"
         )
 
         render_menu_pair \
@@ -8946,9 +9004,7 @@ main_menu() {
             18) transfer_debian_peer_bundle ;;
             19) import_debian_peer_bundle ;;
             20) show_system_status ;;
-            21) wireguard_server_menu ;;
-            22) wireguard_clients_menu ;;
-            23) wireguard_status ;;
+            21) wireguard_menu ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
