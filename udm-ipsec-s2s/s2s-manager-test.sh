@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.45-test"
+VERSION="0.46-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -3337,7 +3337,11 @@ reapply_installed_tunnel() {
 
     echo
     echo "The existing PSK is kept unchanged."
-    echo "No UniFi-side settings need to be changed."
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        echo "No remote Debian peer settings need to be changed."
+    else
+        echo "No UniFi-side settings need to be changed."
+    fi
     echo
 
     if ! check_vti_install_topology "${name}"; then
@@ -3627,19 +3631,120 @@ reconnect_tunnel_by_name() {
 manual_reconnect_tunnel() {
     banner
     section "RECONNECT TUNNEL"
-
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
 
     if [[ "${INSTALLED}" != "1" ]]; then
-        warn "Tunnel '${name}' is not installed on Debian."
+        warn "Tunnel '${DISPLAY_NAME}' is not installed on Debian."
         pause
         return
     fi
 
-    reconnect_tunnel_by_name "${name}"
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        imported_readonly_notice "${name}"
+        echo
+    fi
+
+    local conn
+    conn="$(tunnel_connection_name "${name}")" || return
+
+    printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
+    printf '%-28s %s\n' "Peer type:" "$(peer_type_label "${PEER_TYPE}")"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        printf '%-28s %s\n' "Remote Debian VTI IP:" "${UNIFI_VTI_IP}"
+        echo
+        echo "Reconnect terminates the current IKE/CHILD SAs and then"
+        echo "actively initiates a new connection to the remote Debian peer."
+        echo
+        echo "Traffic through the tunnel will be interrupted briefly."
+        echo "The PSK and tunnel configuration are NOT changed."
+    else
+        printf '%-28s %s\n' "UniFi VTI IP:" "${UNIFI_VTI_IP}"
+        echo
+        echo "Reconnect terminates the current IKE/CHILD SAs."
+        echo "The UniFi side will then establish a new IPsec connection."
+        echo
+        echo "Traffic through the tunnel will be interrupted briefly."
+        echo "The PSK and tunnel configuration are NOT changed."
+        echo
+        echo "In testing, UniFi usually reconnects after about 10 seconds."
+        echo "The manager will wait up to 60 seconds."
+    fi
+
+    echo
+    confirm_yes_no "Reconnect tunnel now?" "N" || return
+
+    section "RECONNECTING"
+
+    printf '[1/3] Terminating current IPsec connection... '
+    # Terminating an already-down tunnel is not considered fatal.
+    swanctl_clean swanctl --terminate --ike "${conn}" >/tmp/s2s-manager-reconnect-terminate.log 2>&1 || true
+    printf '%b\n' "${C_GREEN}OK${C_RESET}"
+
+    if [[ "${PEER_TYPE}" == "debian" ]]; then
+        printf '[2/3] Initiating Debian peer connection... '
+        if swanctl_clean swanctl --initiate --child "${conn}" \
+            >/tmp/s2s-manager-reconnect-initiate.log 2>&1; then
+            printf '%b\n' "${C_GREEN}OK${C_RESET}"
+        else
+            printf '%b\n' "${C_RED}FAILED${C_RESET}"
+            error "Could not initiate the Debian peer connection."
+            echo
+            cat /tmp/s2s-manager-reconnect-initiate.log 2>/dev/null || true
+            echo
+            info "The tunnel configuration was NOT changed."
+            pause
+            return 1
+        fi
+
+        printf '[3/3] Verifying new IKE/CHILD SA... '
+        local waited=0 state=""
+        while (( waited < 15 )); do
+            state="$(tunnel_connection_state "${name}")"
+            if [[ "${state}" == "CONNECTED" ]]; then
+                printf '%b\n' "${C_GREEN}CONNECTED${C_RESET}"
+                ok "Tunnel '${DISPLAY_NAME}' reconnected successfully."
+                pause
+                return 0
+            fi
+            sleep 1
+            ((waited += 1))
+        done
+
+        printf '%b\n' "${C_RED}FAILED${C_RESET}"
+        error "The Debian peer connection was initiated, but no active IKE/CHILD SA was detected."
+        info "Use Tunnel diagnostics and recent strongSwan logs for troubleshooting."
+        pause
+        return 1
+    fi
+
+    printf '[2/3] Waiting for UniFi to reconnect... '
+    local waited=0 state=""
+    while (( waited < 60 )); do
+        state="$(tunnel_connection_state "${name}")"
+        if [[ "${state}" == "CONNECTED" ]]; then
+            printf '%b\n' "${C_GREEN}CONNECTED${C_RESET}"
+            printf '[3/3] Verifying tunnel state... %b\n' "${C_GREEN}OK${C_RESET}"
+            ok "Tunnel '${DISPLAY_NAME}' reconnected successfully."
+            pause
+            return 0
+        fi
+        sleep 2
+        ((waited += 2))
+    done
+
+    printf '\n'
+    error "UniFi did not reconnect within 60 seconds."
+    echo
+    echo "The tunnel configuration was NOT changed."
+    echo "Use Tunnel diagnostics and recent strongSwan logs for troubleshooting."
+    pause
+    return 1
 }
 
 # ==============================================================================
