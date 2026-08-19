@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# UniFi <-> Debian IPsec S2S Manager
-# Development / Test Build
+# IPsec S2S Manager
+# Version 1.0.0
 #
 # Purpose:
-#   Interactive setup and management of route-based IKEv2/IPsec S2S tunnels
-#   between Debian 13 (strongSwan/swanctl) and UniFi UDM gateways or Debian peers.
+#   Interactive setup and management of route-based IKEv2/IPsec Site-to-Site
+#   tunnels on Debian 13 using strongSwan/swanctl and Linux VTI interfaces.
 #
-# State:
-#   /root/s2s-manager-test/
+# Supported peers:
+#   - UniFi gateways
+#   - Debian / strongSwan peers
 #
-# System changes:
-#   - can install required strongSwan packages
-#   - can disable the unused TPM plugin
-#   - can create/remove managed strongSwan tunnel configs
-#   - can create/remove managed VTI scripts and systemd services
-#   - can add/remove managed UFW rules
+# Main features:
+#   - create, install, re-apply, reconnect and diagnose managed S2S tunnels
+#   - static IPv4, Dynamic DNS and UniFi wildcard peer endpoints
+#   - per-tunnel /30 VTI transfer networks and table 220 return routes
+#   - remote-network management with overlap/conflict validation
+#   - Debian peer bundles with direct SCP transfer and secure import
+#   - tunnel backup / restore
+#   - discovery and controlled take-over of existing strongSwan/VTI tunnels
+#   - optional UFW integration for IPsec UDP 500 / 4500
+#
+# Manager state:
+#   /root/s2s-manager/
+#
+# Managed system files:
+#   /etc/swanctl/conf.d/s2s-manager-*.conf
+#   /usr/local/sbin/s2s-manager-vti-*.sh
+#   /etc/systemd/system/s2s-manager-vti-*.service
 #
 # Safety:
-#   - does NOT enable UFW automatically
-#   - shows an installation/change summary before applying
-#   - uses uniquely named managed files
+#   - does not enable UFW automatically
+#   - validates network, VTI, endpoint and allocation conflicts before changes
+#   - previews relevant changes before applying them
 #   - keeps per-tunnel PSKs in mode 600 files
+#   - external backups and peer bundles are parsed as data, not executed as shell code
 # ==============================================================================
 
 set -u
 set -o pipefail
 
-VERSION="0.57-test"
+VERSION="1.0.0"
 
-STATE_DIR="/root/s2s-manager-test"
+STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
 ROUTE_DIR="${STATE_DIR}/routes"
 SECRET_DIR="${STATE_DIR}/secrets"
@@ -155,7 +168,6 @@ banner() {
     printf '╚%s╝\n' "$(printf '═%.0s' $(seq 1 ${width}))"
     printf '%b' "${C_RESET}"
     echo
-    printf '%b\n' "${C_YELLOW}${C_BOLD}DEVELOPMENT / TEST BUILD${C_RESET}"
     printf 'State directory: %b%s%b\n' "${C_CYAN}" "${STATE_DIR}" "${C_RESET}"
     echo
 }
