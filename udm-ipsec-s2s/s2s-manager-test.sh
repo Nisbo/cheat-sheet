@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.0-test"
+VERSION="1.2.1-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -6467,9 +6467,19 @@ wireguard_apply() {
 
 wireguard_server_summary() {
     load_wireguard_server || return 1
-    local state="inactive" pub=""
-    systemctl is-active --quiet wg-quick@wg0 2>/dev/null && state="active"
-    command_available wg && pub="$(wg pubkey < "${WG_SERVER_KEY}" 2>/dev/null || true)"
+    local state="inactive" pub="" private=""
+    systemctl is-active --quiet "wg-quick@${WG_INTERFACE}" 2>/dev/null && state="active"
+
+    if command_available wg; then
+        if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
+            # Read-only imports deliberately do not copy/store the server private key.
+            # Read the public key from the live interface instead.
+            pub="$(wg show "${WG_INTERFACE}" public-key 2>/dev/null || true)"
+        elif [[ -f "${WG_SERVER_KEY}" ]]; then
+            private="$(cat "${WG_SERVER_KEY}" 2>/dev/null || true)"
+            [[ -n "${private}" ]] && pub="$(printf '%s' "${private}" | wg pubkey 2>/dev/null || true)"
+        fi
+    fi
     printf '%-28s %s\n' "Management:" "${WG_MANAGEMENT}"
     printf '%-28s %s\n' "Service:" "${state}"
     printf '%-28s %s\n' "Interface:" "${WG_INTERFACE}"
