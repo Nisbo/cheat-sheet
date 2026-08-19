@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.53-test"
+VERSION="0.54-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -6342,7 +6342,8 @@ restore_tunnel_backup() {
     echo "No strongSwan file, VTI interface or systemd service is installed automatically."
     echo "After restore, use 'Install tunnel on Debian' when you are ready."
     echo
-    echo "Restore will NOT overwrite an existing tunnel with the same internal or display name."
+    echo "If the internal name or display name already exists, restore stops without changing anything."
+    echo "No automatic -2 suffix is added and no existing tunnel is overwritten."
     echo
 
     select_tunnel_backup || return
@@ -6447,7 +6448,8 @@ restore_tunnel_backup() {
         validation_error_block \
             "TUNNEL ALREADY EXISTS" \
             "Internal name: ${NAME}" \
-            "Restore does not overwrite an existing tunnel or its system artifacts."
+            "Restore stops here without changing anything." \
+            "No automatic -2 suffix is added and the existing tunnel is not overwritten."
         pause
         return
     fi
@@ -6457,7 +6459,8 @@ restore_tunnel_backup() {
         validation_error_block \
             "DISPLAY NAME ALREADY EXISTS" \
             "Display name: ${DISPLAY_NAME}" \
-            "Restore does not overwrite or duplicate an existing display name."
+            "Restore stops here without changing anything." \
+            "No automatic -2 suffix is added and the existing display name is not changed."
         pause
         return
     fi
@@ -6717,6 +6720,13 @@ transfer_debian_peer_bundle() {
 
     echo "Transfers an already created Debian peer bundle directly to the remote server via SCP."
     echo "The transfer is encrypted over SSH; your local computer is not used as an intermediate hop."
+    echo
+    echo "The remote import directory is created automatically if it does not already exist."
+    echo "With normal password-based SSH you may be asked for the remote SSH password twice:"
+    echo "  • first to check/create the remote import directory"
+    echo "  • second for the actual SCP file transfer"
+    echo "With SSH key authentication, no password prompt may be necessary."
+    echo
     echo "On the remote server, import the transferred file with 'Import Debian peer bundle'."
     echo
     if [[ -z "${bundle}" ]]; then
