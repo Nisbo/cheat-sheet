@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.47-test"
+VERSION="0.48-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -1587,26 +1587,29 @@ show_existing_tunnels() {
         [[ -z "${name}" ]] && continue
         load_tunnel "${name}" || continue
 
-        if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
-            management="IMPORTED / READ-ONLY"
-            connection="$(tunnel_connection_state "${NAME}")"
-        elif [[ "${INSTALLED}" == "1" ]]; then
-            management="MANAGED"
-            connection="$(tunnel_connection_state "${NAME}")"
+        actual_install_state "${name}" || true
+        management="$(actual_install_state_label "${ACTUAL_INSTALL_STATE}")"
 
-            if [[ "${PEER_MODE}" == "dns" ]]; then
-                dns_peer_endpoint_status "${NAME}" || true
-                case "${DNS_PEER_STATUS}" in
-                    OUTDATED|RESOLVE_FAILED|CHECK_UNAVAILABLE|MULTIPLE|VTI_MISSING)
-                        connection="DISCONNECTED (DNS)"
-                        dns_notices+=("${DISPLAY_NAME}|${DNS_PEER_STATUS}|${DNS_PEER_HOSTNAME}|${DNS_PEER_RESOLVED_IP}|${DNS_PEER_VTI_IP}|${DNS_PEER_DETAIL}")
-                        ;;
-                esac
-            fi
-        else
-            management="DEFINED / MANAGED"
-            connection="-"
-        fi
+        case "${ACTUAL_INSTALL_STATE}" in
+            INSTALLED|IMPORTED)
+                connection="$(tunnel_connection_state "${NAME}")"
+                if [[ "${PEER_MODE}" == "dns" ]]; then
+                    dns_peer_endpoint_status "${NAME}" || true
+                    case "${DNS_PEER_STATUS}" in
+                        OUTDATED|RESOLVE_FAILED|CHECK_UNAVAILABLE|MULTIPLE|VTI_MISSING)
+                            connection="DISCONNECTED (DNS)"
+                            dns_notices+=("${DISPLAY_NAME}|${DNS_PEER_STATUS}|${DNS_PEER_HOSTNAME}|${DNS_PEER_RESOLVED_IP}|${DNS_PEER_VTI_IP}|${DNS_PEER_DETAIL}")
+                            ;;
+                    esac
+                fi
+                ;;
+            PARTIAL)
+                connection="BROKEN"
+                ;;
+            *)
+                connection="-"
+                ;;
+        esac
 
         print_table_cell "${index}" "${number_width}"
         printf '%s' "${gap}"
@@ -1623,7 +1626,7 @@ show_existing_tunnels() {
             CONNECTED)
                 print_table_cell "${connection}" "${connection_width}" "${C_GREEN}${C_BOLD}" "${C_RESET}"
                 ;;
-            DISCONNECTED|"DISCONNECTED (DNS)")
+            DISCONNECTED|"DISCONNECTED (DNS)"|BROKEN)
                 print_table_cell "${connection}" "${connection_width}" "${C_RED}${C_BOLD}" "${C_RESET}"
                 ;;
             *)
@@ -3313,6 +3316,210 @@ tunnel_is_installed() {
     return 1
 }
 
+
+actual_install_state() {
+    local name="$1"
+    local conn service
+    local state_flag=0
+    local swan_file=0 vti_script=0 service_file=0 service_enabled=0
+    local service_active=0 vti_present=0 conn_loaded=0 route_present=0
+    local -a missing=()
+    local -a unexpected=()
+
+    load_tunnel "${name}" >/dev/null 2>&1 || {
+        ACTUAL_INSTALL_STATE="UNKNOWN"
+        ACTUAL_INSTALL_DETAIL="manager definition cannot be loaded"
+        return 1
+    }
+
+    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
+        ACTUAL_INSTALL_STATE="IMPORTED"
+        ACTUAL_INSTALL_DETAIL="read-only imported tunnel"
+        return 0
+    fi
+
+    [[ "${INSTALLED:-0}" == "1" ]] && state_flag=1
+    [[ -f "$(managed_swan_file "${name}")" ]] && swan_file=1
+    [[ -f "$(managed_vti_script "${name}")" ]] && vti_script=1
+    [[ -f "$(managed_service_file "${name}")" ]] && service_file=1
+
+    service="$(managed_service_name "${name}")"
+    if systemctl is-enabled --quiet "${service}" 2>/dev/null; then
+        service_enabled=1
+    fi
+    if systemctl is-active --quiet "${service}" 2>/dev/null; then
+        service_active=1
+    fi
+    if ip link show "${VTI_INTERFACE}" >/dev/null 2>&1; then
+        vti_present=1
+    fi
+
+    conn="${MANAGED_PREFIX}-${NAME}"
+    if command_available swanctl && \
+       swanctl_clean swanctl --list-conns 2>/dev/null | grep -qE "^${conn}:"; then
+        conn_loaded=1
+    fi
+
+    if ip route show table 220 2>/dev/null | \
+       grep -qE "^${VTI_NETWORK//./\\.}([[:space:]]|$).*dev[[:space:]]+${VTI_INTERFACE}([[:space:]]|$)"; then
+        route_present=1
+    fi
+
+    # A completely clean definition is DEFINED regardless of a stale INSTALLED=0 flag.
+    if (( state_flag == 0 && swan_file == 0 && vti_script == 0 && service_file == 0 &&
+          service_enabled == 0 && service_active == 0 && vti_present == 0 &&
+          conn_loaded == 0 && route_present == 0 )); then
+        ACTUAL_INSTALL_STATE="DEFINED"
+        ACTUAL_INSTALL_DETAIL="definition exists; no managed system installation detected"
+        return 0
+    fi
+
+    # Fully installed means both manager state and all expected live/system artifacts agree.
+    if (( state_flag == 1 && swan_file == 1 && vti_script == 1 && service_file == 1 &&
+          service_enabled == 1 && service_active == 1 && vti_present == 1 &&
+          conn_loaded == 1 && route_present == 1 )); then
+        ACTUAL_INSTALL_STATE="INSTALLED"
+        ACTUAL_INSTALL_DETAIL="manager state and live Debian installation agree"
+        return 0
+    fi
+
+    (( state_flag == 0 )) && unexpected+=("manager state says DEFINED")
+    (( state_flag == 1 )) || true
+    (( swan_file == 1 )) || missing+=("strongSwan config")
+    (( vti_script == 1 )) || missing+=("VTI script")
+    (( service_file == 1 )) || missing+=("systemd service file")
+    (( service_enabled == 1 )) || missing+=("enabled systemd service")
+    (( service_active == 1 )) || missing+=("active systemd service")
+    (( vti_present == 1 )) || missing+=("VTI interface ${VTI_INTERFACE}")
+    (( conn_loaded == 1 )) || missing+=("loaded strongSwan connection")
+    (( route_present == 1 )) || missing+=("table 220 tunnel route")
+
+    if (( state_flag == 1 )); then
+        unexpected+=("manager state says INSTALLED")
+    fi
+
+    ACTUAL_INSTALL_STATE="PARTIAL"
+    ACTUAL_INSTALL_DETAIL=""
+    if (( ${#missing[@]} > 0 )); then
+        ACTUAL_INSTALL_DETAIL="Missing: $(IFS=', '; echo "${missing[*]}")"
+    fi
+    if (( state_flag == 0 )); then
+        if [[ -n "${ACTUAL_INSTALL_DETAIL}" ]]; then
+            ACTUAL_INSTALL_DETAIL+="; "
+        fi
+        ACTUAL_INSTALL_DETAIL+="system artifacts exist although manager state is DEFINED"
+    fi
+    return 0
+}
+
+actual_install_state_label() {
+    case "$1" in
+        INSTALLED) printf '%s' "MANAGED" ;;
+        DEFINED)   printf '%s' "DEFINED / MANAGED" ;;
+        PARTIAL)   printf '%s' "PARTIAL / BROKEN" ;;
+        IMPORTED)  printf '%s' "IMPORTED / READ-ONLY" ;;
+        *)         printf '%s' "UNKNOWN" ;;
+    esac
+}
+
+select_tunnel_for_operation() {
+    local operation="$1"
+    local -a names=() labels=() states=()
+    local -a primary_idx=() secondary_idx=()
+    local name state label selection i display
+
+    while read -r name; do
+        [[ -n "${name}" ]] || continue
+        load_tunnel "${name}" || continue
+        [[ "${MANAGEMENT}" == "IMPORTED" ]] && continue
+
+        actual_install_state "${name}" || continue
+        state="${ACTUAL_INSTALL_STATE}"
+        display="${DISPLAY_NAME:-${NAME}}"
+
+        case "${operation}:${state}" in
+            install:DEFINED)
+                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                primary_idx+=("$(( ${#names[@]} - 1 ))")
+                ;;
+            install:PARTIAL)
+                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                secondary_idx+=("$(( ${#names[@]} - 1 ))")
+                ;;
+            uninstall:INSTALLED)
+                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                primary_idx+=("$(( ${#names[@]} - 1 ))")
+                ;;
+            uninstall:PARTIAL)
+                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                secondary_idx+=("$(( ${#names[@]} - 1 ))")
+                ;;
+            reapply:INSTALLED)
+                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                primary_idx+=("$(( ${#names[@]} - 1 ))")
+                ;;
+            reapply:PARTIAL)
+                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                secondary_idx+=("$(( ${#names[@]} - 1 ))")
+                ;;
+        esac
+    done < <(list_tunnel_names)
+
+    if (( ${#names[@]} == 0 )); then
+        case "${operation}" in
+            install)   info "No defined or incomplete managed tunnels are available for installation." ;;
+            uninstall) info "No installed or incomplete managed tunnels are available for removal." ;;
+            reapply)   info "No installed or incomplete managed tunnels are available for re-apply." ;;
+        esac
+        pause
+        return 1
+    fi
+
+    echo
+    local n=1 idx
+    if (( ${#primary_idx[@]} > 0 )); then
+        case "${operation}" in
+            install)   printf '%b\n' "${C_GREEN}${C_BOLD}  READY TO INSTALL${C_RESET}" ;;
+            uninstall) printf '%b\n' "${C_GREEN}${C_BOLD}  INSTALLED${C_RESET}" ;;
+            reapply)   printf '%b\n' "${C_GREEN}${C_BOLD}  INSTALLED${C_RESET}" ;;
+        esac
+        for idx in "${primary_idx[@]}"; do
+            printf '  [%d] %s\n' "${n}" "${labels[$idx]}"
+            DISPLAY_ORDER_${n}="${idx}"
+            ((n += 1))
+        done
+        echo
+    fi
+
+    if (( ${#secondary_idx[@]} > 0 )); then
+        printf '%b\n' "${C_YELLOW}${C_BOLD}  PARTIAL / BROKEN${C_RESET}"
+        for idx in "${secondary_idx[@]}"; do
+            printf '  [%d] %s  [repair needed]\n' "${n}" "${labels[$idx]}"
+            DISPLAY_ORDER_${n}="${idx}"
+            ((n += 1))
+        done
+        echo
+    fi
+
+    echo "Enter tunnel number and press ENTER."
+    echo "B = Back    E = Exit"
+    echo
+    read -r -p "Selection: " selection
+
+    case "${selection}" in
+        ""|b|B|0) return 1 ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
+    [[ "${selection}" =~ ^[0-9]+$ ]] || return 1
+    (( selection >= 1 && selection < n )) || return 1
+
+    local order_var="DISPLAY_ORDER_${selection}"
+    idx="${!order_var}"
+    SELECTED_TUNNEL="${names[$idx]}"
+    SELECTED_ACTUAL_STATE="${states[$idx]}"
+    return 0
+}
+
 # ==============================================================================
 # Re-apply installed tunnel from saved state
 # ==============================================================================
@@ -3421,7 +3628,7 @@ manual_reapply_tunnel() {
     banner
     section "RE-APPLY INSTALLED TUNNEL"
 
-    select_tunnel || return
+    select_tunnel_for_operation "reapply" || return
 
     local name="${SELECTED_TUNNEL}"
     load_tunnel "${name}" || return
@@ -3433,9 +3640,21 @@ manual_reapply_tunnel() {
     fi
 
 
-    if [[ "${INSTALLED}" != "1" ]]; then
-        warn "Tunnel '${name}' is not installed on Debian."
-        echo "Use 'Install defined tunnel on Debian' first."
+    actual_install_state "${name}" || return
+    if [[ "${ACTUAL_INSTALL_STATE}" == "PARTIAL" ]]; then
+        section "INCOMPLETE INSTALLATION DETECTED"
+        warn "Re-apply cannot safely use an inconsistent live installation."
+        printf '%-28s %s
+' "Details:" "${ACTUAL_INSTALL_DETAIL}"
+        echo
+        echo "The manager can clean its system artifacts and rebuild the tunnel."
+        confirm_yes_no "Repair this tunnel now?" "N" || return
+        cleanup_partial_install "${name}"
+        install_tunnel_system_config "${name}"
+        return
+    fi
+    if [[ "${ACTUAL_INSTALL_STATE}" != "INSTALLED" ]]; then
+        warn "Tunnel '${DISPLAY_NAME}' is not fully installed on Debian."
         pause
         return
     fi
@@ -3512,8 +3731,11 @@ reconnect_tunnel_by_name() {
 
     load_tunnel "${name}" || return 1
 
-    if [[ "${INSTALLED}" != "1" ]]; then
-        warn "Tunnel '${DISPLAY_NAME}' is not installed on Debian."
+    actual_install_state "${name}" || return 1
+    if [[ "${ACTUAL_INSTALL_STATE}" != "INSTALLED" ]]; then
+        warn "Tunnel '${DISPLAY_NAME}' is not fully installed on Debian."
+        [[ "${ACTUAL_INSTALL_STATE}" == "PARTIAL" ]] && printf '%-28s %s\n' "Details:" "${ACTUAL_INSTALL_DETAIL}"
+        info "Use Install/Re-apply to repair the tunnel first."
         pause
         return 1
     fi
@@ -5362,41 +5584,88 @@ show_unifi_configuration() {
 install_defined_tunnel() {
     banner
     section "INSTALL TUNNEL ON DEBIAN"
-    select_tunnel || return
+    select_tunnel_for_operation "install" || return
 
-    load_tunnel "${SELECTED_TUNNEL}" || return
-    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
-        imported_readonly_notice "${SELECTED_TUNNEL}"
-        pause
-        return
-    fi
-    if [[ "${INSTALLED}" == "1" ]]; then
-        warn "This tunnel is already marked as installed."
-        pause
-        return
-    fi
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
 
-    install_tunnel_system_config "${SELECTED_TUNNEL}"
+    actual_install_state "${name}" || return
+    case "${ACTUAL_INSTALL_STATE}" in
+        DEFINED)
+            install_tunnel_system_config "${name}"
+            ;;
+        PARTIAL)
+            section "INCOMPLETE INSTALLATION DETECTED"
+            warn "The saved definition and the live Debian installation do not agree."
+            printf '%-28s %s
+' "Display name:" "${DISPLAY_NAME}"
+            printf '%-28s %s
+' "Actual state:" "PARTIAL / BROKEN"
+            printf '%-28s %s
+' "Details:" "${ACTUAL_INSTALL_DETAIL}"
+            echo
+            echo "  [1] Clean manager-owned system artifacts and install again"
+            echo "  [2] Clean manager-owned system artifacts and keep tunnel DEFINED"
+            echo "  [B] Back"
+            echo
+            local choice
+            read -r -p "Selection: " choice
+            case "${choice}" in
+                1)
+                    cleanup_partial_install "${name}"
+                    install_tunnel_system_config "${name}"
+                    ;;
+                2)
+                    cleanup_partial_install "${name}"
+                    pause
+                    ;;
+                *) return ;;
+            esac
+            ;;
+        INSTALLED)
+            warn "Tunnel '${DISPLAY_NAME}' is already fully installed."
+            pause
+            ;;
+        *)
+            error "Tunnel installation state could not be determined."
+            pause
+            ;;
+    esac
 }
 
 remove_installed_tunnel() {
     banner
     section "REMOVE INSTALLED TUNNEL"
-    select_tunnel || return
+    select_tunnel_for_operation "uninstall" || return
 
-    load_tunnel "${SELECTED_TUNNEL}" || return
-    if [[ "${MANAGEMENT}" == "IMPORTED" ]]; then
-        imported_readonly_notice "${SELECTED_TUNNEL}"
-        pause
-        return
-    fi
-    if [[ "${INSTALLED}" != "1" ]]; then
-        warn "This tunnel is not installed."
-        pause
-        return
-    fi
+    local name="${SELECTED_TUNNEL}"
+    load_tunnel "${name}" || return
 
-    remove_tunnel_system_config "${SELECTED_TUNNEL}"
+    actual_install_state "${name}" || return
+    case "${ACTUAL_INSTALL_STATE}" in
+        INSTALLED)
+            remove_tunnel_system_config "${name}"
+            ;;
+        PARTIAL)
+            section "INCOMPLETE INSTALLATION DETECTED"
+            warn "This tunnel is only partially present on Debian."
+            printf '%-28s %s
+' "Display name:" "${DISPLAY_NAME}"
+            printf '%-28s %s
+' "Details:" "${ACTUAL_INSTALL_DETAIL}"
+            echo
+            echo "The tunnel definition and PSK will be kept."
+            echo "Only manager-owned system artifacts will be cleaned."
+            echo
+            confirm_yes_no "Clean the incomplete installation now?" "N" || return
+            cleanup_partial_install "${name}"
+            pause
+            ;;
+        *)
+            warn "There is no installed Debian system configuration to remove."
+            pause
+            ;;
+    esac
 }
 
 show_system_status() {
@@ -5581,7 +5850,11 @@ show_tunnel_diagnostics() {
     printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
     printf '%-28s %s\n' "Internal name:" "${NAME}"
     printf '%-28s %s\n' "Peer type:" "$(peer_type_label "${PEER_TYPE}")"
-    printf '%-28s %s\n' "Management:" "$([[ "${MANAGEMENT}" == "IMPORTED" ]] && echo 'IMPORTED / READ-ONLY' || { [[ "${INSTALLED}" == "1" ]] && echo MANAGED || echo 'DEFINED / MANAGED'; })"
+    actual_install_state "${name}" || true
+    printf '%-28s %s\n' "Management:" "$(actual_install_state_label "${ACTUAL_INSTALL_STATE}")"
+    if [[ "${ACTUAL_INSTALL_STATE}" == "PARTIAL" ]]; then
+        printf '%-28s %s\n' "State details:" "${ACTUAL_INSTALL_DETAIL}"
+    fi
     printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
     printf '%-28s %s\n' "Local Debian VTI IP:" "${DEBIAN_VTI_IP}"
     if [[ "${PEER_TYPE}" == "debian" ]]; then
