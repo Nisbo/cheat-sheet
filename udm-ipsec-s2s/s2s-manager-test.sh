@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.3-test"
+VERSION="1.2.5-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -6422,6 +6422,67 @@ wireguard_next_client_ip() {
     return 1
 }
 
+
+wireguard_table220_active() {
+    local rules
+    rules="$(ip rule show 2>/dev/null || true)"
+    grep -Eq '(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)' <<< "${rules}"
+}
+
+wireguard_table220_route_ok() {
+    load_wireguard_server || return 1
+    local route
+    route="$(ip route show table 220 "${WG_NETWORK}" 2>/dev/null || true)"
+    grep -Eq "^${WG_NETWORK//./\\.} dev ${WG_INTERFACE}([[:space:]]|$)" <<< "${route}"
+}
+
+wireguard_ensure_table220_route() {
+    load_wireguard_server || return 1
+    wireguard_table220_active || return 0
+    ip route replace "${WG_NETWORK}" dev "${WG_INTERFACE}" table 220 || return 1
+}
+
+wireguard_remove_table220_route() {
+    load_wireguard_server || return 1
+    wireguard_table220_active || return 0
+    ip route del "${WG_NETWORK}" dev "${WG_INTERFACE}" table 220 2>/dev/null || true
+}
+
+wireguard_cleanup_legacy_rules() {
+    load_wireguard_server || return 1
+    local net="${WG_NETWORK}"
+    local public_ip
+    public_ip="$(detect_public_ipv4)"
+
+    # Remove common legacy FORWARD rules that match this WG network exactly.
+    while iptables -C FORWARD -s "${net}" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -s "${net}" -j ACCEPT >/dev/null 2>&1 || break
+    done
+
+    while iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; do
+        # Do not remove broad global rules; only one copy is enough to coexist safely.
+        break
+    done
+
+    # Remove legacy SNAT rules for the WG network to the server public IP.
+    if [[ -n "${public_ip}" ]]; then
+        while iptables -t nat -C POSTROUTING -s "${net}" ! -d "${net}" -j SNAT --to-source "${public_ip}" >/dev/null 2>&1; do
+            iptables -t nat -D POSTROUTING -s "${net}" ! -d "${net}" -j SNAT --to-source "${public_ip}" >/dev/null 2>&1 || break
+        done
+    fi
+
+    # Remove duplicate manager-style MASQUERADE/FORWARD rules before wg-quick restarts.
+    while iptables -C FORWARD -i "${WG_INTERFACE}" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -i "${WG_INTERFACE}" -j ACCEPT >/dev/null 2>&1 || break
+    done
+    while iptables -C FORWARD -o "${WG_INTERFACE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -o "${WG_INTERFACE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || break
+    done
+    while iptables -t nat -C POSTROUTING -s "${net}" -o "${WG_EGRESS_IF}" -j MASQUERADE >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -s "${net}" -o "${WG_EGRESS_IF}" -j MASQUERADE >/dev/null 2>&1 || break
+    done
+}
+
 render_wireguard_server_config() {
     load_wireguard_server || return 1
     [[ "${WG_MANAGEMENT}" == "MANAGED" ]] || return 1
@@ -6436,8 +6497,8 @@ render_wireguard_server_config() {
         printf 'Address = %s/%s\n' "${WG_SERVER_IP}" "${WG_PREFIX}"
         printf 'ListenPort = %s\n' "${WG_PORT}"
         printf 'PrivateKey = %s\n' "${private}"
-        printf 'PostUp = iptables -A FORWARD -i %%i -j ACCEPT; iptables -A FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE\n' "${WG_NETWORK}" "${WG_EGRESS_IF}"
-        printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT; iptables -D FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE\n' "${WG_NETWORK}" "${WG_EGRESS_IF}"
+        printf 'PostUp = iptables -A FORWARD -i %%i -j ACCEPT; iptables -A FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route replace %s dev %%i table 220; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
+        printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT; iptables -D FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route del %s dev %%i table 220 2>/dev/null || true; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
         while read -r id; do
             [[ -n "${id}" ]] || continue
             load_wireguard_client "${id}" || continue
@@ -6456,13 +6517,17 @@ render_wireguard_server_config() {
 wireguard_apply() {
     load_wireguard_server || return 1
     [[ "${WG_MANAGEMENT}" == "MANAGED" ]] || return 1
+
+    wireguard_cleanup_legacy_rules || true
     render_wireguard_server_config || return 1
-    systemctl enable wg-quick@wg0 >/dev/null 2>&1 || return 1
-    if ! systemctl restart wg-quick@wg0 >/tmp/s2s-manager-wireguard-restart.log 2>&1; then
+
+    systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1 || return 1
+    if ! systemctl restart "wg-quick@${WG_INTERFACE}" >/tmp/s2s-manager-wireguard-restart.log 2>&1; then
         cat /tmp/s2s-manager-wireguard-restart.log 2>/dev/null || true
         return 1
     fi
-    systemctl is-active --quiet wg-quick@wg0
+    wireguard_ensure_table220_route || return 1
+    systemctl is-active --quiet "wg-quick@${WG_INTERFACE}"
 }
 
 wireguard_server_summary() {
@@ -6870,6 +6935,8 @@ wireguard_migrate_existing_config() {
     echo "  + keep existing peer public keys / PSKs / /32 client IPs"
     echo "  + enable IPv4 forwarding"
     echo "  + replace wg0.conf with manager-owned full-tunnel NAT/forwarding rules"
+    echo "  + remove matching legacy WireGuard NAT/FORWARD rules before restart"
+    echo "  + add the WireGuard VPN network to routing table 220 when S2S policy routing is active"
     echo "  + restart wg-quick@wg0 briefly"
     echo "  + optionally manage the UFW WireGuard UDP rule"
     echo
@@ -7056,7 +7123,8 @@ wireguard_setup_new_server() {
     printf '%-28s %s\n' "Client DNS:" "${dns}"
     printf '%-28s %s\n' "Internet egress:" "${egress}"
     echo
-    echo "Changes: IPv4 forwarding, wg0, Internet NAT, wg-quick service and optional UFW rule."
+    echo "Changes: IPv4 forwarding, wg0, Internet NAT, wg-quick service, optional UFW rule"
+    echo "and a table 220 route for the WireGuard VPN network when S2S policy routing is active."
     echo
     confirm_yes_no "Create the WireGuard server now?" "N" || return
 
@@ -7143,7 +7211,8 @@ wireguard_server_menu() {
     wireguard_server_summary
     echo
     echo "  [1] Change endpoint / port / client DNS"
-    echo "  [2] Restart WireGuard server"
+    echo "  [2] Restart / re-apply WireGuard server"
+    echo "      Regenerates manager-owned wg0 configuration and routing/NAT rules."
     echo "  [B] Back"
     echo
     local c
@@ -7264,81 +7333,76 @@ wireguard_clients_menu() {
         return
     }
 
-    load_wireguard_server || return
+    while :; do
+        load_wireguard_server || return
 
-    banner
-    section "WIREGUARD CLIENTS"
+        banner
+        section "WIREGUARD CLIENTS"
 
-    if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
-        echo "The WireGuard server is imported READ-ONLY."
-        echo "Existing peers are shown below, but client changes require migration."
-    else
-        echo "Manage full-tunnel WireGuard clients."
-    fi
-    echo
-
-    local id count=0 dump peer handshake now age hs type
-    dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
-    now="$(date +%s)"
-
-    printf '%-4s %-24s %-15s %-12s %-18s\n' \
-        "#" "Name" "VPN IP" "Type" "Handshake"
-    printf '%-4s %-24s %-15s %-12s %-18s\n' \
-        "──" "──────────────────────" "──────────────" "──────────" "────────────────"
-
-    while read -r id; do
-        [[ -n "${id}" ]] || continue
-        load_wireguard_client "${id}" || continue
-        ((count += 1))
-
-        if [[ -n "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
-            type="MANAGED"
+        if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
+            echo "The WireGuard server is imported READ-ONLY."
+            echo "Existing peers are shown below, but client changes require migration."
         else
-            type="IMPORTED"
+            echo "Manage full-tunnel WireGuard clients."
+        fi
+        echo
+
+        local id count=0 dump peer handshake now age hs type
+        dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
+        now="$(date +%s)"
+
+        printf '%-4s %-24s %-15s %-12s %-18s\n' "#" "Name" "VPN IP" "Type" "Handshake"
+        printf '%-4s %-24s %-15s %-12s %-18s\n' "──" "──────────────────────" "──────────────" "──────────" "────────────────"
+
+        while read -r id; do
+            [[ -n "${id}" ]] || continue
+            load_wireguard_client "${id}" || continue
+            ((count += 1))
+            [[ -n "${WG_CLIENT_PRIVATE_KEY:-}" ]] && type="MANAGED" || type="IMPORTED"
+
+            peer="$(awk -F'\t' -v p="${WG_CLIENT_PUBLIC_KEY}" '$1==p {print; exit}' <<< "${dump}")"
+            handshake=0
+            [[ -n "${peer}" ]] && handshake="$(cut -f5 <<< "${peer}")"
+            if [[ "${handshake}" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
+                age=$((now - handshake))
+                hs="$(human_duration "${age}") ago"
+            else
+                hs="Never"
+            fi
+
+            printf '%-4s %-24s %-15s %-12s %-18s\n' \
+                "${count}" "${WG_CLIENT_NAME:0:24}" "${WG_CLIENT_IP}" "${type}" "${hs}"
+        done < <(list_wireguard_client_ids)
+
+        (( count == 0 )) && printf '%s\n' "     No WireGuard clients configured."
+        echo
+
+        if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
+            info "Imported peers are read-only."
+            info "Their client private keys are not stored on the server, so complete configs/QR codes cannot be recreated."
+            info "Use 'WireGuard server setup' -> 'Migrate / take over imported WireGuard server' to manage the server."
+            pause
+            return
         fi
 
-        peer="$(awk -F'\t' -v p="${WG_CLIENT_PUBLIC_KEY}" '$1==p {print; exit}' <<< "${dump}")"
-        handshake=0
-        [[ -n "${peer}" ]] && handshake="$(cut -f5 <<< "${peer}")"
-
-        if [[ "${handshake}" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
-            age=$((now - handshake))
-            hs="$(human_duration "${age}") ago"
-        else
-            hs="Never"
-        fi
-
-        printf '%-4s %-24s %-15s %-12s %-18s\n' \
-            "${count}" "${WG_CLIENT_NAME:0:24}" "${WG_CLIENT_IP}" "${type}" "${hs}"
-    done < <(list_wireguard_client_ids)
-
-    if (( count == 0 )); then
-        printf '%s\n' "     No WireGuard clients configured."
-    fi
-
-    echo
-    if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
-        info "Imported peers are read-only."
-        info "Their client private keys are not stored on the server, so complete configs/QR codes cannot be recreated."
-        info "Use 'WireGuard server setup' -> 'Migrate / take over imported WireGuard server' to manage the server."
-        pause
-        return
-    fi
-
-    echo "  [1] Add client"
-    echo "  [2] Show client configuration"
-    echo "  [3] Show client QR code"
-    echo "  [4] Remove client"
-    echo "  [B] Back"
-    echo
-    local c
-    read -r -p "Selection: " c
-    case "${c}" in
-        1) wireguard_add_client ;;
-        2) wireguard_show_client_config ;;
-        3) wireguard_show_client_qr ;;
-        4) wireguard_remove_client ;;
-    esac
+        echo "  [1] Add client"
+        echo "  [2] Show client configuration"
+        echo "  [3] Show client QR code"
+        echo "  [4] Remove client"
+        echo "  [B] Back"
+        echo
+        local c
+        read -r -p "Selection: " c
+        case "${c}" in
+            1) wireguard_add_client ;;
+            2) wireguard_show_client_config ;;
+            3) wireguard_show_client_qr ;;
+            4) wireguard_remove_client ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+        esac
+        # Child actions pause themselves. Redraw this WireGuard client menu afterwards.
+    done
 }
 
 wireguard_status() {
@@ -7349,6 +7413,18 @@ wireguard_status() {
     load_wireguard_server || return
     wireguard_server_summary
     printf '%-28s %s\n' "IPv4 forwarding:" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
+
+    if wireguard_table220_active; then
+        if wireguard_table220_route_ok; then
+            ok "Routing table 220: ${WG_NETWORK} -> ${WG_INTERFACE}"
+        else
+            error "Routing table 220 is active, but ${WG_NETWORK} is not routed to ${WG_INTERFACE}."
+            info "Full-tunnel return traffic may be sent to the wrong interface."
+        fi
+    else
+        info "Routing table 220 policy is not active; no WireGuard table 220 route is required."
+    fi
+
     echo; section "CLIENTS"
     local dump now id peer h rx tx age hs
     dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
