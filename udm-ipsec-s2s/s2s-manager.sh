@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # IPsec S2S Manager
-# Version 1.0.0
+# Version 1.3.0
 #
 # Purpose:
 #   Interactive setup and management of route-based IKEv2/IPsec Site-to-Site
@@ -20,6 +20,7 @@
 #   - tunnel backup / restore
 #   - discovery and controlled take-over of existing strongSwan/VTI tunnels
 #   - optional UFW integration for IPsec UDP 500 / 4500
+#   - optional WireGuard full-tunnel VPN server and client management
 #
 # Manager state:
 #   /root/s2s-manager/
@@ -40,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.3.0"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -48,6 +49,20 @@ ROUTE_DIR="${STATE_DIR}/routes"
 SECRET_DIR="${STATE_DIR}/secrets"
 BACKUP_DIR="${STATE_DIR}/backups"
 EXPORT_DIR="${STATE_DIR}/exports"
+
+WG_DIR="${STATE_DIR}/wireguard"
+WG_CLIENT_DIR="${WG_DIR}/clients"
+WG_CLIENT_EXPORT_DIR="${WG_DIR}/exports"
+WG_BACKUP_DIR="${WG_DIR}/backups"
+WG_SERVER_STATE="${WG_DIR}/server.conf"
+WG_SERVER_KEY="${WG_DIR}/server.key"
+WG_CONFIG_DIR="/etc/wireguard"
+WG_CONFIG="${WG_CONFIG_DIR}/wg0.conf"
+WG_SYSCTL_FILE="/etc/sysctl.d/99-s2s-manager-wireguard.conf"
+WG_INTERFACE_DEFAULT="wg0"
+WG_NETWORK_DEFAULT="10.250.0.0/24"
+WG_PORT_DEFAULT="51820"
+WG_DNS_DEFAULT="1.1.1.1"
 
 SWANCTL_DIR="/etc/swanctl/conf.d"
 MANAGED_PREFIX="s2s-manager"
@@ -317,8 +332,10 @@ ensure_root() {
 }
 
 init_state_dirs() {
-    mkdir -p "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}" "${EXPORT_DIR}"
-    chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}" "${EXPORT_DIR}"
+    mkdir -p "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}" "${EXPORT_DIR}" \
+        "${WG_DIR}" "${WG_CLIENT_DIR}" "${WG_CLIENT_EXPORT_DIR}" "${WG_BACKUP_DIR}"
+    chmod 700 "${STATE_DIR}" "${TUNNEL_DIR}" "${ROUTE_DIR}" "${SECRET_DIR}" "${BACKUP_DIR}" "${EXPORT_DIR}" \
+        "${WG_DIR}" "${WG_CLIENT_DIR}" "${WG_CLIENT_EXPORT_DIR}" "${WG_BACKUP_DIR}"
 }
 
 debian_major_version() {
@@ -6107,6 +6124,1696 @@ remove_installed_tunnel() {
     esac
 }
 
+
+# ==============================================================================
+# WireGuard full-tunnel VPN
+# ==============================================================================
+
+wireguard_server_known() {
+    [[ -f "${WG_SERVER_STATE}" ]]
+}
+
+
+wireguard_config_is_manager_owned() {
+    local file="${1:-${WG_CONFIG}}"
+    [[ -f "${file}" ]] || return 1
+    grep -Fq "# Managed by IPsec S2S Manager" "${file}"
+}
+
+wireguard_reconcile_management_state() {
+    wireguard_server_known || return 0
+    load_wireguard_server || return 0
+
+    if [[ "${WG_MANAGEMENT}" == "MANAGED" ]]; then
+        if ! wireguard_config_is_manager_owned "${WG_CONFIG}"; then
+            # A previously managed state points to a config that is no longer manager-generated.
+            # Do not touch the live WireGuard config here; only downgrade manager metadata to IMPORTED.
+            local endpoint="${WG_ENDPOINT:-$(detect_public_ipv4)}"
+            local dns="${WG_DNS:-${WG_DNS_DEFAULT}}"
+            local egress="${WG_EGRESS_IF:-$(detect_default_egress_interface)}"
+
+            save_wireguard_server_state \
+                "IMPORTED" "${WG_INTERFACE:-${WG_INTERFACE_DEFAULT}}" "${WG_NETWORK}" "${WG_SERVER_IP}" \
+                "${WG_PREFIX}" "${WG_PORT}" "${endpoint}" "${dns}" "${egress}" "${WG_CONFIG}"
+
+            # Existing client metadata may still be valid for display, but managed private-key
+            # material must not be trusted after an external/manual restore.
+            local id
+            while read -r id; do
+                [[ -n "${id}" ]] || continue
+                local f
+                f="$(wireguard_client_state_file "${id}")"
+                [[ -f "${f}" ]] || continue
+                # Strip manager-owned client private keys after a downgrade to read-only.
+                sed -i -E 's/^WG_CLIENT_PRIVATE_KEY=.*/WG_CLIENT_PRIVATE_KEY=/' "${f}" 2>/dev/null || true
+            done < <(list_wireguard_client_ids)
+
+            rm -f "${WG_SERVER_KEY}" 2>/dev/null || true
+            return 2
+        fi
+    fi
+
+    return 0
+}
+
+wireguard_server_managed() {
+    wireguard_server_known || return 1
+    load_wireguard_server || return 1
+    [[ "${WG_MANAGEMENT}" == "MANAGED" && -f "${WG_SERVER_KEY}" ]] || return 1
+    wireguard_config_is_manager_owned "${WG_CONFIG}"
+}
+
+wireguard_server_imported() {
+    wireguard_server_known || return 1
+    load_wireguard_server || return 1
+    [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]
+}
+
+load_wireguard_server() {
+    wireguard_server_known || return 1
+    unset WG_MANAGEMENT WG_INTERFACE WG_NETWORK WG_SERVER_IP WG_PREFIX WG_PORT
+    unset WG_ENDPOINT WG_DNS WG_EGRESS_IF WG_SOURCE_CONFIG WG_CREATED_AT
+    # Manager-owned state only.
+    # shellcheck disable=SC1090
+    source "${WG_SERVER_STATE}"
+    : "${WG_MANAGEMENT:=MANAGED}"
+    : "${WG_INTERFACE:=${WG_INTERFACE_DEFAULT}}"
+    : "${WG_DNS:=${WG_DNS_DEFAULT}}"
+    : "${WG_SOURCE_CONFIG:=}"
+}
+
+save_wireguard_server_state() {
+    local management="$1"
+    local interface="$2"
+    local network="$3"
+    local server_ip="$4"
+    local prefix="$5"
+    local port="$6"
+    local endpoint="$7"
+    local dns="$8"
+    local egress="$9"
+    local source_config="${10:-}"
+
+    {
+        printf 'WG_MANAGEMENT=%q\n' "${management}"
+        printf 'WG_INTERFACE=%q\n' "${interface}"
+        printf 'WG_NETWORK=%q\n' "${network}"
+        printf 'WG_SERVER_IP=%q\n' "${server_ip}"
+        printf 'WG_PREFIX=%q\n' "${prefix}"
+        printf 'WG_PORT=%q\n' "${port}"
+        printf 'WG_ENDPOINT=%q\n' "${endpoint}"
+        printf 'WG_DNS=%q\n' "${dns}"
+        printf 'WG_EGRESS_IF=%q\n' "${egress}"
+        printf 'WG_SOURCE_CONFIG=%q\n' "${source_config}"
+        printf 'WG_CREATED_AT=%q\n' "$(date -Is)"
+    } > "${WG_SERVER_STATE}"
+    chmod 600 "${WG_SERVER_STATE}"
+}
+
+wireguard_client_state_file() { printf '%s/%s.client' "${WG_CLIENT_DIR}" "$1"; }
+wireguard_client_export_file() { printf '%s/%s.conf' "${WG_CLIENT_EXPORT_DIR}" "$1"; }
+
+wireguard_safe_client_id() {
+    local v="$1"
+    v="${v// /-}"
+    v="$(printf '%s' "${v}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')"
+    [[ -n "${v}" ]] || v="client"
+    printf '%s' "${v}"
+}
+
+list_wireguard_client_ids() {
+    local f
+    shopt -s nullglob
+    for f in "${WG_CLIENT_DIR}"/*.client; do basename "${f}" .client; done | sort
+    shopt -u nullglob
+}
+
+load_wireguard_client() {
+    local id="$1" f
+    f="$(wireguard_client_state_file "${id}")"
+    [[ -f "${f}" ]] || return 1
+    unset WG_CLIENT_ID WG_CLIENT_NAME WG_CLIENT_IP WG_CLIENT_PRIVATE_KEY
+    unset WG_CLIENT_PUBLIC_KEY WG_CLIENT_PRESHARED_KEY WG_CLIENT_CREATED_AT
+    # Manager-owned state only.
+    # shellcheck disable=SC1090
+    source "${f}"
+}
+
+detect_default_egress_interface() {
+    ip -4 route show default 2>/dev/null |
+        awk '{for(i=1;i<=NF;i++) if($i=="dev" && (i+1)<=NF){print $(i+1); exit}}'
+}
+
+wireguard_udp_port_in_use() {
+    local out
+    out="$(ss -H -lun "sport = :$1" 2>/dev/null || true)"
+    [[ -n "${out}" ]]
+}
+
+wireguard_rule_exists() {
+    local status
+    ufw_installed || return 1
+    status="$(ufw status 2>/dev/null || true)"
+    grep -F "S2S Manager WireGuard" <<< "${status}" |
+        grep -Eq "(^|[[:space:]])$1/udp([[:space:]]|$)"
+}
+
+remove_managed_wireguard_ufw_rules() {
+    ufw_installed || return 0
+    local nums n
+    nums="$(ufw status numbered 2>/dev/null |
+        awk '/S2S Manager WireGuard/{n=$1;gsub(/\[|\]/,"",n);print n}' | sort -rn)"
+    while read -r n; do
+        [[ -n "${n}" ]] && ufw --force delete "${n}" >/dev/null 2>&1 || true
+    done <<< "${nums}"
+}
+
+ensure_wireguard_firewall_rule() {
+    local port="$1" choice ssh_port action proto extra_port desc
+
+    if ! ufw_installed; then
+        banner
+        section "OPTIONAL UFW FIREWALL SETUP"
+        cat <<EOF
+UFW is currently not installed.
+
+UFW is NOT required for the WireGuard server.
+An external/provider firewall can be used instead.
+
+WireGuard requires its UDP listen port to be reachable from the Internet.
+
+Required WireGuard port:
+  UDP ${port}
+
+If UFW is installed and enabled, incoming connections that are not
+explicitly allowed may be blocked.
+
+IMPORTANT:
+Before enabling UFW, make sure every service you still need is allowed.
+EOF
+        ssh_port=""
+        [[ -n "${SSH_CONNECTION:-}" ]] && ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION}")"
+        if [[ -z "${ssh_port}" ]] && command_available sshd; then
+            ssh_port="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2;exit}')"
+        fi
+        [[ -n "${ssh_port}" ]] || ssh_port="22"
+
+        echo
+        echo "Detected SSH port: TCP ${ssh_port}"
+        echo
+        echo "  [1] Install UFW and configure it safely"
+        echo "  [2] Continue without UFW"
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1)
+                apt-get update || return 1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
+                ufw allow "${ssh_port}/tcp" comment 'S2S Manager SSH safety' >/dev/null || return 1
+                ufw allow "${port}/udp" comment 'S2S Manager WireGuard' >/dev/null || return 1
+
+                while :; do
+                    banner
+                    section "UFW CONFIGURATION SUMMARY"
+                    echo "Mandatory rules prepared by the manager:"
+                    echo
+                    printf "  TCP %-8s SSH / current remote access\n" "${ssh_port}"
+                    printf "  UDP %-8s WireGuard VPN\n" "${port}"
+                    echo
+                    echo "Existing UFW rules are preserved."
+                    echo
+                    echo "WARNING: Other incoming ports may be blocked after UFW is enabled."
+                    echo
+                    echo "  [1] Add additional firewall rule"
+                    echo "  [2] Review and continue"
+                    echo "  [B] Back (UFW remains disabled)"
+                    echo "  [E] Exit"
+                    echo
+                    read -r -p "Selection: " action
+                    case "${action}" in
+                        1)
+                            read -r -p "Protocol [tcp]: " proto
+                            proto="${proto:-tcp}"; proto="${proto,,}"
+                            [[ "${proto}" == "tcp" || "${proto}" == "udp" ]] || { error "Protocol must be tcp or udp."; pause; continue; }
+                            read -r -p "Port: " extra_port
+                            [[ "${extra_port}" =~ ^[0-9]+$ ]] && ((extra_port>=1 && extra_port<=65535)) || { error "Invalid port."; pause; continue; }
+                            read -r -p "Description [Additional service]: " desc
+                            desc="${desc:-Additional service}"
+                            ufw allow "${extra_port}/${proto}" comment "S2S Manager ${desc}" >/dev/null || return 1
+                            ok "Added ${proto^^} ${extra_port} (${desc})"
+                            pause
+                            ;;
+                        2) break ;;
+                        b|B|0) return 0 ;;
+                        e|E) clear_screen; echo "Bye."; exit 0 ;;
+                    esac
+                done
+
+                banner
+                section "FINAL UFW SAFETY CHECK"
+                ufw status numbered || true
+                echo
+                echo "Current SSH access detected on TCP port ${ssh_port}."
+                local status
+                status="$(ufw status 2>/dev/null || true)"
+                if ! grep -Eq "(^|[[:space:]])${ssh_port}/tcp[[:space:]]+ALLOW" <<< "${status}"; then
+                    error "No matching SSH allow rule found. UFW will NOT be enabled."
+                    pause
+                    return 0
+                fi
+                echo
+                read -r -p "Enable UFW now? [y/N]: " choice
+                if [[ "${choice,,}" == "y" ]]; then
+                    ufw default deny incoming >/dev/null
+                    ufw default allow outgoing >/dev/null
+                    ufw --force enable >/dev/null || return 1
+                    ok "UFW enabled."
+                else
+                    info "UFW installed and rules prepared, but UFW was NOT enabled."
+                fi
+                ;;
+            2)
+                info "Allow incoming UDP ${port} in any external/provider firewall."
+                ;;
+            b|B|0) return 1 ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
+
+    if ! ufw_active; then
+        info "UFW is installed but inactive."
+        echo "The manager will not enable it automatically in this path."
+        echo
+        echo "  [1] Add managed WireGuard rule and keep UFW disabled"
+        echo "  [2] Skip firewall changes"
+        echo "  [B] Back"
+        echo
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1) ;;
+            2) info "Allow UDP ${port} in any external/provider firewall."; return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    if ! wireguard_rule_exists "${port}"; then
+        remove_managed_wireguard_ufw_rules
+        ufw allow "${port}/udp" comment 'S2S Manager WireGuard' >/dev/null || return 1
+    fi
+    ok "Managed WireGuard firewall rule is present (UDP ${port})."
+}
+
+install_wireguard_packages() {
+    local -a need=()
+    package_installed wireguard-tools || need+=(wireguard-tools)
+    package_installed qrencode || need+=(qrencode)
+    package_installed iptables || need+=(iptables)
+    (( ${#need[@]} == 0 )) && { ok "WireGuard packages already installed."; return 0; }
+    info "Installing: ${need[*]}"
+    apt-get update &&
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${need[@]}"
+}
+
+write_wireguard_sysctl() {
+    cat > "${WG_SYSCTL_FILE}" <<'EOF'
+# Managed by IPsec S2S Manager - WireGuard full-tunnel VPN
+net.ipv4.ip_forward = 1
+EOF
+    chmod 644 "${WG_SYSCTL_FILE}"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+}
+
+wireguard_next_client_ip() {
+    load_wireguard_server || return 1
+    [[ "${WG_PREFIX}" == "24" ]] || return 1
+    local base n h candidate id used
+    base="${WG_NETWORK%%/*}"
+    n="$(ipv4_to_int "${base}")"
+    for ((h=2;h<=254;h++)); do
+        candidate="$(int_to_ipv4 "$((n+h))")"
+        used=0
+        while read -r id; do
+            [[ -n "${id}" ]] || continue
+            load_wireguard_client "${id}" || continue
+            [[ "${WG_CLIENT_IP}" == "${candidate}" ]] && { used=1; break; }
+        done < <(list_wireguard_client_ids)
+        ((used==0)) && { printf '%s' "${candidate}"; return 0; }
+    done
+    return 1
+}
+
+
+wireguard_table220_active() {
+    local rules
+    rules="$(ip rule show 2>/dev/null || true)"
+    grep -Eq '(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)' <<< "${rules}"
+}
+
+wireguard_table220_route_ok() {
+    load_wireguard_server || return 1
+    local route
+    route="$(ip route show table 220 "${WG_NETWORK}" 2>/dev/null || true)"
+    grep -Eq "^${WG_NETWORK//./\\.} dev ${WG_INTERFACE}([[:space:]]|$)" <<< "${route}"
+}
+
+wireguard_ensure_table220_route() {
+    load_wireguard_server || return 1
+    wireguard_table220_active || return 0
+    ip route replace "${WG_NETWORK}" dev "${WG_INTERFACE}" table 220 || return 1
+}
+
+wireguard_remove_table220_route() {
+    load_wireguard_server || return 1
+    wireguard_table220_active || return 0
+    ip route del "${WG_NETWORK}" dev "${WG_INTERFACE}" table 220 2>/dev/null || true
+}
+
+wireguard_cleanup_legacy_rules() {
+    load_wireguard_server || return 1
+    local net="${WG_NETWORK}"
+    local public_ip
+    public_ip="$(detect_public_ipv4)"
+
+    # Remove common legacy FORWARD rules that match this WG network exactly.
+    while iptables -C FORWARD -s "${net}" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -s "${net}" -j ACCEPT >/dev/null 2>&1 || break
+    done
+
+    while iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; do
+        # Do not remove broad global rules; only one copy is enough to coexist safely.
+        break
+    done
+
+    # Remove legacy SNAT rules for the WG network to the server public IP.
+    if [[ -n "${public_ip}" ]]; then
+        while iptables -t nat -C POSTROUTING -s "${net}" ! -d "${net}" -j SNAT --to-source "${public_ip}" >/dev/null 2>&1; do
+            iptables -t nat -D POSTROUTING -s "${net}" ! -d "${net}" -j SNAT --to-source "${public_ip}" >/dev/null 2>&1 || break
+        done
+    fi
+
+    # Remove duplicate manager-style MASQUERADE/FORWARD rules before wg-quick restarts.
+    while iptables -C FORWARD -i "${WG_INTERFACE}" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -i "${WG_INTERFACE}" -j ACCEPT >/dev/null 2>&1 || break
+    done
+    while iptables -C FORWARD -o "${WG_INTERFACE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -o "${WG_INTERFACE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || break
+    done
+    while iptables -t nat -C POSTROUTING -s "${net}" -o "${WG_EGRESS_IF}" -j MASQUERADE >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -s "${net}" -o "${WG_EGRESS_IF}" -j MASQUERADE >/dev/null 2>&1 || break
+    done
+}
+
+render_wireguard_server_config() {
+    load_wireguard_server || return 1
+    [[ "${WG_MANAGEMENT}" == "MANAGED" ]] || return 1
+    local private id tmp
+    private="$(cat "${WG_SERVER_KEY}" 2>/dev/null || true)"
+    [[ -n "${private}" ]] || return 1
+    mkdir -p "${WG_CONFIG_DIR}"; chmod 700 "${WG_CONFIG_DIR}"
+    tmp="$(mktemp)"
+    {
+        echo "# Managed by IPsec S2S Manager"
+        echo "[Interface]"
+        printf 'Address = %s/%s\n' "${WG_SERVER_IP}" "${WG_PREFIX}"
+        printf 'ListenPort = %s\n' "${WG_PORT}"
+        printf 'PrivateKey = %s\n' "${private}"
+        printf 'PostUp = iptables -A FORWARD -i %%i -j ACCEPT; iptables -A FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route replace %s dev %%i table 220; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
+        printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %%i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE 2>/dev/null || true; if ip rule show | grep -Eq "(^|[[:space:]])220:.*lookup[[:space:]]+220([[:space:]]|$)"; then ip route del %s dev %%i table 220 2>/dev/null || true; fi\n' "${WG_NETWORK}" "${WG_EGRESS_IF}" "${WG_NETWORK}"
+        while read -r id; do
+            [[ -n "${id}" ]] || continue
+            load_wireguard_client "${id}" || continue
+            echo
+            printf '# Client: %s\n' "${WG_CLIENT_NAME}"
+            echo "[Peer]"
+            printf 'PublicKey = %s\n' "${WG_CLIENT_PUBLIC_KEY}"
+            if [[ -n "${WG_CLIENT_PRESHARED_KEY}" ]]; then
+                printf 'PresharedKey = %s\n' "${WG_CLIENT_PRESHARED_KEY}"
+            fi
+            printf 'AllowedIPs = %s/32\n' "${WG_CLIENT_IP}"
+        done < <(list_wireguard_client_ids)
+    } > "${tmp}"
+    install -m 600 "${tmp}" "${WG_CONFIG}"
+    rm -f "${tmp}"
+}
+
+wireguard_apply() {
+    load_wireguard_server || return 1
+    [[ "${WG_MANAGEMENT}" == "MANAGED" ]] || return 1
+
+    wireguard_cleanup_legacy_rules || true
+    render_wireguard_server_config || return 1
+
+    systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1 || return 1
+    if ! systemctl restart "wg-quick@${WG_INTERFACE}" >/tmp/s2s-manager-wireguard-restart.log 2>&1; then
+        cat /tmp/s2s-manager-wireguard-restart.log 2>/dev/null || true
+        return 1
+    fi
+    wireguard_ensure_table220_route || return 1
+    systemctl is-active --quiet "wg-quick@${WG_INTERFACE}"
+}
+
+# Update only WireGuard peer state without restarting wg0. This preserves
+# existing handshakes, traffic counters and active client sessions.
+wireguard_sync_peers_live() {
+    load_wireguard_server || return 1
+    [[ "${WG_MANAGEMENT}" == "MANAGED" ]] || return 1
+
+    render_wireguard_server_config || return 1
+
+    if ! systemctl is-active --quiet "wg-quick@${WG_INTERFACE}" 2>/dev/null; then
+        wireguard_apply
+        return $?
+    fi
+
+    local stripped
+    stripped="$(mktemp)" || return 1
+    if ! wg-quick strip "${WG_INTERFACE}" > "${stripped}" 2>/tmp/s2s-manager-wireguard-strip.log; then
+        rm -f "${stripped}"
+        return 1
+    fi
+
+    if ! wg syncconf "${WG_INTERFACE}" "${stripped}" >/tmp/s2s-manager-wireguard-sync.log 2>&1; then
+        rm -f "${stripped}"
+        cat /tmp/s2s-manager-wireguard-sync.log 2>/dev/null || true
+        return 1
+    fi
+    rm -f "${stripped}"
+
+    wireguard_ensure_table220_route || return 1
+    return 0
+}
+
+wireguard_server_summary() {
+    load_wireguard_server || return 1
+    local state="inactive" pub="" private=""
+    systemctl is-active --quiet "wg-quick@${WG_INTERFACE}" 2>/dev/null && state="active"
+
+    if command_available wg; then
+        if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
+            # Read-only imports deliberately do not copy/store the server private key.
+            # Read the public key from the live interface instead.
+            pub="$(wg show "${WG_INTERFACE}" public-key 2>/dev/null || true)"
+        elif [[ -f "${WG_SERVER_KEY}" ]]; then
+            private="$(cat "${WG_SERVER_KEY}" 2>/dev/null || true)"
+            [[ -n "${private}" ]] && pub="$(printf '%s' "${private}" | wg pubkey 2>/dev/null || true)"
+        fi
+    fi
+    printf '%-28s %s\n' "Management:" "${WG_MANAGEMENT}"
+    printf '%-28s %s\n' "Service:" "${state}"
+    printf '%-28s %s\n' "Interface:" "${WG_INTERFACE}"
+    printf '%-28s %s\n' "VPN network:" "${WG_NETWORK}"
+    printf '%-28s %s/%s\n' "Server VPN IP:" "${WG_SERVER_IP}" "${WG_PREFIX}"
+    printf '%-28s UDP %s\n' "Listen port:" "${WG_PORT}"
+    printf '%-28s %s\n' "Public endpoint:" "${WG_ENDPOINT}"
+    printf '%-28s %s\n' "Client DNS:" "${WG_DNS}"
+    printf '%-28s %s\n' "Internet egress:" "${WG_EGRESS_IF}"
+    [[ -n "${pub}" ]] && printf '%-28s %s\n' "Server public key:" "${pub}"
+}
+
+wireguard_render_client_export() {
+    local id="$1" server_private server_public out
+    load_wireguard_server || return 1
+    load_wireguard_client "${id}" || return 1
+    server_private="$(cat "${WG_SERVER_KEY}")"
+    server_public="$(printf '%s' "${server_private}" | wg pubkey)" || return 1
+    out="$(wireguard_client_export_file "${id}")"
+    {
+        echo "# WireGuard client generated by IPsec S2S Manager"
+        echo "[Interface]"
+        printf 'PrivateKey = %s\n' "${WG_CLIENT_PRIVATE_KEY}"
+        printf 'Address = %s/32\n' "${WG_CLIENT_IP}"
+        printf 'DNS = %s\n' "${WG_DNS}"
+        echo
+        echo "[Peer]"
+        printf 'PublicKey = %s\n' "${server_public}"
+        if [[ -n "${WG_CLIENT_PRESHARED_KEY}" ]]; then
+            printf 'PresharedKey = %s\n' "${WG_CLIENT_PRESHARED_KEY}"
+        fi
+        printf 'Endpoint = %s:%s\n' "${WG_ENDPOINT}" "${WG_PORT}"
+        echo 'AllowedIPs = 0.0.0.0/0'
+        echo 'PersistentKeepalive = 25'
+    } > "${out}"
+    chmod 600 "${out}"
+}
+
+
+wireguard_existing_configs() {
+    local f
+    shopt -s nullglob
+    for f in /etc/wireguard/*.conf; do
+        [[ -f "${f}" ]] && printf '%s\n' "${f}"
+    done
+    shopt -u nullglob
+}
+
+wireguard_parse_existing_config() {
+    local file="$1"
+    [[ -f "${file}" ]] || return 1
+
+    DISC_WG_FILE="${file}"
+    DISC_WG_INTERFACE="$(basename "${file}" .conf)"
+    DISC_WG_ADDRESS=""
+    DISC_WG_PORT=""
+    DISC_WG_PRIVATE_KEY=""
+    DISC_WG_POSTUP=""
+    DISC_WG_POSTDOWN=""
+    DISC_WG_COMPATIBLE=1
+    DISC_WG_REASON=""
+    DISC_WG_PEER_PUBLIC_KEYS=()
+    DISC_WG_PEER_PSKS=()
+    DISC_WG_PEER_ALLOWED=()
+    DISC_WG_PEER_NAMES=()
+
+    local section="" line key value peer_index=-1 comment_name="" trimmed
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        [[ -z "${trimmed}" ]] && continue
+
+        if [[ "${trimmed}" == \#* ]]; then
+            if [[ "${trimmed}" =~ ^#[[:space:]]*Client:[[:space:]]*(.+)$ ]]; then
+                comment_name="${BASH_REMATCH[1]}"
+            fi
+            continue
+        fi
+
+        case "${trimmed}" in
+            "[Interface]")
+                section="Interface"
+                ;;
+            "[Peer]")
+                section="Peer"
+                ((peer_index += 1))
+                DISC_WG_PEER_PUBLIC_KEYS[peer_index]=""
+                DISC_WG_PEER_PSKS[peer_index]=""
+                DISC_WG_PEER_ALLOWED[peer_index]=""
+                if [[ -n "${comment_name}" ]]; then
+                    DISC_WG_PEER_NAMES[peer_index]="${comment_name}"
+                else
+                    DISC_WG_PEER_NAMES[peer_index]="Imported peer $((peer_index + 1))"
+                fi
+                comment_name=""
+                ;;
+            *=*)
+                key="${trimmed%%=*}"
+                value="${trimmed#*=}"
+                key="${key%"${key##*[![:space:]]}"}"
+                value="${value#"${value%%[![:space:]]*}"}"
+                value="${value%"${value##*[![:space:]]}"}"
+
+                if [[ "${section}" == "Interface" ]]; then
+                    case "${key}" in
+                        Address)
+                            if [[ -z "${DISC_WG_ADDRESS}" ]]; then
+                                DISC_WG_ADDRESS="${value%%,*}"
+                                DISC_WG_ADDRESS="${DISC_WG_ADDRESS//[[:space:]]/}"
+                            fi
+                            ;;
+                        ListenPort) DISC_WG_PORT="${value}" ;;
+                        PrivateKey) DISC_WG_PRIVATE_KEY="${value}" ;;
+                        PostUp) DISC_WG_POSTUP+="${value}"$'\n' ;;
+                        PostDown) DISC_WG_POSTDOWN+="${value}"$'\n' ;;
+                        DNS|MTU|Table|PreUp|PreDown|SaveConfig)
+                            ;;
+                        *)
+                            DISC_WG_COMPATIBLE=0
+                            DISC_WG_REASON="unsupported Interface directive: ${key}"
+                            ;;
+                    esac
+                elif [[ "${section}" == "Peer" && ${peer_index} -ge 0 ]]; then
+                    case "${key}" in
+                        PublicKey) DISC_WG_PEER_PUBLIC_KEYS[peer_index]="${value}" ;;
+                        PresharedKey) DISC_WG_PEER_PSKS[peer_index]="${value}" ;;
+                        AllowedIPs) DISC_WG_PEER_ALLOWED[peer_index]="${value}" ;;
+                        Endpoint|PersistentKeepalive)
+                            # Valid server config directives, but not required for migration.
+                            ;;
+                        *)
+                            DISC_WG_COMPATIBLE=0
+                            DISC_WG_REASON="unsupported Peer directive: ${key}"
+                            ;;
+                    esac
+                fi
+                ;;
+            *)
+                DISC_WG_COMPATIBLE=0
+                DISC_WG_REASON="unrecognized line in configuration"
+                ;;
+        esac
+    done < "${file}"
+
+    if ! valid_cidr "${DISC_WG_ADDRESS}"; then
+        DISC_WG_COMPATIBLE=0
+        DISC_WG_REASON="missing or unsupported IPv4 Address"
+        return 0
+    fi
+
+    local addr_ip="${DISC_WG_ADDRESS%%/*}"
+    local prefix="${DISC_WG_ADDRESS##*/}"
+    if [[ "${prefix}" != "24" ]]; then
+        DISC_WG_COMPATIBLE=0
+        DISC_WG_REASON="manager migration currently requires a /24 WireGuard network"
+    fi
+
+    DISC_WG_SERVER_IP="${addr_ip}"
+    DISC_WG_PREFIX="${prefix}"
+    DISC_WG_NETWORK="$(cidr_normalized "${DISC_WG_ADDRESS}")"
+
+    if [[ -z "${DISC_WG_PORT}" ]] && command_available wg &&
+       ip link show "${DISC_WG_INTERFACE}" >/dev/null 2>&1; then
+        DISC_WG_PORT="$(wg show "${DISC_WG_INTERFACE}" listen-port 2>/dev/null || true)"
+    fi
+    [[ "${DISC_WG_PORT}" =~ ^[0-9]+$ ]] || {
+        DISC_WG_COMPATIBLE=0
+        DISC_WG_REASON="ListenPort could not be determined"
+    }
+
+    [[ -n "${DISC_WG_PRIVATE_KEY}" ]] || {
+        DISC_WG_COMPATIBLE=0
+        DISC_WG_REASON="PrivateKey is not present in the configuration file"
+    }
+
+    local i allowed
+    for i in "${!DISC_WG_PEER_PUBLIC_KEYS[@]}"; do
+        [[ -n "${DISC_WG_PEER_PUBLIC_KEYS[$i]}" ]] || {
+            DISC_WG_COMPATIBLE=0
+            DISC_WG_REASON="peer $((i+1)) has no PublicKey"
+            continue
+        }
+        allowed="${DISC_WG_PEER_ALLOWED[$i]}"
+        if [[ ! "${allowed}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/32$ ]]; then
+            DISC_WG_COMPATIBLE=0
+            DISC_WG_REASON="peer $((i+1)) AllowedIPs is not exactly one IPv4 /32"
+        fi
+    done
+
+    return 0
+}
+
+wireguard_show_discovered_config() {
+    wireguard_parse_existing_config "$1" || return 1
+
+    local active="inactive"
+    ip link show "${DISC_WG_INTERFACE}" >/dev/null 2>&1 && active="active"
+
+    printf '%-28s %s\n' "Config file:" "${DISC_WG_FILE}"
+    printf '%-28s %s\n' "Interface:" "${DISC_WG_INTERFACE}"
+    printf '%-28s %s\n' "Interface state:" "${active}"
+    printf '%-28s %s\n' "VPN address:" "${DISC_WG_ADDRESS:-unknown}"
+    printf '%-28s UDP %s\n' "Listen port:" "${DISC_WG_PORT:-unknown}"
+    printf '%-28s %s\n' "Peers:" "${#DISC_WG_PEER_PUBLIC_KEYS[@]}"
+    if (( DISC_WG_COMPATIBLE == 1 )); then
+        printf '%-28s %s\n' "Manager migration:" "SUPPORTED"
+    else
+        printf '%-28s %s\n' "Manager migration:" "NOT SUPPORTED"
+        printf '%-28s %s\n' "Reason:" "${DISC_WG_REASON}"
+    fi
+
+    echo
+    if [[ -n "${DISC_WG_POSTUP}" || -n "${DISC_WG_POSTDOWN}" ]]; then
+        echo "Existing PostUp/PostDown commands were detected."
+        echo "Read-only import preserves them because it changes nothing."
+        echo "A manager migration replaces them with the manager's full-tunnel NAT/forwarding rules."
+    fi
+}
+
+wireguard_select_existing_config() {
+    local -a configs=()
+    local f i choice
+
+    while read -r f; do
+        [[ -n "${f}" ]] && configs+=("${f}")
+    done < <(wireguard_existing_configs)
+
+    if (( ${#configs[@]} == 0 )); then
+        warn "No existing /etc/wireguard/*.conf configuration was found."
+        pause
+        return 1
+    fi
+
+    echo
+    for i in "${!configs[@]}"; do
+        wireguard_parse_existing_config "${configs[$i]}" || continue
+        printf '  [%d] %-14s %s  UDP %s\n' \
+            "$((i+1))" "${DISC_WG_INTERFACE}" "${DISC_WG_ADDRESS:-unknown}" "${DISC_WG_PORT:-unknown}"
+    done
+    echo
+    echo "B = Back    E = Exit"
+    echo
+    read -r -p "Selection: " choice
+
+    case "${choice}" in
+        b|B|0|"") return 1 ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
+    [[ "${choice}" =~ ^[0-9]+$ ]] || return 1
+    (( choice >= 1 && choice <= ${#configs[@]} )) || return 1
+    SELECTED_WG_EXISTING="${configs[$((choice-1))]}"
+}
+
+wireguard_clear_imported_clients() {
+    rm -f "${WG_CLIENT_DIR}"/*.client 2>/dev/null || true
+    rm -f "${WG_CLIENT_EXPORT_DIR}"/*.conf 2>/dev/null || true
+}
+
+wireguard_import_existing_peers_readonly() {
+    local i id name ip psk
+    wireguard_clear_imported_clients
+
+    for i in "${!DISC_WG_PEER_PUBLIC_KEYS[@]}"; do
+        name="${DISC_WG_PEER_NAMES[$i]}"
+        id="imported-$((i+1))"
+        ip="${DISC_WG_PEER_ALLOWED[$i]%/32}"
+        psk="${DISC_WG_PEER_PSKS[$i]}"
+
+        {
+            printf 'WG_CLIENT_ID=%q\n' "${id}"
+            printf 'WG_CLIENT_NAME=%q\n' "${name}"
+            printf 'WG_CLIENT_IP=%q\n' "${ip}"
+            printf 'WG_CLIENT_PRIVATE_KEY=%q\n' ""
+            printf 'WG_CLIENT_PUBLIC_KEY=%q\n' "${DISC_WG_PEER_PUBLIC_KEYS[$i]}"
+            printf 'WG_CLIENT_PRESHARED_KEY=%q\n' "${psk}"
+            printf 'WG_CLIENT_CREATED_AT=%q\n' "imported"
+        } > "$(wireguard_client_state_file "${id}")"
+        chmod 600 "$(wireguard_client_state_file "${id}")"
+    done
+}
+
+wireguard_import_existing_readonly() {
+    local file="$1"
+    wireguard_parse_existing_config "${file}" || return 1
+
+    local endpoint egress
+    endpoint="$(detect_public_ipv4)"
+    egress="$(detect_default_egress_interface)"
+
+    save_wireguard_server_state \
+        "IMPORTED" "${DISC_WG_INTERFACE}" "${DISC_WG_NETWORK}" "${DISC_WG_SERVER_IP}" \
+        "${DISC_WG_PREFIX}" "${DISC_WG_PORT}" "${endpoint}" "${WG_DNS_DEFAULT}" \
+        "${egress}" "${file}"
+
+    wireguard_import_existing_peers_readonly
+
+    echo
+    ok "Existing WireGuard server imported as READ-ONLY."
+    info "No WireGuard file, interface, firewall rule or running peer was changed."
+    info "Use 'Migrate / take over imported WireGuard server' when you want manager ownership."
+}
+
+wireguard_backup_existing_config() {
+    local file="$1" interface="$2" dir
+    dir="${WG_BACKUP_DIR}/${interface}-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "${dir}"
+    chmod 700 "${dir}"
+
+    cp -a -- "${file}" "${dir}/$(basename "${file}")" || return 1
+    systemctl status "wg-quick@${interface}" --no-pager -l > "${dir}/service-status.txt" 2>&1 || true
+    wg show "${interface}" > "${dir}/wg-show.txt" 2>&1 || true
+    ip -d addr show dev "${interface}" > "${dir}/ip-address.txt" 2>&1 || true
+    ip route show table all > "${dir}/routes.txt" 2>&1 || true
+    if ufw_installed; then
+        ufw status numbered > "${dir}/ufw-status.txt" 2>&1 || true
+    fi
+
+    WG_LAST_MIGRATION_BACKUP="${dir}"
+}
+
+wireguard_migrate_existing_config() {
+    local file="$1"
+    wireguard_parse_existing_config "${file}" || return 1
+
+    banner
+    section "MIGRATE EXISTING WIREGUARD SERVER"
+
+    echo "This converts an existing WireGuard server into manager-owned configuration."
+    echo
+    wireguard_show_discovered_config "${file}"
+    echo
+    echo "The existing server private key and peer public keys are kept."
+    echo "Existing peers are imported, but their CLIENT private keys are not available"
+    echo "on the server and therefore cannot be reconstructed."
+    echo
+    echo "For imported peers:"
+    echo "  • live status and peer removal remain possible after migration"
+    echo "  • QR code / complete client .conf cannot be generated"
+    echo "  • newly created clients have full manager-generated configs and QR codes"
+    echo
+
+    if (( DISC_WG_COMPATIBLE != 1 )); then
+        error "This existing configuration cannot be migrated automatically."
+        printf '%-28s %s\n' "Reason:" "${DISC_WG_REASON}"
+        info "You may still use read-only import."
+        pause
+        return
+    fi
+
+    if [[ "${DISC_WG_INTERFACE}" != "wg0" ]]; then
+        error "Automatic migration currently supports interface wg0 only."
+        info "Read-only import is still available for other WireGuard interfaces."
+        pause
+        return
+    fi
+
+    local endpoint dns egress
+    endpoint="$(detect_public_ipv4)"
+    echo
+    echo "The public endpoint and client DNS are not stored in a WireGuard server config."
+    echo "They are needed only for client configurations generated by the manager."
+    echo
+    read -r -p "Public WireGuard endpoint [${endpoint}]: " endpoint
+    endpoint="${endpoint:-$(detect_public_ipv4)}"
+    if ! valid_ipv4 "${endpoint}" && ! valid_hostname "${endpoint}"; then
+        error "Endpoint must be an IPv4 address or DNS hostname."
+        pause
+        return
+    fi
+
+    read -r -p "DNS server for newly generated clients [${WG_DNS_DEFAULT}]: " dns
+    dns="${dns:-${WG_DNS_DEFAULT}}"
+    valid_ipv4 "${dns}" || { error "DNS must be an IPv4 address."; pause; return; }
+
+    egress="$(detect_default_egress_interface)"
+    [[ -n "${egress}" ]] || { error "Could not detect Internet egress interface."; pause; return; }
+
+    echo
+    section "MIGRATION PLAN"
+    printf '%-28s %s\n' "Source config:" "${file}"
+    printf '%-28s %s\n' "Interface:" "${DISC_WG_INTERFACE}"
+    printf '%-28s %s\n' "VPN network:" "${DISC_WG_NETWORK}"
+    printf '%-28s UDP %s\n' "Listen port:" "${DISC_WG_PORT}"
+    printf '%-28s %s\n' "Existing peers:" "${#DISC_WG_PEER_PUBLIC_KEYS[@]}"
+    printf '%-28s %s\n' "Internet egress:" "${egress}"
+    echo
+    echo "The manager will:"
+    echo "  + create a timestamped backup of the existing WireGuard setup"
+    echo "  + keep the existing server private key"
+    echo "  + keep existing peer public keys / PSKs / /32 client IPs"
+    echo "  + enable IPv4 forwarding"
+    echo "  + replace wg0.conf with manager-owned full-tunnel NAT/forwarding rules"
+    echo "  + remove matching legacy WireGuard NAT/FORWARD rules before restart"
+    echo "  + add the WireGuard VPN network to routing table 220 when S2S policy routing is active"
+    echo "  + restart wg-quick@wg0 briefly"
+    echo "  + optionally manage the UFW WireGuard UDP rule"
+    echo
+    warn "Any custom PostUp/PostDown commands in the old config are NOT copied into the managed config."
+    echo
+    info "If the managed configuration fails to start, the manager automatically restores"
+    info "the configuration backed up immediately before migration and restarts the old setup."
+    echo
+    confirm_yes_no "Migrate this WireGuard server to manager ownership?" "N" || return
+
+    wireguard_backup_existing_config "${file}" "${DISC_WG_INTERFACE}" || {
+        error "Could not create the migration backup. Nothing was changed."
+        pause
+        return
+    }
+
+    printf '%s\n' "${DISC_WG_PRIVATE_KEY}" > "${WG_SERVER_KEY}"
+    chmod 600 "${WG_SERVER_KEY}"
+
+    save_wireguard_server_state \
+        "MANAGED" "${DISC_WG_INTERFACE}" "${DISC_WG_NETWORK}" "${DISC_WG_SERVER_IP}" \
+        "${DISC_WG_PREFIX}" "${DISC_WG_PORT}" "${endpoint}" "${dns}" "${egress}" ""
+
+    wireguard_import_existing_peers_readonly
+
+    write_wireguard_sysctl || {
+        error "Could not enable IPv4 forwarding."
+        info "Backup: ${WG_LAST_MIGRATION_BACKUP}"
+        pause
+        return
+    }
+
+    ensure_wireguard_firewall_rule "${DISC_WG_PORT}" || {
+        warn "Firewall step was cancelled or failed."
+        info "The original WireGuard configuration backup is at:"
+        echo "  ${WG_LAST_MIGRATION_BACKUP}"
+        pause
+        return
+    }
+
+    if wireguard_apply; then
+        echo
+        ok "Existing WireGuard server migrated successfully."
+        printf '%-28s %s\n' "Backup:" "${WG_LAST_MIGRATION_BACKUP}"
+        info "Existing clients keep their current keys and IPs."
+        info "Only newly created clients can show a complete config / QR code in the manager."
+    else
+        error "Managed WireGuard configuration did not start."
+        echo
+        warn "Migration failed. Restoring the WireGuard configuration saved immediately before migration..."
+
+        local backup_config="${WG_LAST_MIGRATION_BACKUP}/$(basename "${file}")"
+        local rollback_ok=1
+
+        if [[ -f "${backup_config}" ]]; then
+            cp -a -- "${backup_config}" "${file}" || rollback_ok=0
+            chmod 600 "${file}" 2>/dev/null || true
+        else
+            rollback_ok=0
+        fi
+
+        # Return manager metadata to the read-only state that existed before migration.
+        save_wireguard_server_state \
+            "IMPORTED" "${DISC_WG_INTERFACE}" "${DISC_WG_NETWORK}" "${DISC_WG_SERVER_IP}" \
+            "${DISC_WG_PREFIX}" "${DISC_WG_PORT}" "${endpoint}" "${dns}" "${egress}" "${file}"
+        wireguard_import_existing_peers_readonly
+        rm -f "${WG_SERVER_KEY}" 2>/dev/null || true
+
+        systemctl reset-failed "wg-quick@${DISC_WG_INTERFACE}" >/dev/null 2>&1 || true
+        if (( rollback_ok == 1 )) && systemctl restart "wg-quick@${DISC_WG_INTERFACE}" >/tmp/s2s-manager-wireguard-rollback.log 2>&1; then
+            ok "Rollback successful. The previous WireGuard configuration is active again."
+            info "Manager state returned to IMPORTED / READ-ONLY."
+            info "Backup kept at: ${WG_LAST_MIGRATION_BACKUP}"
+        else
+            error "Automatic rollback FAILED."
+            info "Backup kept at: ${WG_LAST_MIGRATION_BACKUP}"
+            info "Rollback log: /tmp/s2s-manager-wireguard-rollback.log"
+            warn "WireGuard may currently be offline. Restore the backup manually before retrying."
+        fi
+    fi
+    pause
+}
+
+wireguard_imported_server_menu() {
+    while :; do
+        load_wireguard_server || return
+
+        banner
+        section "IMPORTED WIREGUARD SERVER"
+
+        echo "This WireGuard server is known to the manager but remains READ-ONLY."
+        echo "The existing /etc/wireguard configuration and running interface are unchanged."
+        echo
+        wireguard_server_summary
+        [[ -n "${WG_SOURCE_CONFIG}" ]] && printf '%-28s %s\n' "Source config:" "${WG_SOURCE_CONFIG}"
+        echo
+        echo "  [1] Migrate / take over imported WireGuard server"
+        echo "  [2] Forget read-only import"
+        echo "  [B] Back"
+        echo
+
+        local choice source="${WG_SOURCE_CONFIG}"
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1)
+                [[ -f "${source}" ]] || { error "Source configuration no longer exists."; pause; continue; }
+                wireguard_migrate_existing_config "${source}"
+                return
+                ;;
+            2)
+                echo "This removes only the manager's read-only import metadata."
+                echo "The existing WireGuard server is NOT changed."
+                echo
+                confirm_yes_no "Forget this imported WireGuard server?" "N" || continue
+                rm -f "${WG_SERVER_STATE}"
+                wireguard_clear_imported_clients
+                ok "Read-only import removed. Existing WireGuard configuration was untouched."
+                pause
+                return
+                ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
+
+wireguard_discovery_menu() {
+    banner
+    section "DISCOVER EXISTING WIREGUARD SERVER"
+
+    echo "Scans /etc/wireguard for an existing manually configured WireGuard server."
+    echo "Detection and read-only import do NOT change the running WireGuard setup."
+    echo
+
+    wireguard_select_existing_config || return
+    local file="${SELECTED_WG_EXISTING}"
+
+    banner
+    section "EXISTING WIREGUARD CONFIGURATION"
+    wireguard_show_discovered_config "${file}"
+    echo
+    echo "  [1] Import read-only"
+    echo "      Show it in the manager without changing WireGuard."
+    echo
+    echo "  [2] Migrate / take over"
+    echo "      Back up the existing setup and convert it to manager ownership."
+    echo
+    echo "  [B] Back"
+    echo
+
+    local choice
+    read -r -p "Selection: " choice
+    case "${choice}" in
+        1)
+            wireguard_import_existing_readonly "${file}"
+            pause
+            ;;
+        2)
+            wireguard_migrate_existing_config "${file}"
+            ;;
+    esac
+}
+
+wireguard_setup_new_server() {
+    banner
+    section "WIREGUARD SERVER SETUP"
+    echo "Creates a simple IPv4 full-tunnel WireGuard VPN server."
+    echo "Clients can reach this Debian server and use its Internet connection."
+    echo "Automatic S2S remote-network access is NOT configured in this first version."
+    echo
+
+    if [[ -f "${WG_CONFIG}" && ! -f "${WG_SERVER_STATE}" ]]; then
+        warn "An existing WireGuard configuration was found: ${WG_CONFIG}"
+        echo "It will NOT be overwritten by the new-server setup."
+        echo
+        info "Use the WireGuard discovery/import function instead."
+        pause
+        return
+    fi
+
+    install_wireguard_packages || { error "Package installation failed."; pause; return; }
+
+    local detected endpoint port network prefix base n server_ip dns egress
+    detected="$(detect_public_ipv4)"
+    read -r -p "Public WireGuard endpoint [${detected}]: " endpoint
+    endpoint="${endpoint:-${detected}}"
+    if ! valid_ipv4 "${endpoint}" && ! valid_hostname "${endpoint}"; then
+        error "Endpoint must be an IPv4 address or DNS hostname."; pause; return
+    fi
+
+    read -r -p "WireGuard UDP listen port [${WG_PORT_DEFAULT}]: " port
+    port="${port:-${WG_PORT_DEFAULT}}"
+    [[ "${port}" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { error "Invalid port."; pause; return; }
+    wireguard_udp_port_in_use "${port}" && { error "UDP port ${port} is already in use."; pause; return; }
+
+    read -r -p "WireGuard VPN network [${WG_NETWORK_DEFAULT}]: " network
+    network="${network:-${WG_NETWORK_DEFAULT}}"
+    valid_cidr "${network}" || { error "Invalid IPv4 CIDR."; pause; return; }
+    prefix="${network##*/}"
+    [[ "${prefix}" == "24" ]] || { error "This first WireGuard version supports a /24 VPN network."; pause; return; }
+    network="$(cidr_normalized "${network}")"
+    if check_network_conflict "${network}" "" "${WG_INTERFACE_DEFAULT}"; then
+        show_network_conflict "${network}"; pause; return
+    fi
+    base="${network%%/*}"; n="$(ipv4_to_int "${base}")"; server_ip="$(int_to_ipv4 "$((n+1))")"
+
+    read -r -p "DNS server for clients [${WG_DNS_DEFAULT}]: " dns
+    dns="${dns:-${WG_DNS_DEFAULT}}"
+    valid_ipv4 "${dns}" || { error "DNS must be an IPv4 address."; pause; return; }
+
+    egress="$(detect_default_egress_interface)"
+    [[ -n "${egress}" ]] || { error "Could not detect Internet egress interface."; pause; return; }
+
+    section "WIREGUARD SERVER PLAN"
+    printf '%-28s %s\n' "Public endpoint:" "${endpoint}"
+    printf '%-28s UDP %s\n' "Listen port:" "${port}"
+    printf '%-28s %s\n' "VPN network:" "${network}"
+    printf '%-28s %s/24\n' "Server VPN IP:" "${server_ip}"
+    printf '%-28s %s\n' "Client DNS:" "${dns}"
+    printf '%-28s %s\n' "Internet egress:" "${egress}"
+    echo
+    echo "Changes: IPv4 forwarding, wg0, Internet NAT, wg-quick service, optional UFW rule"
+    echo "and a table 220 route for the WireGuard VPN network when S2S policy routing is active."
+    echo
+    confirm_yes_no "Create the WireGuard server now?" "N" || return
+
+    wg genkey > "${WG_SERVER_KEY}" || { error "Key generation failed."; pause; return; }
+    chmod 600 "${WG_SERVER_KEY}"
+    save_wireguard_server_state "MANAGED" "${WG_INTERFACE_DEFAULT}" "${network}" "${server_ip}" "24" "${port}" "${endpoint}" "${dns}" "${egress}" ""
+    write_wireguard_sysctl || { error "Could not enable IPv4 forwarding."; pause; return; }
+    ensure_wireguard_firewall_rule "${port}" || { warn "Firewall setup cancelled/failed; server state was kept."; pause; return; }
+
+    if wireguard_apply; then
+        ok "WireGuard full-tunnel server is running."
+        info "Next: create a client with 'Manage WireGuard clients'."
+    else
+        error "WireGuard could not be started."
+    fi
+    pause
+}
+
+wireguard_change_server_settings() {
+    load_wireguard_server || return
+    banner
+    section "CHANGE WIREGUARD SERVER SETTINGS"
+    echo "Changes the public endpoint, listen port or client DNS."
+    echo "The VPN network and server key remain unchanged."
+    echo
+    local endpoint port dns old_port="${WG_PORT}"
+
+    read -r -p "Public endpoint [${WG_ENDPOINT}]: " endpoint; endpoint="${endpoint:-${WG_ENDPOINT}}"
+    if ! valid_ipv4 "${endpoint}" && ! valid_hostname "${endpoint}"; then error "Invalid endpoint."; pause; return; fi
+    read -r -p "UDP listen port [${WG_PORT}]: " port; port="${port:-${WG_PORT}}"
+    [[ "${port}" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { error "Invalid port."; pause; return; }
+    [[ "${port}" != "${old_port}" ]] && wireguard_udp_port_in_use "${port}" && { error "UDP port ${port} is already in use."; pause; return; }
+    read -r -p "Client DNS [${WG_DNS}]: " dns; dns="${dns:-${WG_DNS}}"
+    valid_ipv4 "${dns}" || { error "Invalid DNS IPv4."; pause; return; }
+
+    confirm_yes_no "Apply these settings?" "N" || return
+    save_wireguard_server_state "MANAGED" "${WG_INTERFACE}" "${WG_NETWORK}" "${WG_SERVER_IP}" "${WG_PREFIX}" "${port}" "${endpoint}" "${dns}" "${WG_EGRESS_IF}" ""
+    [[ "${port}" != "${old_port}" ]] && ensure_wireguard_firewall_rule "${port}" || true
+
+    local id
+    while read -r id; do [[ -n "${id}" ]] && wireguard_render_client_export "${id}" || true; done < <(list_wireguard_client_ids)
+    wireguard_apply && ok "WireGuard settings applied." || error "WireGuard restart failed."
+    pause
+}
+
+wireguard_server_menu() {
+    if ! wireguard_server_known; then
+        banner
+        section "WIREGUARD SERVER"
+
+        echo "Set up a new WireGuard server or detect an existing manual installation."
+        echo
+        if wireguard_existing_configs | grep -q .; then
+            ok "Existing /etc/wireguard configuration detected."
+        else
+            info "No existing /etc/wireguard/*.conf configuration detected."
+        fi
+        echo
+        echo "  [1] Create new manager-owned WireGuard server"
+        echo "  [2] Discover / import existing WireGuard server"
+        echo "  [B] Back"
+        echo
+
+        local first_choice
+        read -r -p "Selection: " first_choice
+        case "${first_choice}" in
+            1) wireguard_setup_new_server ;;
+            2) wireguard_discovery_menu ;;
+        esac
+        return
+    fi
+
+    if wireguard_server_imported; then
+        wireguard_imported_server_menu
+        return
+    fi
+
+    load_wireguard_server || return
+    banner
+    section "WIREGUARD SERVER"
+    echo "Manages the local full-tunnel WireGuard VPN server."
+    echo "Internet through this server is supported; automatic S2S access is not."
+    echo
+    wireguard_server_summary
+    echo
+    echo "  [1] Change endpoint / port / client DNS"
+    echo "  [2] Restart / re-apply WireGuard server"
+    echo "      Regenerates manager-owned wg0 configuration and routing/NAT rules."
+    echo "  [B] Back"
+    echo
+    local c
+    read -r -p "Selection: " c
+    case "${c}" in
+        1) wireguard_change_server_settings ;;
+        2) wireguard_apply && ok "WireGuard restarted." || error "Restart failed."; pause ;;
+    esac
+}
+
+wireguard_menu() {
+    while :; do
+        banner
+        section "WIREGUARD"
+
+        echo "Set up and manage the local full-tunnel WireGuard VPN server."
+        echo
+        echo "  [1] WireGuard server setup"
+        echo "  [2] Manage WireGuard clients"
+        echo "  [3] WireGuard status / diagnostics"
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+
+        local c
+        read -r -p "Selection: " c
+        case "${c}" in
+            1) wireguard_server_menu ;;
+            2) wireguard_clients_menu ;;
+            3) wireguard_status ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
+
+wireguard_add_client() {
+    wireguard_server_managed || { warn "Configure WireGuard server first."; pause; return; }
+    load_wireguard_server || return
+    banner
+    section "ADD WIREGUARD CLIENT"
+    echo "Creates a full-tunnel IPv4 client (AllowedIPs = 0.0.0.0/0)."
+    echo
+    local name id base n=2 ip private public psk
+    read -r -p "Client display name: " name
+    [[ -n "${name}" ]] || { error "Client name required."; pause; return; }
+    base="$(wireguard_safe_client_id "${name}")"; id="${base}"
+    while [[ -e "$(wireguard_client_state_file "${id}")" ]]; do id="${base}-${n}"; ((n+=1)); done
+    ip="$(wireguard_next_client_ip)" || { error "No free client IP."; pause; return; }
+    private="$(wg genkey)" || return
+    public="$(printf '%s' "${private}" | wg pubkey)" || return
+    psk="$(wg genpsk)" || return
+    {
+        printf 'WG_CLIENT_ID=%q\n' "${id}"
+        printf 'WG_CLIENT_NAME=%q\n' "${name}"
+        printf 'WG_CLIENT_IP=%q\n' "${ip}"
+        printf 'WG_CLIENT_PRIVATE_KEY=%q\n' "${private}"
+        printf 'WG_CLIENT_PUBLIC_KEY=%q\n' "${public}"
+        printf 'WG_CLIENT_PRESHARED_KEY=%q\n' "${psk}"
+        printf 'WG_CLIENT_CREATED_AT=%q\n' "$(date -Is)"
+    } > "$(wireguard_client_state_file "${id}")"
+    chmod 600 "$(wireguard_client_state_file "${id}")"
+    wireguard_render_client_export "${id}" || { error "Could not create client config."; pause; return; }
+    wireguard_sync_peers_live || { error "Client saved, but live WireGuard update failed."; pause; return; }
+    ok "WireGuard client created."
+    printf '%-28s %s\n' "Client:" "${name}"
+    printf '%-28s %s\n' "VPN IP:" "${ip}"
+    printf '%-28s %s\n' "Config file:" "$(wireguard_client_export_file "${id}")"
+    pause
+}
+
+select_wireguard_client() {
+    local -a ids=(); local id i c
+    while read -r id; do [[ -n "${id}" ]] && ids+=("${id}"); done < <(list_wireguard_client_ids)
+    (( ${#ids[@]} > 0 )) || { warn "No WireGuard clients configured."; pause; return 1; }
+    echo
+    for i in "${!ids[@]}"; do
+        load_wireguard_client "${ids[$i]}" || continue
+        printf '  [%d] %-24s %s\n' "$((i+1))" "${WG_CLIENT_NAME}" "${WG_CLIENT_IP}"
+    done
+    echo; echo "B = Back"; read -r -p "Selection: " c
+    [[ "${c}" =~ ^[0-9]+$ ]] && ((c>=1 && c<=${#ids[@]})) || return 1
+    SELECTED_WG_CLIENT="${ids[$((c-1))]}"
+}
+
+wireguard_show_client_config() {
+    select_wireguard_client || return
+    load_wireguard_client "${SELECTED_WG_CLIENT}" || return
+    if [[ -z "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
+        banner
+        section "WIREGUARD CLIENT CONFIGURATION"
+        warn "This client was imported from the server-side WireGuard configuration."
+        echo "Its private key is not stored on the server and cannot be reconstructed."
+        echo "Therefore a complete client configuration cannot be generated."
+        pause
+        return
+    fi
+    wireguard_render_client_export "${SELECTED_WG_CLIENT}" || return
+    banner; section "WIREGUARD CLIENT CONFIGURATION"
+    warn "This configuration contains private key material."
+    printf '%-28s %s\n' "Client:" "${WG_CLIENT_NAME}"
+    printf '%-28s %s\n' "File:" "$(wireguard_client_export_file "${SELECTED_WG_CLIENT}")"
+    echo; cat "$(wireguard_client_export_file "${SELECTED_WG_CLIENT}")"; pause
+}
+
+wireguard_show_client_qr() {
+    select_wireguard_client || return
+    local id="${SELECTED_WG_CLIENT}"
+    load_wireguard_client "${id}" || return
+
+    banner
+    section "WIREGUARD CLIENT QR CODE"
+
+    if [[ -z "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
+        warn "This client was imported from the server-side WireGuard configuration."
+        echo "Its private key is not stored on the server and cannot be reconstructed."
+        echo "Therefore a complete client QR code cannot be generated."
+        pause
+        return
+    fi
+
+    local export_file="${WG_CLIENT_EXPORT_DIR}/${id}.conf"
+    if [[ ! -f "${export_file}" ]]; then
+        wireguard_render_client_export "${id}" || {
+            error "Could not generate the WireGuard client configuration."
+            pause
+            return
+        }
+    fi
+
+    if ! command -v qrencode >/dev/null 2>&1; then
+        echo "The 'qrencode' package is required to display WireGuard client QR codes."
+        echo "It is currently not installed."
+        echo
+        echo "Installing qrencode is optional and does not change the WireGuard server configuration."
+        echo
+        echo "  [1] Install qrencode"
+        echo "  [B] Back"
+        echo
+
+        local choice
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1)
+                if ! command -v apt-get >/dev/null 2>&1; then
+                    error "Automatic installation is only supported on systems with apt-get."
+                    info "Install the 'qrencode' package manually and try again."
+                    pause
+                    return
+                fi
+
+                echo
+                info "Installing qrencode..."
+                if DEBIAN_FRONTEND=noninteractive apt-get update &&
+                   DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode; then
+                    if ! command -v qrencode >/dev/null 2>&1; then
+                        error "qrencode installation completed, but the command is still unavailable."
+                        pause
+                        return
+                    fi
+                    ok "qrencode installed successfully."
+                    echo
+                else
+                    error "Could not install qrencode."
+                    info "No WireGuard configuration was changed."
+                    pause
+                    return
+                fi
+                ;;
+            b|B|0|"")
+                return
+                ;;
+            *)
+                error "Invalid selection."
+                sleep 1
+                return
+                ;;
+        esac
+    fi
+
+    echo "Scan with the WireGuard app. This QR code contains the client's private key."
+    echo
+    if ! qrencode -t ansiutf8 < "${export_file}"; then
+        error "Could not render the WireGuard client QR code."
+    fi
+    pause
+}
+
+
+wireguard_rename_client() {
+    select_wireguard_client || return
+    local id="${SELECTED_WG_CLIENT}"
+    load_wireguard_client "${id}" || return
+
+    banner
+    section "RENAME WIREGUARD CLIENT"
+
+    echo "Changes only the client display name stored by the manager."
+    echo "WireGuard keys, VPN IP, AllowedIPs and the live tunnel are not changed."
+    echo
+    printf '%-28s %s\n' "Current name:" "${WG_CLIENT_NAME}"
+    printf '%-28s %s\n' "VPN IP:" "${WG_CLIENT_IP}"
+    echo
+
+    local new_name
+    read -r -p "New client display name: " new_name
+    [[ -n "${new_name}" ]] || {
+        warn "No name entered. Nothing changed."
+        pause
+        return
+    }
+
+    if [[ "${new_name}" == "${WG_CLIENT_NAME}" ]]; then
+        info "The new name is identical to the current name. Nothing changed."
+        pause
+        return
+    fi
+
+    local other
+    while read -r other; do
+        [[ -n "${other}" ]] || continue
+        [[ "${other}" == "${id}" ]] && continue
+        load_wireguard_client "${other}" || continue
+        if [[ "${WG_CLIENT_NAME}" == "${new_name}" ]]; then
+            error "Another WireGuard client already uses the display name '${new_name}'."
+            pause
+            return
+        fi
+    done < <(list_wireguard_client_ids)
+
+    load_wireguard_client "${id}" || return
+
+    local f
+    f="$(wireguard_client_state_file "${id}")"
+
+    {
+        printf 'WG_CLIENT_ID=%q\n' "${WG_CLIENT_ID}"
+        printf 'WG_CLIENT_NAME=%q\n' "${new_name}"
+        printf 'WG_CLIENT_IP=%q\n' "${WG_CLIENT_IP}"
+        printf 'WG_CLIENT_PRIVATE_KEY=%q\n' "${WG_CLIENT_PRIVATE_KEY}"
+        printf 'WG_CLIENT_PUBLIC_KEY=%q\n' "${WG_CLIENT_PUBLIC_KEY}"
+        printf 'WG_CLIENT_PRESHARED_KEY=%q\n' "${WG_CLIENT_PRESHARED_KEY}"
+        printf 'WG_CLIENT_CREATED_AT=%q\n' "${WG_CLIENT_CREATED_AT}"
+    } > "${f}"
+    chmod 600 "${f}"
+
+    # Managed client export remains technically unchanged, but refresh the comment/header.
+    if [[ -n "${WG_CLIENT_PRIVATE_KEY:-}" && "${WG_MANAGEMENT}" == "MANAGED" ]]; then
+        wireguard_render_client_export "${id}" || true
+    fi
+
+    ok "WireGuard client display name changed."
+    printf '%-28s %s\n' "New name:" "${new_name}"
+    pause
+}
+
+
+wireguard_show_client_export_instructions() {
+    select_wireguard_client || return
+    local id="${SELECTED_WG_CLIENT}"
+    load_wireguard_client "${id}" || return
+
+    banner
+    section "EXPORT / TRANSFER WIREGUARD CLIENT"
+
+    if [[ -z "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
+        warn "This client was imported from an existing WireGuard server configuration."
+        echo "Its private key is not stored on the server and cannot be reconstructed."
+        echo "Therefore no complete client configuration file is available for export."
+        pause
+        return
+    fi
+
+    wireguard_render_client_export "${id}" || {
+        error "Could not generate the WireGuard client configuration."
+        pause
+        return
+    }
+
+    load_wireguard_server || return
+
+    local export_file
+    export_file="$(wireguard_client_export_file "${id}")"
+
+    local ssh_port="22"
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION}")"
+    fi
+    [[ "${ssh_port}" =~ ^[0-9]+$ ]] || ssh_port="22"
+
+    local ssh_host="${WG_ENDPOINT}"
+    local ssh_user="root"
+
+    printf '%-28s %s\n' "Client:" "${WG_CLIENT_NAME}"
+    printf '%-28s %s\n' "VPN IP:" "${WG_CLIENT_IP}"
+    printf '%-28s %s\n' "Config file:" "${export_file}"
+    printf '%-28s %s\n' "SSH server:" "${ssh_host}"
+    printf '%-28s %s\n' "SSH port:" "${ssh_port}"
+    echo
+
+    echo "Download the configuration FROM your computer."
+    echo "The server does not need access to your computer."
+    echo
+
+    section "MACOS / LINUX"
+    echo "Run this command in Terminal:"
+    echo
+    if [[ "${ssh_port}" == "22" ]]; then
+        printf 'scp %s@%s:%q ~/Downloads/\n' "${ssh_user}" "${ssh_host}" "${export_file}"
+    else
+        printf 'scp -P %s %s@%s:%q ~/Downloads/\n' "${ssh_port}" "${ssh_user}" "${ssh_host}" "${export_file}"
+    fi
+    echo
+    echo "The file will be saved in your Downloads folder."
+
+    echo
+    section "WINDOWS POWERSHELL"
+    echo "Modern Windows versions can use the built-in OpenSSH scp command when"
+    echo "the 'OpenSSH Client' optional feature is installed."
+    echo
+    echo "Run this command in PowerShell:"
+    echo
+    if [[ "${ssh_port}" == "22" ]]; then
+        printf 'scp %s@%s:%s "$HOME\\Downloads\\"\n' "${ssh_user}" "${ssh_host}" "${export_file}"
+    else
+        printf 'scp -P %s %s@%s:%s "$HOME\\Downloads\\"\n' "${ssh_port}" "${ssh_user}" "${ssh_host}" "${export_file}"
+    fi
+    echo
+    echo "If Windows reports that 'scp' is unknown, install the Windows"
+    echo "'OpenSSH Client' optional feature or use an SFTP client such as WinSCP."
+    echo
+    printf 'SFTP server:                %s\n' "${ssh_host}"
+    printf 'SFTP port:                  %s\n' "${ssh_port}"
+    printf 'SFTP user:                  %s\n' "${ssh_user}"
+    printf 'Remote file:                %s\n' "${export_file}"
+
+    echo
+    warn "The exported .conf file contains the client's private WireGuard key"
+    warn "and may also contain a preshared key. Treat it like a password."
+    pause
+}
+
+wireguard_remove_client() {
+    select_wireguard_client || return
+    load_wireguard_client "${SELECTED_WG_CLIENT}" || return
+    banner; section "REMOVE WIREGUARD CLIENT"
+    printf '%-28s %s\n' "Client:" "${WG_CLIENT_NAME}"
+    printf '%-28s %s\n' "VPN IP:" "${WG_CLIENT_IP}"
+    echo; confirm_yes_no "Remove this client from WireGuard?" "N" || return
+    rm -f "$(wireguard_client_state_file "${SELECTED_WG_CLIENT}")" "$(wireguard_client_export_file "${SELECTED_WG_CLIENT}")"
+    wireguard_sync_peers_live && ok "Client removed." || error "Client removed from state, but live WireGuard update failed."
+    pause
+}
+
+wireguard_clients_menu() {
+    wireguard_server_known || {
+        banner
+        section "WIREGUARD CLIENTS"
+        warn "Configure or import a WireGuard server first."
+        pause
+        return
+    }
+
+    while :; do
+        load_wireguard_server || return
+
+        banner
+        section "WIREGUARD CLIENTS"
+
+        if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
+            echo "The WireGuard server is imported READ-ONLY."
+            echo "Existing peers are shown below, but client changes require migration."
+        else
+            echo "Manage full-tunnel WireGuard clients."
+        fi
+        echo
+
+        local id count=0 dump peer handshake now age hs type
+        dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
+        now="$(date +%s)"
+
+        printf '%-4s %-24s %-15s %-12s %-18s\n' "#" "Name" "VPN IP" "Type" "Handshake"
+        printf '%-4s %-24s %-15s %-12s %-18s\n' "──" "──────────────────────" "──────────────" "──────────" "────────────────"
+
+        while read -r id; do
+            [[ -n "${id}" ]] || continue
+            load_wireguard_client "${id}" || continue
+            ((count += 1))
+            [[ -n "${WG_CLIENT_PRIVATE_KEY:-}" ]] && type="MANAGED" || type="IMPORTED"
+
+            peer="$(awk -F'\t' -v p="${WG_CLIENT_PUBLIC_KEY}" '$1==p {print; exit}' <<< "${dump}")"
+            handshake=0
+            [[ -n "${peer}" ]] && handshake="$(cut -f5 <<< "${peer}")"
+            if [[ "${handshake}" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
+                age=$((now - handshake))
+                hs="$(human_duration "${age}") ago"
+            else
+                hs="Never"
+            fi
+
+            printf '%-4s %-24s %-15s %-12s %-18s\n' \
+                "${count}" "${WG_CLIENT_NAME:0:24}" "${WG_CLIENT_IP}" "${type}" "${hs}"
+        done < <(list_wireguard_client_ids)
+
+        (( count == 0 )) && printf '%s\n' "     No WireGuard clients configured."
+        echo
+
+        if [[ "${WG_MANAGEMENT}" == "IMPORTED" ]]; then
+            info "Imported peers are read-only."
+            info "Their client private keys are not stored on the server, so complete configs/QR codes cannot be recreated."
+            info "Use 'WireGuard server setup' -> 'Migrate / take over imported WireGuard server' to manage the server."
+            pause
+            return
+        fi
+
+        echo "  [1] Add client"
+        echo "  [2] Show client configuration"
+        echo "  [3] Show client QR code"
+        echo "  [4] Rename client display name"
+        echo "  [5] Export / transfer client configuration"
+        echo "  [6] Remove client"
+        echo "  [B] Back"
+        echo
+        local c
+        read -r -p "Selection: " c
+        case "${c}" in
+            1) wireguard_add_client ;;
+            2) wireguard_show_client_config ;;
+            3) wireguard_show_client_qr ;;
+            4) wireguard_rename_client ;;
+            5) wireguard_show_client_export_instructions ;;
+            6) wireguard_remove_client ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+        esac
+        # Child actions pause themselves. Redraw this WireGuard client menu afterwards.
+    done
+}
+
+wireguard_status() {
+    banner; section "WIREGUARD STATUS / DIAGNOSTICS"
+    echo "Read-only status, handshakes and traffic counters."
+    echo
+    wireguard_server_known || { warn "No WireGuard server is configured/imported in the manager."; pause; return; }
+    load_wireguard_server || return
+    wireguard_server_summary
+    printf '%-28s %s\n' "IPv4 forwarding:" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
+
+    if wireguard_table220_active; then
+        if wireguard_table220_route_ok; then
+            ok "Routing table 220: ${WG_NETWORK} -> ${WG_INTERFACE}"
+        else
+            error "Routing table 220 is active, but ${WG_NETWORK} is not routed to ${WG_INTERFACE}."
+            info "Full-tunnel return traffic may be sent to the wrong interface."
+        fi
+    else
+        info "Routing table 220 policy is not active; no WireGuard table 220 route is required."
+    fi
+
+    echo; section "CLIENTS"
+    local dump now id peer h rx tx age hs
+    dump="$(wg show "${WG_INTERFACE}" dump 2>/dev/null || true)"
+    now="$(date +%s)"
+    printf '%-22s %-15s %-18s %-12s %-12s\n' "Name" "VPN IP" "Handshake" "RX" "TX"
+    while read -r id; do
+        [[ -n "${id}" ]] || continue
+        load_wireguard_client "${id}" || continue
+        peer="$(awk -F'\t' -v p="${WG_CLIENT_PUBLIC_KEY}" '$1==p{print;exit}' <<< "${dump}")"
+        h=0; rx=0; tx=0
+        if [[ -n "${peer}" ]]; then h="$(cut -f5 <<< "${peer}")"; rx="$(cut -f6 <<< "${peer}")"; tx="$(cut -f7 <<< "${peer}")"; fi
+        if [[ "${h}" =~ ^[0-9]+$ ]] && ((h>0)); then age=$((now-h)); hs="$(human_duration "${age}") ago"; else hs="Never"; fi
+        printf '%-22s %-15s %-18s %-12s %-12s\n' "${WG_CLIENT_NAME:0:22}" "${WG_CLIENT_IP}" "${hs}" "$(human_bytes "${rx}")" "$(human_bytes "${tx}")"
+    done < <(list_wireguard_client_ids)
+    echo; section "LIVE WG OUTPUT"
+    wg show "${WG_INTERFACE}" 2>/dev/null || warn "WireGuard interface is not active."
+    echo
+    if ufw_installed; then
+        wireguard_rule_exists "${WG_PORT}" && ok "UFW WireGuard rule present (UDP ${WG_PORT})." || warn "Managed UFW WireGuard rule missing."
+    else
+        info "UFW not installed; check provider firewall for UDP ${WG_PORT}."
+    fi
+    pause
+}
+
+
 show_system_status() {
     banner
     section "SYSTEM STATUS"
@@ -7557,6 +9264,7 @@ main_menu() {
 
         local -a menu_system=(
             "  [20] Show system status"
+            "  [21] WireGuard"
         )
 
         render_menu_pair \
@@ -7569,7 +9277,7 @@ main_menu() {
 
         render_menu_pair \
             "EXPORT / TRANSFER" "${C_GREEN}" menu_export \
-            "SYSTEM" "${C_CYAN}" menu_system
+            "SYSTEM / WIREGUARD" "${C_CYAN}" menu_system
 
         echo
         echo "  [E] Exit"
@@ -7599,6 +9307,7 @@ main_menu() {
             18) transfer_debian_peer_bundle ;;
             19) import_debian_peer_bundle ;;
             20) show_system_status ;;
+            21) wireguard_menu ;;
             [eE]|0) clear_screen; echo "Bye."; exit 0 ;;
             *) error "Invalid selection."; sleep 1 ;;
         esac
@@ -7612,10 +9321,28 @@ main_menu() {
 ensure_root
 init_state_dirs
 
+WG_STATE_RECONCILED=0
+if wireguard_reconcile_management_state; then
+    :
+else
+    rc=$?
+    if [[ "${rc}" == "2" ]]; then
+        WG_STATE_RECONCILED=1
+    fi
+fi
+
 if repair_peer_type_state_bug; then
     echo
     ok "Recovered Debian peer type metadata from an existing peer bundle."
     info "This repairs tunnel state written by versions 0.40-test through 0.44-test."
+    sleep 2
+fi
+
+if [[ "${WG_STATE_RECONCILED:-0}" == "1" ]]; then
+    echo
+    warn "WireGuard manager state said MANAGED, but the current wg0.conf is not manager-generated."
+    info "The live WireGuard configuration was NOT changed."
+    info "Manager state was safely returned to IMPORTED / READ-ONLY."
     sleep 2
 fi
 
