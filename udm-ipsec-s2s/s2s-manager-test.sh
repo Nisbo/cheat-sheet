@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.56-test"
+VERSION="0.57-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -321,7 +321,9 @@ debian_major_version() {
 }
 
 package_installed() {
-    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
+    local status
+    status="$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true)"
+    grep -q '^install ok installed$' <<< "${status}"
 }
 
 missing_packages() {
@@ -373,7 +375,10 @@ ufw_installed() {
 }
 
 ufw_active() {
-    ufw_installed && ufw status 2>/dev/null | grep -q '^Status: active'
+    local status
+    ufw_installed || return 1
+    status="$(ufw status 2>/dev/null || true)"
+    grep -q '^Status: active' <<< "${status}"
 }
 
 preflight_ready() {
@@ -604,11 +609,11 @@ EOF
     fi
 
     echo
-    if journalctl -u strongswan --since "1 minute ago" --no-pager |
-       grep -qi "failed to load"; then
+    local recent_strongswan
+    recent_strongswan="$(journalctl -u strongswan --since "1 minute ago" --no-pager 2>/dev/null || true)"
+    if grep -qi "failed to load" <<< "${recent_strongswan}"; then
         warn "Recent strongSwan plugin load errors were found:"
-        journalctl -u strongswan --since "1 minute ago" --no-pager |
-            grep -i "failed to load"
+        grep -i "failed to load" <<< "${recent_strongswan}"
     else
         ok "No recent strongSwan plugin load errors."
     fi
@@ -782,6 +787,248 @@ valid_tunnel_name() {
 
 valid_auth_id() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]]
+}
+
+# ==============================================================================
+# Safe external key/value parsing
+# ==============================================================================
+
+decode_printf_q_value() {
+    local raw="$1"
+    local out="" body="" ch="" next="" esc="" digits=""
+    local i=0 len=0 j=0 max=0
+
+    # printf %q uses '' for the empty string.
+    if [[ "${raw}" == "''" ]]; then
+        printf ''
+        return 0
+    fi
+
+    # ANSI-C quoted form used by printf %q for e.g. UTF-8/control bytes.
+    if [[ "${raw}" == "\$'"*"'" ]]; then
+        body="${raw:2:${#raw}-3}"
+        len=${#body}
+
+        while (( i < len )); do
+            ch="${body:i:1}"
+            if [[ "${ch}" != '\' ]]; then
+                out+="${ch}"
+                ((i += 1))
+                continue
+            fi
+
+            ((i += 1))
+            (( i < len )) || return 1
+            esc="${body:i:1}"
+
+            case "${esc}" in
+                a) out+=$'\a'; ((i += 1)) ;;
+                b) out+=$'\b'; ((i += 1)) ;;
+                e|E) out+=$'\e'; ((i += 1)) ;;
+                f) out+=$'\f'; ((i += 1)) ;;
+                n) out+=$'\n'; ((i += 1)) ;;
+                r) out+=$'\r'; ((i += 1)) ;;
+                t) out+=$'\t'; ((i += 1)) ;;
+                v) out+=$'\v'; ((i += 1)) ;;
+                \\) out+='\' ; ((i += 1)) ;;
+                \') out+="'" ; ((i += 1)) ;;
+                \") out+='"' ; ((i += 1)) ;;
+                x)
+                    ((i += 1))
+                    digits=""
+                    for ((j=0; j<2 && i<len; j++)); do
+                        ch="${body:i:1}"
+                        [[ "${ch}" =~ ^[0-9A-Fa-f]$ ]] || break
+                        digits+="${ch}"
+                        ((i += 1))
+                    done
+                    [[ -n "${digits}" ]] || return 1
+                    printf -v ch '%b' "\\x${digits}"
+                    out+="${ch}"
+                    ;;
+                [0-7])
+                    digits="${esc}"
+                    ((i += 1))
+                    for ((j=1; j<3 && i<len; j++)); do
+                        ch="${body:i:1}"
+                        [[ "${ch}" =~ ^[0-7]$ ]] || break
+                        digits+="${ch}"
+                        ((i += 1))
+                    done
+                    printf -v ch '%b' "\\${digits}"
+                    out+="${ch}"
+                    ;;
+                *)
+                    # Unknown ANSI-C escape: reject instead of guessing.
+                    return 1
+                    ;;
+            esac
+        done
+
+        printf '%s' "${out}"
+        return 0
+    fi
+
+    # Normal printf %q form: shell metacharacters are escaped with a backslash.
+    # Decode backslash-next-char literally; never execute the result.
+    len=${#raw}
+    while (( i < len )); do
+        ch="${raw:i:1}"
+        if [[ "${ch}" == '\' ]]; then
+            ((i += 1))
+            (( i < len )) || return 1
+            next="${raw:i:1}"
+            out+="${next}"
+            ((i += 1))
+        else
+            out+="${ch}"
+            ((i += 1))
+        fi
+    done
+
+    printf '%s' "${out}"
+}
+
+safe_assignment_value() {
+    local file="$1"
+    local wanted="$2"
+    local line="" found=0 raw=""
+
+    [[ -f "${file}" ]] || return 1
+    [[ "${wanted}" =~ ^[A-Z0-9_]+$ ]] || return 1
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ "${line}" == "${wanted}="* ]] || continue
+        ((found += 1))
+        (( found == 1 )) || return 1
+        raw="${line#*=}"
+    done < "${file}"
+
+    (( found == 1 )) || return 1
+    decode_printf_q_value "${raw}"
+}
+
+read_external_tunnel_config() {
+    local file="$1"
+    local line key raw value
+    local -A seen=()
+
+    [[ -f "${file}" ]] || return 1
+
+    unset EXT_NAME EXT_DISPLAY_NAME EXT_PUBLIC_IP EXT_AUTH_ID EXT_VTI_INTERFACE EXT_VTI_KEY
+    unset EXT_VTI_NETWORK EXT_DEBIAN_VTI_IP EXT_UNIFI_VTI_IP EXT_PEER_MODE EXT_PEER_ADDRESS
+    unset EXT_PEER_TYPE EXT_CREATED_AT EXT_INSTALLED
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" ]] && continue
+        [[ "${line}" =~ ^([A-Z0-9_]+)=(.*)$ ]] || return 1
+        key="${BASH_REMATCH[1]}"
+        raw="${BASH_REMATCH[2]}"
+
+        case "${key}" in
+            NAME|DISPLAY_NAME|PUBLIC_IP|AUTH_ID|VTI_INTERFACE|VTI_KEY|VTI_NETWORK|\
+            DEBIAN_VTI_IP|UNIFI_VTI_IP|PEER_MODE|PEER_ADDRESS|PEER_TYPE|CREATED_AT|INSTALLED)
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+
+        [[ -z "${seen[${key}]:-}" ]] || return 1
+        seen["${key}"]=1
+
+        value="$(decode_printf_q_value "${raw}")" || return 1
+        [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || return 1
+        printf -v "EXT_${key}" '%s' "${value}"
+    done < "${file}"
+
+    [[ -n "${EXT_NAME:-}" ]] || return 1
+    [[ -n "${EXT_PUBLIC_IP:-}" ]] || return 1
+    [[ -n "${EXT_AUTH_ID:-}" ]] || return 1
+    [[ -n "${EXT_VTI_INTERFACE:-}" ]] || return 1
+    [[ -n "${EXT_VTI_KEY:-}" ]] || return 1
+    [[ -n "${EXT_VTI_NETWORK:-}" ]] || return 1
+    [[ -n "${EXT_DEBIAN_VTI_IP:-}" ]] || return 1
+    [[ -n "${EXT_UNIFI_VTI_IP:-}" ]] || return 1
+
+    : "${EXT_DISPLAY_NAME:=${EXT_NAME}}"
+    : "${EXT_PEER_MODE:=dynamic}"
+    : "${EXT_PEER_ADDRESS:=}"
+    : "${EXT_PEER_TYPE:=unifi}"
+    : "${EXT_INSTALLED:=0}"
+
+    valid_tunnel_name "${EXT_NAME}" || return 1
+    valid_display_name "${EXT_DISPLAY_NAME}" || return 1
+    valid_ipv4 "${EXT_PUBLIC_IP}" || return 1
+    valid_auth_id "${EXT_AUTH_ID}" || return 1
+    [[ "${EXT_VTI_INTERFACE}" =~ ^ipsec[0-9]+$ ]] || return 1
+    [[ "${EXT_VTI_KEY}" =~ ^[0-9]+$ ]] || return 1
+    valid_cidr "${EXT_VTI_NETWORK}" || return 1
+    valid_ipv4 "${EXT_DEBIAN_VTI_IP}" || return 1
+    valid_ipv4 "${EXT_UNIFI_VTI_IP}" || return 1
+    [[ "${EXT_PEER_MODE}" =~ ^(dynamic|static|dns)$ ]] || return 1
+    [[ "${EXT_PEER_TYPE}" =~ ^(unifi|debian)$ ]] || return 1
+    [[ "${EXT_INSTALLED}" =~ ^[01]$ ]] || return 1
+
+    case "${EXT_PEER_MODE}" in
+        dynamic)
+            [[ -z "${EXT_PEER_ADDRESS}" ]] || return 1
+            ;;
+        static)
+            valid_ipv4 "${EXT_PEER_ADDRESS}" || return 1
+            ;;
+        dns)
+            valid_hostname "${EXT_PEER_ADDRESS}" || return 1
+            ;;
+    esac
+}
+
+read_peer_bundle() {
+    local file="$1"
+    local line key raw value
+    local -A seen=()
+
+    [[ -f "${file}" ]] || return 1
+
+    unset S2S_PEER_BUNDLE_VERSION CREATED_BY_VERSION CREATED_AT SOURCE_DISPLAY_NAME PEER_DISPLAY_NAME
+    unset PUBLIC_IP REMOTE_PUBLIC_IP AUTH_ID VTI_NETWORK LOCAL_VTI_IP REMOTE_VTI_IP PSK
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" ]] && continue
+        [[ "${line}" =~ ^([A-Z0-9_]+)=(.*)$ ]] || return 1
+        key="${BASH_REMATCH[1]}"
+        raw="${BASH_REMATCH[2]}"
+
+        case "${key}" in
+            S2S_PEER_BUNDLE_VERSION|CREATED_BY_VERSION|CREATED_AT|SOURCE_DISPLAY_NAME|\
+            PEER_DISPLAY_NAME|PUBLIC_IP|REMOTE_PUBLIC_IP|AUTH_ID|VTI_NETWORK|\
+            LOCAL_VTI_IP|REMOTE_VTI_IP|PSK)
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+
+        [[ -z "${seen[${key}]:-}" ]] || return 1
+        seen["${key}"]=1
+
+        value="$(decode_printf_q_value "${raw}")" || return 1
+        [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || return 1
+        printf -v "${key}" '%s' "${value}"
+    done < "${file}"
+
+    [[ "${S2S_PEER_BUNDLE_VERSION:-}" == "1" ]] || return 1
+    valid_ipv4 "${PUBLIC_IP:-}" || return 1
+    valid_ipv4 "${REMOTE_PUBLIC_IP:-}" || return 1
+    valid_auth_id "${AUTH_ID:-}" || return 1
+    valid_cidr "${VTI_NETWORK:-}" || return 1
+    [[ "${VTI_NETWORK}" =~ /30$ ]] || return 1
+    valid_ipv4 "${LOCAL_VTI_IP:-}" || return 1
+    valid_ipv4 "${REMOTE_VTI_IP:-}" || return 1
+    [[ -n "${PSK:-}" && ${#PSK} -le 1024 ]] || return 1
+
+    [[ -z "${SOURCE_DISPLAY_NAME:-}" ]] || valid_display_name "${SOURCE_DISPLAY_NAME}" || return 1
+    [[ -z "${PEER_DISPLAY_NAME:-}" ]] || valid_display_name "${PEER_DISPLAY_NAME}" || return 1
 }
 
 # ==============================================================================
@@ -1167,9 +1414,10 @@ auth_id_in_loaded_swan() {
 
 vti_key_in_system_use() {
     local wanted="$1"
+    local details
     command_available ip || return 1
-    ip -d link show type vti 2>/dev/null |
-        grep -Eq "vti .* (ikey|okey) (0\\.0\\.0\\.)?${wanted}([[:space:]]|$)"
+    details="$(ip -d link show type vti 2>/dev/null || true)"
+    grep -Eq "vti .* (ikey|okey) (0\\.0\\.0\\.)?${wanted}([[:space:]]|$)" <<< "${details}"
 }
 
 interface_in_system_use() {
@@ -1480,17 +1728,7 @@ tunnel_connection_state() {
 bundle_value() {
     local file="$1"
     local key="$2"
-    local line value
-
-    [[ -f "${file}" ]] || return 1
-    line="$(grep -m1 -E "^${key}=" "${file}" 2>/dev/null || true)"
-    [[ -n "${line}" ]] || return 1
-    value="${line#*=}"
-
-    # Bundles created by the manager use printf %q. Decode only the simple
-    # shell-escaped scalar format generated by this manager.
-    # shellcheck disable=SC2086
-    eval "printf '%s' ${value}"
+    safe_assignment_value "${file}" "${key}"
 }
 
 bundle_matches_tunnel_as_debian_peer() {
@@ -1828,8 +2066,9 @@ internal_name_artifacts_exist() {
     [[ -L "${SYSTEMD_DIR}/multi-user.target.wants/$(managed_service_name "${name}")" ]] && return 0
 
     if command_available swanctl; then
-        swanctl_clean swanctl --list-conns 2>/dev/null |
-            grep -qE "^${MANAGED_PREFIX}-${name}:" && return 0
+        local conns
+        conns="$(swanctl_clean swanctl --list-conns 2>/dev/null || true)"
+        grep -qE "^${MANAGED_PREFIX}-${name}:" <<< "${conns}" && return 0
     fi
     return 1
 }
@@ -2461,7 +2700,9 @@ prompt_psk() {
 
 ufw_comment_exists() {
     local comment="$1"
-    ufw status 2>/dev/null | grep -Fq "${comment}"
+    local status
+    status="$(ufw status 2>/dev/null || true)"
+    grep -Fq "${comment}" <<< "${status}"
 }
 
 ensure_shared_firewall_rules() {
@@ -2584,7 +2825,9 @@ EOF
                 echo
                 echo "Current SSH access detected on TCP port ${ssh_port}."
 
-                if ufw status | grep -Eq "(^|[[:space:]])${ssh_port}/tcp[[:space:]]+ALLOW"; then
+                local ufw_status_check
+                ufw_status_check="$(ufw status 2>/dev/null || true)"
+                if grep -Eq "(^|[[:space:]])${ssh_port}/tcp[[:space:]]+ALLOW" <<< "${ufw_status_check}"; then
                     ok "Matching SSH allow rule is present."
                 else
                     error "No matching SSH allow rule found."
@@ -2829,7 +3072,7 @@ ip tunnel add ${VTI_INTERFACE} \\
 
 ip link set ${VTI_INTERFACE} up
 
-ip addr show dev ${VTI_INTERFACE} | grep -q '${DEBIAN_VTI_IP}/30' || \\
+grep -q '${DEBIAN_VTI_IP}/30' < <(ip addr show dev ${VTI_INTERFACE}) || \\
 ip addr add ${DEBIAN_VTI_IP}/30 dev ${VTI_INTERFACE}
 
 ip route replace ${VTI_NETWORK} dev ${VTI_INTERFACE} table 220
@@ -3300,8 +3543,9 @@ install_tunnel_system_config() {
     printf '[6/6] Loading / verifying strongSwan configuration... '
     swanctl_clean swanctl --load-all >/tmp/s2s-manager-swanctl.log 2>&1 || true
 
-    if swanctl_clean swanctl --list-conns 2>/dev/null |
-       grep -qE "^${MANAGED_PREFIX}-${name}:"; then
+    local loaded_conns_verify
+    loaded_conns_verify="$(swanctl_clean swanctl --list-conns 2>/dev/null || true)"
+    if grep -qE "^${MANAGED_PREFIX}-${name}:" <<< "${loaded_conns_verify}"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
@@ -4815,8 +5059,9 @@ takeover_imported_tunnel() {
         :
     fi
 
-    if swanctl_clean swanctl --list-conns 2>/dev/null |
-       grep -qE "^${MANAGED_PREFIX}-${name}:"; then
+    local takeover_conns
+    takeover_conns="$(swanctl_clean swanctl --list-conns 2>/dev/null || true)"
+    if grep -qE "^${MANAGED_PREFIX}-${name}:" <<< "${takeover_conns}"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
@@ -4835,7 +5080,8 @@ takeover_imported_tunnel() {
 
     # Restore the normal active configuration set before changing any files.
     swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-stage-restore.log 2>&1 || true
-    if ! swanctl_clean swanctl --list-conns 2>/dev/null | grep -qE "^${old_conn}:"; then
+    takeover_conns="$(swanctl_clean swanctl --list-conns 2>/dev/null || true)"
+    if ! grep -qE "^${old_conn}:" <<< "${takeover_conns}"; then
         error "Could not restore the original loaded connection after staged validation."
         echo "The active IKE SA was not intentionally terminated."
         pause
@@ -4893,8 +5139,8 @@ takeover_imported_tunnel() {
     printf '[9/12] Reloading / verifying manager strongSwan connection... '
     swanctl_clean swanctl --load-all >/tmp/s2s-manager-takeover-load.log 2>&1 || true
 
-    if swanctl_clean swanctl --list-conns 2>/dev/null |
-       grep -qE "^${MANAGED_PREFIX}-${name}:"; then
+    takeover_conns="$(swanctl_clean swanctl --list-conns 2>/dev/null || true)"
+    if grep -qE "^${MANAGED_PREFIX}-${name}:" <<< "${takeover_conns}"; then
         printf '%b\n' "${C_GREEN}OK${C_RESET}"
     else
         printf '%b\n' "${C_RED}FAILED${C_RESET}"
@@ -6467,6 +6713,41 @@ restore_tunnel_backup() {
         return
     fi
 
+    # Reject archive member types other than regular files/directories before extraction.
+    # This also blocks symbolic links, hard links, devices, FIFOs and sockets.
+    local tar_verbose tar_line tar_type
+    if ! tar_verbose="$(tar -tvzf "${archive}" 2>/dev/null)"; then
+        rm -rf "${tmpdir}"
+        error "Could not read the tunnel backup archive."
+        error "Tunnel backup was NOT restored."
+        pause
+        return
+    fi
+
+    [[ -n "${tar_verbose}" ]] || {
+        rm -rf "${tmpdir}"
+        error "Tunnel backup archive is empty."
+        error "Tunnel backup was NOT restored."
+        pause
+        return
+    }
+
+    while IFS= read -r tar_line; do
+        [[ -n "${tar_line}" ]] || continue
+        tar_type="${tar_line:0:1}"
+        if [[ "${tar_type}" != "-" && "${tar_type}" != "d" ]]; then
+            rm -rf "${tmpdir}"
+            validation_error_block \
+                "UNSAFE BACKUP ARCHIVE" \
+                "Only regular files and directories are allowed in a tunnel backup." \
+                "Links, devices and other special archive members are rejected." \
+                "No files were restored."
+            error "Tunnel backup was NOT restored."
+            pause
+            return
+        fi
+    done <<< "${tar_verbose}"
+
     if ! tar -xzf "${archive}" -C "${tmpdir}" --no-same-owner --no-same-permissions \
         >/tmp/s2s-manager-restore-tar.log 2>&1; then
         rm -rf "${tmpdir}"
@@ -6476,12 +6757,46 @@ restore_tunnel_backup() {
         return
     fi
 
-    if find "${tmpdir}" -type l -print -quit | grep -q .; then
+    # Only the exact manager backup structure is allowed after extraction.
+    # Reject symlinks, hard/special files, extra directories and unexpected files.
+    local tree_entry rel type tree_invalid=0
+    while IFS='|' read -r rel type; do
+        [[ -n "${rel}" ]] || continue
+        case "${rel}|${type}" in
+            "tunnel|d"|"BACKUP-INFO.txt|f")
+                ;;
+            tunnel/*.conf'|f'|tunnel/*.routes'|f'|tunnel/*.psk'|f')
+                local base_name="${rel#tunnel/}"
+                base_name="${base_name%.*}"
+                valid_tunnel_name "${base_name}" || { tree_invalid=1; break; }
+                ;;
+            *)
+                tree_invalid=1
+                break
+                ;;
+        esac
+    done < <(find "${tmpdir}" -mindepth 1 -printf '%P|%y\n' 2>/dev/null)
+
+    if (( tree_invalid == 1 )); then
         rm -rf "${tmpdir}"
         validation_error_block \
-            "UNSAFE BACKUP ARCHIVE" \
-            "Symbolic links are not allowed in tunnel backups." \
+            "UNSAFE / INVALID BACKUP ARCHIVE" \
+            "The backup contains an unexpected path or file type." \
+            "Only BACKUP-INFO.txt and regular .conf/.routes/.psk files under tunnel/ are allowed." \
             "No files were restored."
+        error "Tunnel backup was NOT restored."
+        pause
+        return
+    fi
+
+    if [[ ! -f "${tmpdir}/BACKUP-INFO.txt" ]]; then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "INVALID BACKUP ARCHIVE" \
+            "BACKUP-INFO.txt is missing." \
+            "This does not look like a complete S2S Manager tunnel backup." \
+            "No files were restored."
+        error "Tunnel backup was NOT restored."
         pause
         return
     fi
@@ -6499,18 +6814,53 @@ restore_tunnel_backup() {
     local internal
     internal="$(basename "${conf}" .conf)"
 
-    # Manager backup configs are generated by this program with printf %q.
-    # Load the extracted definition only after structural archive validation.
-    unset NAME DISPLAY_NAME PUBLIC_IP AUTH_ID VTI_INTERFACE VTI_KEY VTI_NETWORK
-    unset DEBIAN_VTI_IP UNIFI_VTI_IP PEER_MODE PEER_ADDRESS PEER_TYPE INSTALLED
-    # shellcheck disable=SC1090
-    source "${conf}"
+    local tunnel_member member_base
+    while IFS= read -r tunnel_member; do
+        [[ -n "${tunnel_member}" ]] || continue
+        member_base="$(basename "${tunnel_member}")"
+        case "${member_base}" in
+            "${internal}.conf"|"${internal}.routes"|"${internal}.psk")
+                ;;
+            *)
+                rm -rf "${tmpdir}"
+                validation_error_block \
+                    "INVALID BACKUP ARCHIVE" \
+                    "Unexpected tunnel file: ${member_base}" \
+                    "All tunnel files in one backup must belong to the same internal tunnel name." \
+                    "No files were restored."
+                error "Tunnel backup was NOT restored."
+                pause
+                return
+                ;;
+        esac
+    done < <(find "${tmpdir}/tunnel" -maxdepth 1 -type f -print 2>/dev/null)
 
-    : "${NAME:=${internal}}"
-    : "${DISPLAY_NAME:=${NAME}}"
-    : "${PEER_MODE:=dynamic}"
-    : "${PEER_ADDRESS:=}"
-    : "${PEER_TYPE:=unifi}"
+    # Parse the external backup definition as data only. Never source it as shell code.
+    if ! read_external_tunnel_config "${conf}"; then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "INVALID BACKUP CONFIGURATION" \
+            "The tunnel definition contains an unknown, duplicate or invalid field." \
+            "No shell code from backup files is executed." \
+            "No files were restored."
+        error "Tunnel backup was NOT restored."
+        pause
+        return
+    fi
+
+    NAME="${EXT_NAME}"
+    DISPLAY_NAME="${EXT_DISPLAY_NAME}"
+    PUBLIC_IP="${EXT_PUBLIC_IP}"
+    AUTH_ID="${EXT_AUTH_ID}"
+    VTI_INTERFACE="${EXT_VTI_INTERFACE}"
+    VTI_KEY="${EXT_VTI_KEY}"
+    VTI_NETWORK="${EXT_VTI_NETWORK}"
+    DEBIAN_VTI_IP="${EXT_DEBIAN_VTI_IP}"
+    UNIFI_VTI_IP="${EXT_UNIFI_VTI_IP}"
+    PEER_MODE="${EXT_PEER_MODE}"
+    PEER_ADDRESS="${EXT_PEER_ADDRESS}"
+    PEER_TYPE="${EXT_PEER_TYPE}"
+    INSTALLED="0"
 
     if [[ "${NAME}" != "${internal}" ]]; then
         rm -rf "${tmpdir}"
@@ -6891,22 +7241,7 @@ transfer_debian_peer_bundle() {
     pause
 }
 
-read_peer_bundle() {
-    local file="$1"
-    [[ -f "${file}" ]] || return 1
-    unset S2S_PEER_BUNDLE_VERSION CREATED_BY_VERSION CREATED_AT SOURCE_DISPLAY_NAME PEER_DISPLAY_NAME
-    unset PUBLIC_IP REMOTE_PUBLIC_IP AUTH_ID VTI_NETWORK LOCAL_VTI_IP REMOTE_VTI_IP PSK
-    # shellcheck disable=SC1090
-    source "${file}" || return 1
-    [[ "${S2S_PEER_BUNDLE_VERSION:-}" == "1" ]] || return 1
-    valid_ipv4 "${PUBLIC_IP:-}" || return 1
-    valid_ipv4 "${REMOTE_PUBLIC_IP:-}" || return 1
-    valid_auth_id "${AUTH_ID:-}" || return 1
-    [[ "${VTI_NETWORK:-}" =~ /30$ ]] || return 1
-    valid_ipv4 "${LOCAL_VTI_IP:-}" || return 1
-    valid_ipv4 "${REMOTE_VTI_IP:-}" || return 1
-    [[ -n "${PSK:-}" ]] || return 1
-}
+
 
 import_debian_peer_bundle() {
     banner
