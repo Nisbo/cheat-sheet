@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.9-test"
+VERSION="1.2.10-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -7554,6 +7554,92 @@ wireguard_rename_client() {
     pause
 }
 
+
+wireguard_show_client_export_instructions() {
+    select_wireguard_client || return
+    local id="${SELECTED_WG_CLIENT}"
+    load_wireguard_client "${id}" || return
+
+    banner
+    section "EXPORT / TRANSFER WIREGUARD CLIENT"
+
+    if [[ -z "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
+        warn "This client was imported from an existing WireGuard server configuration."
+        echo "Its private key is not stored on the server and cannot be reconstructed."
+        echo "Therefore no complete client configuration file is available for export."
+        pause
+        return
+    fi
+
+    wireguard_render_client_export "${id}" || {
+        error "Could not generate the WireGuard client configuration."
+        pause
+        return
+    }
+
+    load_wireguard_server || return
+
+    local export_file
+    export_file="$(wireguard_client_export_file "${id}")"
+
+    local ssh_port="22"
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION}")"
+    fi
+    [[ "${ssh_port}" =~ ^[0-9]+$ ]] || ssh_port="22"
+
+    local ssh_host="${WG_ENDPOINT}"
+    local ssh_user="root"
+
+    printf '%-28s %s\n' "Client:" "${WG_CLIENT_NAME}"
+    printf '%-28s %s\n' "VPN IP:" "${WG_CLIENT_IP}"
+    printf '%-28s %s\n' "Config file:" "${export_file}"
+    printf '%-28s %s\n' "SSH server:" "${ssh_host}"
+    printf '%-28s %s\n' "SSH port:" "${ssh_port}"
+    echo
+
+    echo "Download the configuration FROM your computer."
+    echo "The server does not need access to your computer."
+    echo
+
+    section "MACOS / LINUX"
+    echo "Run this command in Terminal:"
+    echo
+    if [[ "${ssh_port}" == "22" ]]; then
+        printf 'scp %s@%s:%q ~/Downloads/\n' "${ssh_user}" "${ssh_host}" "${export_file}"
+    else
+        printf 'scp -P %s %s@%s:%q ~/Downloads/\n' "${ssh_port}" "${ssh_user}" "${ssh_host}" "${export_file}"
+    fi
+    echo
+    echo "The file will be saved in your Downloads folder."
+
+    echo
+    section "WINDOWS POWERSHELL"
+    echo "Modern Windows versions can use the built-in OpenSSH scp command when"
+    echo "the 'OpenSSH Client' optional feature is installed."
+    echo
+    echo "Run this command in PowerShell:"
+    echo
+    if [[ "${ssh_port}" == "22" ]]; then
+        printf 'scp %s@%s:%s "$HOME\\Downloads\\"\n' "${ssh_user}" "${ssh_host}" "${export_file}"
+    else
+        printf 'scp -P %s %s@%s:%s "$HOME\\Downloads\\"\n' "${ssh_port}" "${ssh_user}" "${ssh_host}" "${export_file}"
+    fi
+    echo
+    echo "If Windows reports that 'scp' is unknown, install the Windows"
+    echo "'OpenSSH Client' optional feature or use an SFTP client such as WinSCP."
+    echo
+    printf 'SFTP server:                %s\n' "${ssh_host}"
+    printf 'SFTP port:                  %s\n' "${ssh_port}"
+    printf 'SFTP user:                  %s\n' "${ssh_user}"
+    printf 'Remote file:                %s\n' "${export_file}"
+
+    echo
+    warn "The exported .conf file contains the client's private WireGuard key"
+    warn "and may also contain a preshared key. Treat it like a password."
+    pause
+}
+
 wireguard_remove_client() {
     select_wireguard_client || return
     load_wireguard_client "${SELECTED_WG_CLIENT}" || return
@@ -7631,7 +7717,8 @@ wireguard_clients_menu() {
         echo "  [2] Show client configuration"
         echo "  [3] Show client QR code"
         echo "  [4] Rename client display name"
-        echo "  [5] Remove client"
+        echo "  [5] Export / transfer client configuration"
+        echo "  [6] Remove client"
         echo "  [B] Back"
         echo
         local c
@@ -7641,7 +7728,8 @@ wireguard_clients_menu() {
             2) wireguard_show_client_config ;;
             3) wireguard_show_client_qr ;;
             4) wireguard_rename_client ;;
-            5) wireguard_remove_client ;;
+            5) wireguard_show_client_export_instructions ;;
+            6) wireguard_remove_client ;;
             b|B|0|"") return ;;
             e|E) clear_screen; echo "Bye."; exit 0 ;;
         esac
