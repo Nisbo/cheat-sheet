@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.55-test"
+VERSION="0.56-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -4228,6 +4228,11 @@ discover_existing_tunnels() {
     banner
     section "DISCOVER EXISTING IPSEC TUNNELS"
 
+    echo "Scans this Debian server for existing strongSwan/VTI tunnels that are not yet managed."
+    echo "Discovered tunnels can be imported as read-only entries for inspection."
+    echo "Importing does not immediately rewrite or take ownership of their existing configuration."
+    echo
+
     echo "This scan is read-only."
     echo "It does NOT modify strongSwan, VTI interfaces, routing or systemd."
     echo
@@ -4573,6 +4578,11 @@ show_takeover_backups() {
     banner
     section "TAKE OVER BACKUPS"
 
+    echo "Shows backups created automatically before the manager takes over an imported tunnel."
+    echo "These backups preserve the original configuration from before manager ownership."
+    echo "This page is read-only and does not restore or modify a tunnel."
+    echo
+
     echo "Take Over backups are stored under:"
     echo "  ${BACKUP_DIR}"
     echo
@@ -4657,6 +4667,11 @@ show_takeover_backups() {
 takeover_imported_tunnel() {
     banner
     section "TAKE OVER IMPORTED TUNNEL"
+
+    echo "Converts a previously imported read-only tunnel into a manager-owned tunnel."
+    echo "The manager validates the existing setup and creates a backup before taking ownership."
+    echo "After takeover, the tunnel can be managed with the normal S2S Manager functions."
+    echo
 
     select_tunnel || return
 
@@ -4966,6 +4981,11 @@ add_tunnel_definition() {
     banner
     section "ADD SITE-TO-SITE TUNNEL"
 
+    echo "Creates a new managed S2S tunnel definition step by step."
+    echo "You choose the peer type, endpoint, transfer network, remote networks and PSK."
+    echo "The definition can be saved first and installed on Debian afterwards."
+    echo
+
     local detected_ip
     detected_ip="$(detect_public_ipv4)"
     [[ -n "${detected_ip}" ]] || detected_ip="0.0.0.0"
@@ -5200,6 +5220,11 @@ add_tunnel_definition() {
 add_remote_network() {
     banner
     section "ADD REMOTE NETWORK"
+
+    echo "Adds another network that should be reachable through an existing S2S tunnel."
+    echo "The manager checks the network for conflicts before saving it."
+    echo "For an installed tunnel, re-apply the configuration afterwards to activate the route."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -5300,6 +5325,11 @@ add_remote_network() {
 remove_remote_network() {
     banner
     section "REMOVE REMOTE NETWORK"
+
+    echo "Removes a configured remote network from an existing S2S tunnel."
+    echo "This changes the saved tunnel definition but does not delete the tunnel itself."
+    echo "For an installed tunnel, re-apply the configuration afterwards to remove the active route."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -5372,6 +5402,12 @@ remove_remote_network() {
 delete_tunnel_completely() {
     banner
     section "DELETE TUNNEL COMPLETELY"
+
+    echo "Permanently removes the selected tunnel from the S2S Manager."
+    echo "If installed, its manager-owned Debian configuration is removed as well."
+    echo "The tunnel definition, remote-network state and stored PSK are then deleted."
+    echo "Use a tunnel backup first if you may need the configuration again."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -5534,6 +5570,11 @@ show_tunnel_details() {
 rename_tunnel_display_name() {
     banner
     section "RENAME TUNNEL DISPLAY NAME"
+
+    echo "Changes only the human-readable name shown by the S2S Manager."
+    echo "The internal name and all strongSwan, VTI, systemd and manager filenames stay unchanged."
+    echo "Display names must remain unique."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -5576,6 +5617,10 @@ rename_tunnel_display_name() {
 show_configuration() {
     banner
     section "SHOW TUNNEL CONFIGURATION"
+
+    echo "Shows the complete saved configuration and current connection state of a tunnel."
+    echo "This is read-only; no tunnel settings or Debian system files are changed."
+    echo
     select_tunnel || return
     show_tunnel_details "${SELECTED_TUNNEL}"
     pause
@@ -5645,6 +5690,10 @@ print_unifi_config() {
 show_unifi_configuration() {
     banner
     section "SHOW UNIFI CONFIGURATION"
+
+    echo "Shows the values needed to configure the UniFi side of a UniFi Gateway tunnel."
+    echo "This is a reference view only; the manager does not change the UniFi gateway."
+    echo
     select_tunnel || return
 
     local tunnel="${SELECTED_TUNNEL}"
@@ -5763,6 +5812,11 @@ install_defined_tunnel() {
 remove_installed_tunnel() {
     banner
     section "REMOVE INSTALLED TUNNEL"
+
+    echo "Removes the manager-installed strongSwan, VTI, systemd and routing configuration"
+    echo "from this Debian server, but keeps the tunnel definition and stored PSK."
+    echo "The tunnel can therefore be installed again later without recreating it."
+    echo
     select_tunnel_for_operation "uninstall" || return
 
     local name="${SELECTED_TUNNEL}"
