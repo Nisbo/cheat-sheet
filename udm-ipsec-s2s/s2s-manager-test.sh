@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.52-test"
+VERSION="0.53-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -6205,9 +6205,18 @@ export_tunnel_backup() {
     banner
     section "EXPORT TUNNEL BACKUP"
 
-    echo "Creates a backup file of an existing tunnel definition."
-    echo "Use it to archive or manually move a tunnel configuration."
-    echo "The backup contains the tunnel settings and stored PSK, so keep it secure."
+    echo "Creates a portable backup of one S2S Manager tunnel."
+    echo
+    echo "The backup contains:"
+    echo "  • manager tunnel definition"
+    echo "  • configured remote networks"
+    echo "  • stored PSK (if present)"
+    echo
+    echo "It does NOT contain active systemd/VTI/strongSwan runtime files."
+    echo "To restore it later, use 'Tunnel backup / restore' -> 'Restore tunnel backup'."
+    echo "A restored tunnel is returned to DEFINED state and can then be installed normally."
+    echo
+    warn "Backup files may contain the PSK. Store and transfer them securely."
     echo
     select_tunnel || return
 
@@ -6256,6 +6265,317 @@ resolve_tunnel_peer_ipv4() {
             ;;
         *) return 1 ;;
     esac
+}
+
+
+list_tunnel_backups() {
+    find "${EXPORT_DIR}" -maxdepth 1 -type f -name '*.s2s-backup.tar.gz' -printf '%p\n' 2>/dev/null | sort
+}
+
+select_tunnel_backup() {
+    local -a backups=()
+    local f choice i
+
+    while IFS= read -r f; do
+        [[ -n "${f}" ]] && backups+=("${f}")
+    done < <(list_tunnel_backups)
+
+    if (( ${#backups[@]} == 0 )); then
+        warn "No tunnel backup files found in ${EXPORT_DIR}."
+        echo
+        info "Create one first with 'Create tunnel backup', or choose a custom path."
+        echo
+        echo "  [P] Enter another backup path"
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            p|P)
+                read -r -p "Backup file: " SELECTED_BACKUP
+                [[ -n "${SELECTED_BACKUP}" ]] || return 1
+                ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
+
+    echo
+    for i in "${!backups[@]}"; do
+        printf '  [%d] %s\n' "$((i+1))" "$(basename "${backups[$i]}")"
+    done
+    echo
+    echo "  [P] Enter another backup path"
+    echo "  [B] Back"
+    echo "  [E] Exit"
+    echo
+    read -r -p "Selection: " choice
+
+    case "${choice}" in
+        p|P)
+            read -r -p "Backup file: " SELECTED_BACKUP
+            [[ -n "${SELECTED_BACKUP}" ]] || return 1
+            return 0
+            ;;
+        b|B|0|"") return 1 ;;
+        e|E) clear_screen; echo "Bye."; exit 0 ;;
+    esac
+
+    [[ "${choice}" =~ ^[0-9]+$ ]] || return 1
+    (( choice >= 1 && choice <= ${#backups[@]} )) || return 1
+    SELECTED_BACKUP="${backups[$((choice-1))]}"
+}
+
+restore_tunnel_backup() {
+    banner
+    section "RESTORE TUNNEL BACKUP"
+
+    echo "Restores a tunnel backup previously created by this S2S Manager."
+    echo
+    echo "Restore brings back:"
+    echo "  • tunnel definition"
+    echo "  • remote networks"
+    echo "  • stored PSK (if included in the backup)"
+    echo
+    echo "The restored tunnel is always set to DEFINED."
+    echo "No strongSwan file, VTI interface or systemd service is installed automatically."
+    echo "After restore, use 'Install tunnel on Debian' when you are ready."
+    echo
+    echo "Restore will NOT overwrite an existing tunnel with the same internal or display name."
+    echo
+
+    select_tunnel_backup || return
+    local archive="${SELECTED_BACKUP}"
+
+    [[ -f "${archive}" ]] || {
+        error "Backup file not found: ${archive}"
+        pause
+        return
+    }
+
+    command_available tar || {
+        error "tar is required to restore a tunnel backup."
+        pause
+        return
+    }
+
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    chmod 700 "${tmpdir}"
+
+    # Reject dangerous archive paths before extracting.
+    local entry unsafe=0
+    while IFS= read -r entry; do
+        [[ -z "${entry}" ]] && continue
+        case "${entry}" in
+            /*|../*|*/../*|*/..)
+                unsafe=1
+                break
+                ;;
+        esac
+    done < <(tar -tzf "${archive}" 2>/dev/null || true)
+
+    if (( unsafe == 1 )); then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "UNSAFE BACKUP ARCHIVE" \
+            "The backup contains an absolute or parent-directory path." \
+            "No files were restored."
+        pause
+        return
+    fi
+
+    if ! tar -xzf "${archive}" -C "${tmpdir}" --no-same-owner --no-same-permissions \
+        >/tmp/s2s-manager-restore-tar.log 2>&1; then
+        rm -rf "${tmpdir}"
+        error "Could not extract the tunnel backup."
+        cat /tmp/s2s-manager-restore-tar.log 2>/dev/null || true
+        pause
+        return
+    fi
+
+    if find "${tmpdir}" -type l -print -quit | grep -q .; then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "UNSAFE BACKUP ARCHIVE" \
+            "Symbolic links are not allowed in tunnel backups." \
+            "No files were restored."
+        pause
+        return
+    fi
+
+    local -a confs=()
+    mapfile -t confs < <(find "${tmpdir}/tunnel" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null)
+    if (( ${#confs[@]} != 1 )); then
+        rm -rf "${tmpdir}"
+        error "Backup must contain exactly one tunnel definition."
+        pause
+        return
+    fi
+
+    local conf="${confs[0]}"
+    local internal
+    internal="$(basename "${conf}" .conf)"
+
+    # Manager backup configs are generated by this program with printf %q.
+    # Load the extracted definition only after structural archive validation.
+    unset NAME DISPLAY_NAME PUBLIC_IP AUTH_ID VTI_INTERFACE VTI_KEY VTI_NETWORK
+    unset DEBIAN_VTI_IP UNIFI_VTI_IP PEER_MODE PEER_ADDRESS PEER_TYPE INSTALLED
+    # shellcheck disable=SC1090
+    source "${conf}"
+
+    : "${NAME:=${internal}}"
+    : "${DISPLAY_NAME:=${NAME}}"
+    : "${PEER_MODE:=dynamic}"
+    : "${PEER_ADDRESS:=}"
+    : "${PEER_TYPE:=unifi}"
+
+    if [[ "${NAME}" != "${internal}" ]]; then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "INVALID BACKUP" \
+            "Internal tunnel name does not match the backup filename." \
+            "Config name: ${NAME}" \
+            "File name:   ${internal}"
+        pause
+        return
+    fi
+
+    if tunnel_exists "${NAME}" || internal_name_artifacts_exist "${NAME}"; then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "TUNNEL ALREADY EXISTS" \
+            "Internal name: ${NAME}" \
+            "Restore does not overwrite an existing tunnel or its system artifacts."
+        pause
+        return
+    fi
+
+    if display_name_in_use "${DISPLAY_NAME}"; then
+        rm -rf "${tmpdir}"
+        validation_error_block \
+            "DISPLAY NAME ALREADY EXISTS" \
+            "Display name: ${DISPLAY_NAME}" \
+            "Restore does not overwrite or duplicate an existing display name."
+        pause
+        return
+    fi
+
+    if check_network_conflict "${VTI_NETWORK}"; then
+        show_network_conflict "${VTI_NETWORK}"
+        rm -rf "${tmpdir}"
+        pause
+        return
+    fi
+
+    local detected_public
+    detected_public="$(detect_public_ipv4)"
+    if [[ -n "${detected_public}" && "${PUBLIC_IP}" != "${detected_public}" ]]; then
+        validation_error_block \
+            "LOCAL PUBLIC IP MISMATCH" \
+            "Backup local Debian IP: ${PUBLIC_IP}" \
+            "Detected server IP:     ${detected_public}" \
+            "" \
+            "This backup belongs to a different local IPsec endpoint." \
+            "No files were restored."
+        rm -rf "${tmpdir}"
+        pause
+        return
+    fi
+
+    # Keep original VTI allocation if still free; otherwise allocate a new one.
+    if interface_in_system_use "${VTI_INTERFACE}" || vti_key_in_system_use "${VTI_KEY}"; then
+        local idx
+        idx="$(next_interface_index)"
+        VTI_INTERFACE="ipsec${idx}"
+        VTI_KEY=$((DEFAULT_VTI_KEY + idx))
+        info "Original VTI resources are already in use; new resources were allocated."
+    fi
+
+    local route_src="${tmpdir}/tunnel/${NAME}.routes"
+    local psk_src="${tmpdir}/tunnel/${NAME}.psk"
+    local psk_present="no"
+    [[ -f "${psk_src}" ]] && psk_present="yes"
+
+    section "RESTORE PREVIEW"
+    printf '%-28s %s\n' "Display name:" "${DISPLAY_NAME}"
+    printf '%-28s %s\n' "Internal name:" "${NAME}"
+    printf '%-28s %s\n' "Peer type:" "$(peer_type_label "${PEER_TYPE}")"
+    printf '%-28s %s\n' "Local Debian public IP:" "${PUBLIC_IP}"
+    printf '%-28s %s\n' "VTI interface:" "${VTI_INTERFACE}"
+    printf '%-28s %s\n' "VTI key / mark:" "${VTI_KEY}"
+    printf '%-28s %s\n' "Tunnel network:" "${VTI_NETWORK}"
+    printf '%-28s %s\n' "PSK included:" "${psk_present}"
+    echo
+    echo "The tunnel will be restored as DEFINED and will not be installed yet."
+    echo
+
+    confirm_yes_no "Restore this tunnel backup?" "N" || {
+        rm -rf "${tmpdir}"
+        return
+    }
+
+    save_tunnel \
+        "${NAME}" "${PUBLIC_IP}" "${AUTH_ID}" "${VTI_INTERFACE}" "${VTI_KEY}" \
+        "${VTI_NETWORK}" "${DEBIAN_VTI_IP}" "${UNIFI_VTI_IP}" "0" \
+        "${PEER_MODE}" "${PEER_ADDRESS}" "${DISPLAY_NAME}" "${PEER_TYPE}"
+
+    if [[ -f "${route_src}" ]]; then
+        cp -a "${route_src}" "$(tunnel_route_file "${NAME}")"
+        chmod 600 "$(tunnel_route_file "${NAME}")"
+    else
+        write_routes "${NAME}"
+    fi
+
+    if [[ -f "${psk_src}" ]]; then
+        cp -a "${psk_src}" "$(tunnel_secret_file "${NAME}")"
+        chmod 600 "$(tunnel_secret_file "${NAME}")"
+    fi
+
+    rm -rf "${tmpdir}"
+
+    echo
+    ok "Tunnel backup restored successfully."
+    printf '%-28s %s\n' "State:" "DEFINED / MANAGED"
+    if [[ "${psk_present}" == "yes" ]]; then
+        ok "Stored PSK restored."
+    else
+        warn "This backup did not contain a PSK. Installation will require a valid PSK."
+    fi
+    info "Use 'Install tunnel on Debian' to install the restored tunnel."
+    pause
+}
+
+tunnel_backup_menu() {
+    while :; do
+        banner
+        section "TUNNEL BACKUP / RESTORE"
+
+        echo "Backups are for saving and restoring an S2S Manager tunnel on the same"
+        echo "local IPsec endpoint. They contain the manager definition, remote networks"
+        echo "and the stored PSK (if present), but not active Debian system files."
+        echo
+        echo "  [1] Create tunnel backup"
+        echo "      Save a portable .s2s-backup.tar.gz file."
+        echo
+        echo "  [2] Restore tunnel backup"
+        echo "      Restore a backup to DEFINED state; install it afterwards if needed."
+        echo
+        echo "  [B] Back"
+        echo "  [E] Exit"
+        echo
+
+        local choice
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1) export_tunnel_backup; return ;;
+            2) restore_tunnel_backup; return ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
+        esac
+    done
 }
 
 create_debian_peer_bundle() {
@@ -6370,6 +6690,10 @@ select_peer_bundle() {
     while read -r f; do [[ -n "${f}" ]] && bundles+=("${f}"); done < <(list_peer_bundles)
     if (( ${#bundles[@]} == 0 )); then
         warn "No Debian peer bundles found in ${EXPORT_DIR}."
+        echo
+        info "Create one first with 'Create Debian peer bundle'."
+        echo "Nothing was transferred."
+        pause
         return 1
     fi
     echo
@@ -6786,7 +7110,7 @@ main_menu() {
         )
 
         local -a menu_export=(
-            "  [16] Export tunnel backup"
+            "  [16] Tunnel backup / restore"
             "  [17] Create Debian peer bundle"
             "  [18] Transfer Debian peer bundle via SCP"
             "  [19] Import Debian peer bundle"
@@ -6831,7 +7155,7 @@ main_menu() {
             13) discover_existing_tunnels ;;
             14) takeover_imported_tunnel ;;
             15) show_takeover_backups ;;
-            16) export_tunnel_backup ;;
+            16) tunnel_backup_menu ;;
             17) create_debian_peer_bundle ;;
             18) transfer_debian_peer_bundle ;;
             19) import_debian_peer_bundle ;;
