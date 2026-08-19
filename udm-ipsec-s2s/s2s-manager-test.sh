@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.6-test"
+VERSION="1.2.7-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -6133,10 +6133,54 @@ wireguard_server_known() {
     [[ -f "${WG_SERVER_STATE}" ]]
 }
 
+
+wireguard_config_is_manager_owned() {
+    local file="${1:-${WG_CONFIG}}"
+    [[ -f "${file}" ]] || return 1
+    grep -Fq "# Managed by IPsec S2S Manager" "${file}"
+}
+
+wireguard_reconcile_management_state() {
+    wireguard_server_known || return 0
+    load_wireguard_server || return 0
+
+    if [[ "${WG_MANAGEMENT}" == "MANAGED" ]]; then
+        if ! wireguard_config_is_manager_owned "${WG_CONFIG}"; then
+            # A previously managed state points to a config that is no longer manager-generated.
+            # Do not touch the live WireGuard config here; only downgrade manager metadata to IMPORTED.
+            local endpoint="${WG_ENDPOINT:-$(detect_public_ipv4)}"
+            local dns="${WG_DNS:-${WG_DNS_DEFAULT}}"
+            local egress="${WG_EGRESS_IF:-$(detect_default_egress_interface)}"
+
+            save_wireguard_server_state \
+                "IMPORTED" "${WG_INTERFACE:-${WG_INTERFACE_DEFAULT}}" "${WG_NETWORK}" "${WG_SERVER_IP}" \
+                "${WG_PREFIX}" "${WG_PORT}" "${endpoint}" "${dns}" "${egress}" "${WG_CONFIG}"
+
+            # Existing client metadata may still be valid for display, but managed private-key
+            # material must not be trusted after an external/manual restore.
+            local id
+            while read -r id; do
+                [[ -n "${id}" ]] || continue
+                local f
+                f="$(wireguard_client_state_file "${id}")"
+                [[ -f "${f}" ]] || continue
+                # Strip manager-owned client private keys after a downgrade to read-only.
+                sed -i -E 's/^WG_CLIENT_PRIVATE_KEY=.*/WG_CLIENT_PRIVATE_KEY=/' "${f}" 2>/dev/null || true
+            done < <(list_wireguard_client_ids)
+
+            rm -f "${WG_SERVER_KEY}" 2>/dev/null || true
+            return 2
+        fi
+    fi
+
+    return 0
+}
+
 wireguard_server_managed() {
     wireguard_server_known || return 1
     load_wireguard_server || return 1
-    [[ "${WG_MANAGEMENT}" == "MANAGED" && -f "${WG_SERVER_KEY}" ]]
+    [[ "${WG_MANAGEMENT}" == "MANAGED" && -f "${WG_SERVER_KEY}" ]] || return 1
+    wireguard_config_is_manager_owned "${WG_CONFIG}"
 }
 
 wireguard_server_imported() {
@@ -7025,40 +7069,47 @@ wireguard_migrate_existing_config() {
 }
 
 wireguard_imported_server_menu() {
-    load_wireguard_server || return
+    while :; do
+        load_wireguard_server || return
 
-    banner
-    section "IMPORTED WIREGUARD SERVER"
+        banner
+        section "IMPORTED WIREGUARD SERVER"
 
-    echo "This WireGuard server is known to the manager but remains READ-ONLY."
-    echo "The existing /etc/wireguard configuration and running interface are unchanged."
-    echo
-    wireguard_server_summary
-    [[ -n "${WG_SOURCE_CONFIG}" ]] && printf '%-28s %s\n' "Source config:" "${WG_SOURCE_CONFIG}"
-    echo
-    echo "  [1] Migrate / take over imported WireGuard server"
-    echo "  [2] Forget read-only import"
-    echo "  [B] Back"
-    echo
+        echo "This WireGuard server is known to the manager but remains READ-ONLY."
+        echo "The existing /etc/wireguard configuration and running interface are unchanged."
+        echo
+        wireguard_server_summary
+        [[ -n "${WG_SOURCE_CONFIG}" ]] && printf '%-28s %s\n' "Source config:" "${WG_SOURCE_CONFIG}"
+        echo
+        echo "  [1] Migrate / take over imported WireGuard server"
+        echo "  [2] Forget read-only import"
+        echo "  [B] Back"
+        echo
 
-    local choice source="${WG_SOURCE_CONFIG}"
-    read -r -p "Selection: " choice
-    case "${choice}" in
-        1)
-            [[ -f "${source}" ]] || { error "Source configuration no longer exists."; pause; return; }
-            wireguard_migrate_existing_config "${source}"
-            ;;
-        2)
-            echo "This removes only the manager's read-only import metadata."
-            echo "The existing WireGuard server is NOT changed."
-            echo
-            confirm_yes_no "Forget this imported WireGuard server?" "N" || return
-            rm -f "${WG_SERVER_STATE}"
-            wireguard_clear_imported_clients
-            ok "Read-only import removed. Existing WireGuard configuration was untouched."
-            pause
-            ;;
-    esac
+        local choice source="${WG_SOURCE_CONFIG}"
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1)
+                [[ -f "${source}" ]] || { error "Source configuration no longer exists."; pause; continue; }
+                wireguard_migrate_existing_config "${source}"
+                return
+                ;;
+            2)
+                echo "This removes only the manager's read-only import metadata."
+                echo "The existing WireGuard server is NOT changed."
+                echo
+                confirm_yes_no "Forget this imported WireGuard server?" "N" || continue
+                rm -f "${WG_SERVER_STATE}"
+                wireguard_clear_imported_clients
+                ok "Read-only import removed. Existing WireGuard configuration was untouched."
+                pause
+                return
+                ;;
+            b|B|0|"") return ;;
+            e|E) clear_screen; echo "Bye."; exit 0 ;;
+            *) error "Invalid selection."; sleep 1 ;;
+        esac
+    done
 }
 
 wireguard_discovery_menu() {
@@ -7372,6 +7423,74 @@ wireguard_show_client_qr() {
     pause
 }
 
+
+wireguard_rename_client() {
+    select_wireguard_client || return
+    local id="${SELECTED_WG_CLIENT}"
+    load_wireguard_client "${id}" || return
+
+    banner
+    section "RENAME WIREGUARD CLIENT"
+
+    echo "Changes only the client display name stored by the manager."
+    echo "WireGuard keys, VPN IP, AllowedIPs and the live tunnel are not changed."
+    echo
+    printf '%-28s %s\n' "Current name:" "${WG_CLIENT_NAME}"
+    printf '%-28s %s\n' "VPN IP:" "${WG_CLIENT_IP}"
+    echo
+
+    local new_name
+    read -r -p "New client display name: " new_name
+    [[ -n "${new_name}" ]] || {
+        warn "No name entered. Nothing changed."
+        pause
+        return
+    }
+
+    if [[ "${new_name}" == "${WG_CLIENT_NAME}" ]]; then
+        info "The new name is identical to the current name. Nothing changed."
+        pause
+        return
+    fi
+
+    local other
+    while read -r other; do
+        [[ -n "${other}" ]] || continue
+        [[ "${other}" == "${id}" ]] && continue
+        load_wireguard_client "${other}" || continue
+        if [[ "${WG_CLIENT_NAME}" == "${new_name}" ]]; then
+            error "Another WireGuard client already uses the display name '${new_name}'."
+            pause
+            return
+        fi
+    done < <(list_wireguard_client_ids)
+
+    load_wireguard_client "${id}" || return
+
+    local f
+    f="$(wireguard_client_state_file "${id}")"
+
+    {
+        printf 'WG_CLIENT_ID=%q\n' "${WG_CLIENT_ID}"
+        printf 'WG_CLIENT_NAME=%q\n' "${new_name}"
+        printf 'WG_CLIENT_IP=%q\n' "${WG_CLIENT_IP}"
+        printf 'WG_CLIENT_PRIVATE_KEY=%q\n' "${WG_CLIENT_PRIVATE_KEY}"
+        printf 'WG_CLIENT_PUBLIC_KEY=%q\n' "${WG_CLIENT_PUBLIC_KEY}"
+        printf 'WG_CLIENT_PRESHARED_KEY=%q\n' "${WG_CLIENT_PRESHARED_KEY}"
+        printf 'WG_CLIENT_CREATED_AT=%q\n' "${WG_CLIENT_CREATED_AT}"
+    } > "${f}"
+    chmod 600 "${f}"
+
+    # Managed client export remains technically unchanged, but refresh the comment/header.
+    if [[ -n "${WG_CLIENT_PRIVATE_KEY:-}" && "${WG_MANAGEMENT}" == "MANAGED" ]]; then
+        wireguard_render_client_export "${id}" || true
+    fi
+
+    ok "WireGuard client display name changed."
+    printf '%-28s %s\n' "New name:" "${new_name}"
+    pause
+}
+
 wireguard_remove_client() {
     select_wireguard_client || return
     load_wireguard_client "${SELECTED_WG_CLIENT}" || return
@@ -7448,7 +7567,8 @@ wireguard_clients_menu() {
         echo "  [1] Add client"
         echo "  [2] Show client configuration"
         echo "  [3] Show client QR code"
-        echo "  [4] Remove client"
+        echo "  [4] Rename client display name"
+        echo "  [5] Remove client"
         echo "  [B] Back"
         echo
         local c
@@ -7457,7 +7577,8 @@ wireguard_clients_menu() {
             1) wireguard_add_client ;;
             2) wireguard_show_client_config ;;
             3) wireguard_show_client_qr ;;
-            4) wireguard_remove_client ;;
+            4) wireguard_rename_client ;;
+            5) wireguard_remove_client ;;
             b|B|0|"") return ;;
             e|E) clear_screen; echo "Bye."; exit 0 ;;
         esac
@@ -9018,10 +9139,28 @@ main_menu() {
 ensure_root
 init_state_dirs
 
+WG_STATE_RECONCILED=0
+if wireguard_reconcile_management_state; then
+    :
+else
+    rc=$?
+    if [[ "${rc}" == "2" ]]; then
+        WG_STATE_RECONCILED=1
+    fi
+fi
+
 if repair_peer_type_state_bug; then
     echo
     ok "Recovered Debian peer type metadata from an existing peer bundle."
     info "This repairs tunnel state written by versions 0.40-test through 0.44-test."
+    sleep 2
+fi
+
+if [[ "${WG_STATE_RECONCILED:-0}" == "1" ]]; then
+    echo
+    warn "WireGuard manager state said MANAGED, but the current wg0.conf is not manager-generated."
+    info "The live WireGuard configuration was NOT changed."
+    info "Manager state was safely returned to IMPORTED / READ-ONLY."
     sleep 2
 fi
 
