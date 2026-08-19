@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.7-test"
+VERSION="1.2.8-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -7405,21 +7405,84 @@ wireguard_show_client_config() {
 
 wireguard_show_client_qr() {
     select_wireguard_client || return
-    load_wireguard_client "${SELECTED_WG_CLIENT}" || return
+    local id="${SELECTED_WG_CLIENT}"
+    load_wireguard_client "${id}" || return
+
+    banner
+    section "WIREGUARD CLIENT QR CODE"
+
     if [[ -z "${WG_CLIENT_PRIVATE_KEY:-}" ]]; then
-        banner
-        section "WIREGUARD CLIENT QR CODE"
-        warn "This client was imported from an existing server configuration."
-        echo "The client private key is not available on the server."
-        echo "A QR code cannot be regenerated for this imported client."
+        warn "This client was imported from the server-side WireGuard configuration."
+        echo "Its private key is not stored on the server and cannot be reconstructed."
+        echo "Therefore a complete client QR code cannot be generated."
         pause
         return
     fi
-    wireguard_render_client_export "${SELECTED_WG_CLIENT}" || return
-    banner; section "WIREGUARD CLIENT QR CODE"
+
+    local export_file="${WG_EXPORT_DIR}/${id}.conf"
+    if [[ ! -f "${export_file}" ]]; then
+        wireguard_render_client_export "${id}" || {
+            error "Could not generate the WireGuard client configuration."
+            pause
+            return
+        }
+    fi
+
+    if ! command -v qrencode >/dev/null 2>&1; then
+        echo "The 'qrencode' package is required to display WireGuard client QR codes."
+        echo "It is currently not installed."
+        echo
+        echo "Installing qrencode is optional and does not change the WireGuard server configuration."
+        echo
+        echo "  [1] Install qrencode"
+        echo "  [B] Back"
+        echo
+
+        local choice
+        read -r -p "Selection: " choice
+        case "${choice}" in
+            1)
+                if ! command -v apt-get >/dev/null 2>&1; then
+                    error "Automatic installation is only supported on systems with apt-get."
+                    info "Install the 'qrencode' package manually and try again."
+                    pause
+                    return
+                fi
+
+                echo
+                info "Installing qrencode..."
+                if DEBIAN_FRONTEND=noninteractive apt-get update &&
+                   DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode; then
+                    if ! command -v qrencode >/dev/null 2>&1; then
+                        error "qrencode installation completed, but the command is still unavailable."
+                        pause
+                        return
+                    fi
+                    ok "qrencode installed successfully."
+                    echo
+                else
+                    error "Could not install qrencode."
+                    info "No WireGuard configuration was changed."
+                    pause
+                    return
+                fi
+                ;;
+            b|B|0|"")
+                return
+                ;;
+            *)
+                error "Invalid selection."
+                sleep 1
+                return
+                ;;
+        esac
+    fi
+
     echo "Scan with the WireGuard app. This QR code contains the client's private key."
     echo
-    qrencode -t ANSIUTF8 < "$(wireguard_client_export_file "${SELECTED_WG_CLIENT}")"
+    if ! qrencode -t ansiutf8 < "${export_file}"; then
+        error "Could not render the WireGuard client QR code."
+    fi
     pause
 }
 
