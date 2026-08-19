@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.49-test"
+VERSION="0.50-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -3308,8 +3308,9 @@ tunnel_is_installed() {
         return 0
     fi
 
-    if systemctl list-unit-files "$(managed_service_name "${name}")" 2>/dev/null |
-       grep -Fq "$(managed_service_name "${name}")"; then
+    local unit_files
+    unit_files="$(systemctl list-unit-files "$(managed_service_name "${name}")" 2>/dev/null || true)"
+    if grep -Fq "$(managed_service_name "${name}")" <<< "${unit_files}"; then
         return 0
     fi
 
@@ -3319,7 +3320,7 @@ tunnel_is_installed() {
 
 actual_install_state() {
     local name="$1"
-    local conn service
+    local conn service loaded_conns table220_routes
     local state_flag=0
     local swan_file=0 vti_script=0 service_file=0 service_enabled=0
     local service_active=0 vti_present=0 conn_loaded=0 route_present=0
@@ -3355,13 +3356,16 @@ actual_install_state() {
     fi
 
     conn="${MANAGED_PREFIX}-${NAME}"
-    if command_available swanctl && \
-       swanctl_clean swanctl --list-conns 2>/dev/null | grep -qE "^${conn}:"; then
-        conn_loaded=1
+    if command_available swanctl; then
+        loaded_conns="$(swanctl_clean swanctl --list-conns 2>/dev/null || true)"
+        if grep -qE "^${conn}:" <<< "${loaded_conns}"; then
+            conn_loaded=1
+        fi
     fi
 
-    if ip route show table 220 2>/dev/null | \
-       grep -qE "^${VTI_NETWORK//./\\.}([[:space:]]|$).*dev[[:space:]]+${VTI_INTERFACE}([[:space:]]|$)"; then
+    table220_routes="$(ip route show table 220 2>/dev/null || true)"
+    if grep -qE "^${VTI_NETWORK//./\\.}([[:space:]]|$).*dev[[:space:]]+${VTI_INTERFACE}([[:space:]]|$)" \
+        <<< "${table220_routes}"; then
         route_present=1
     fi
 
