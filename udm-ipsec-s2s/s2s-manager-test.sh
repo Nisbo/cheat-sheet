@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.54-test"
+VERSION="0.55-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -3735,6 +3735,13 @@ manual_reapply_tunnel() {
     banner
     section "RE-APPLY INSTALLED TUNNEL"
 
+    echo "Regenerates the manager-owned strongSwan, VTI and systemd configuration"
+    echo "from the currently saved tunnel definition."
+    echo "Use this after changing tunnel settings or to repair manager-owned configuration files."
+    echo "The PSK and saved tunnel definition are not regenerated or changed."
+    echo "An established IPsec SA is kept unless a reconnect is performed separately."
+    echo
+
     select_tunnel_for_operation "reapply" || return
 
     local name="${SELECTED_TUNNEL}"
@@ -3970,6 +3977,13 @@ reconnect_tunnel_by_name() {
 manual_reconnect_tunnel() {
     banner
     section "RECONNECT TUNNEL"
+
+    echo "Terminates the current IKE/CHILD SAs and establishes a fresh IPsec connection."
+    echo "Use this when changed IPsec settings must take effect immediately or when a tunnel"
+    echo "is installed correctly but the current connection needs to be restarted."
+    echo "The tunnel definition, PSK, VTI configuration and systemd files are not changed."
+    echo "Traffic through the tunnel is interrupted briefly."
+    echo
     select_tunnel || return
 
     local name="${SELECTED_TUNNEL}"
@@ -5691,6 +5705,12 @@ show_unifi_configuration() {
 install_defined_tunnel() {
     banner
     section "INSTALL TUNNEL ON DEBIAN"
+
+    echo "Installs a saved tunnel definition on this Debian server."
+    echo "The manager creates the strongSwan configuration, VTI setup and systemd service"
+    echo "and adds the required routing/firewall integration."
+    echo "The saved PSK and tunnel definition are reused; the remote peer is not changed."
+    echo
     select_tunnel_for_operation "install" || return
 
     local name="${SELECTED_TUNNEL}"
@@ -5941,6 +5961,12 @@ get_tunnel_connected_since_epoch() {
 show_tunnel_diagnostics() {
     banner
     section "TUNNEL DIAGNOSTICS"
+
+    echo "Checks the selected tunnel without changing its configuration."
+    echo "It shows manager/install state, strongSwan and VTI status, table 220 routes"
+    echo "and the current IKE/CHILD SA connection state."
+    echo "Optional tests can ping the remote VTI address, analyze uptime or show recent logs."
+    echo
 
     select_tunnel || return
 
@@ -6450,6 +6476,7 @@ restore_tunnel_backup() {
             "Internal name: ${NAME}" \
             "Restore stops here without changing anything." \
             "No automatic -2 suffix is added and the existing tunnel is not overwritten."
+        error "Tunnel backup was NOT restored."
         pause
         return
     fi
@@ -6461,6 +6488,7 @@ restore_tunnel_backup() {
             "Display name: ${DISPLAY_NAME}" \
             "Restore stops here without changing anything." \
             "No automatic -2 suffix is added and the existing display name is not changed."
+        error "Tunnel backup was NOT restored."
         pause
         return
     fi
