@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.50-test"
+VERSION="0.51-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -178,6 +178,95 @@ menu_group_header() {
     printf '  %b' "${color}"
     table_divider_segment "${width}"
     printf '%b\n' "${C_RESET}"
+}
+
+
+visible_length() {
+    local value="$1"
+    # Strip ANSI CSI color/style sequences before measuring.
+    value="$(printf '%s' "${value}" | sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g')"
+    printf '%d' "${#value}"
+}
+
+pad_ansi_right() {
+    local value="$1"
+    local width="$2"
+    local len pad
+
+    len="$(visible_length "${value}")"
+    pad=$(( width - len ))
+    (( pad < 0 )) && pad=0
+
+    printf '%b' "${value}"
+    printf '%*s' "${pad}" ''
+}
+
+menu_block_line() {
+    local color="$1"
+    local title="$2"
+    local width="$3"
+
+    printf '%b' "${C_BOLD}${color}"
+    printf '  %s' "${title}"
+    printf '%b' "${C_RESET}"
+    local used=$(( 2 + ${#title} ))
+    if (( used < width )); then
+        printf '%*s' "$(( width - used ))" ''
+    fi
+}
+
+menu_block_rule() {
+    local color="$1"
+    local width="$2"
+
+    printf '  %b' "${color}"
+    table_divider_segment "$(( width - 2 ))"
+    printf '%b' "${C_RESET}"
+}
+
+render_menu_pair() {
+    local left_title="$1"
+    local left_color="$2"
+    local left_items_name="$3"
+    local right_title="$4"
+    local right_color="$5"
+    local right_items_name="$6"
+
+    local -n left_items="${left_items_name}"
+    local -n right_items="${right_items_name}"
+
+    local col_width=58
+    local gap="    "
+    local rows i left right
+
+    (( ${#left_items[@]} > ${#right_items[@]} )) && rows=${#left_items[@]} || rows=${#right_items[@]}
+
+    echo
+
+    local left_header right_header
+    left_header="${C_BOLD}${left_color}  ${left_title}${C_RESET}"
+    right_header="${C_BOLD}${right_color}  ${right_title}${C_RESET}"
+    pad_ansi_right "${left_header}" "${col_width}"
+    printf '%s' "${gap}"
+    pad_ansi_right "${right_header}" "${col_width}"
+    printf '\n'
+
+    local left_rule right_rule
+    left_rule="${left_color}  $(printf '─%.0s' $(seq 1 $((col_width - 2))))${C_RESET}"
+    right_rule="${right_color}  $(printf '─%.0s' $(seq 1 $((col_width - 2))))${C_RESET}"
+    pad_ansi_right "${left_rule}" "${col_width}"
+    printf '%s' "${gap}"
+    pad_ansi_right "${right_rule}" "${col_width}"
+    printf '\n'
+
+    for ((i=0; i<rows; i++)); do
+        left="${left_items[$i]:-}"
+        right="${right_items[$i]:-}"
+        pad_ansi_right "${left}" "${col_width}"
+        printf '%s' "${gap}"
+        pad_ansi_right "${right}" "${col_width}"
+        printf '\n'
+    done
 }
 
 confirm_yes_no() {
@@ -6651,37 +6740,55 @@ main_menu() {
         table_divider_segment 128
         printf '%b\n' "${C_RESET}"
 
-        menu_group_header "TUNNEL CONFIGURATION" "${C_CYAN}"
-        echo "  [1] Show tunnel configuration"
-        echo "  [2] Add S2S tunnel"
-        echo "  [3] Add remote network to tunnel"
-        echo "  [4] Remove remote network from tunnel"
-        echo "  [5] Show UniFi configuration"
-        echo "  [6] Rename tunnel display name"
+        local -a menu_config=(
+            "  [1] Show tunnel configuration"
+            "  [2] Add S2S tunnel"
+            "  [3] Add remote network to tunnel"
+            "  [4] Remove remote network from tunnel"
+            "  [5] Show UniFi configuration"
+            "  [6] Rename tunnel display name"
+        )
 
-        menu_group_header "TUNNEL OPERATIONS" "${C_GREEN}"
-        echo "  [7] Install tunnel on Debian"
-        echo "  [8] Re-apply tunnel configuration"
-        echo "  [9] Reconnect tunnel"
-        echo "  [10] Tunnel diagnostics"
+        local -a menu_operations=(
+            "  [7] Install tunnel on Debian"
+            "  [8] Re-apply tunnel configuration"
+            "  [9] Reconnect tunnel"
+            "  [10] Tunnel diagnostics"
+        )
 
-        menu_group_header "REMOVE / DELETE" "${C_YELLOW}"
-        echo "  [11] Uninstall tunnel from Debian (keep definition + PSK)"
-        echo "  [12] Delete tunnel completely"
+        local -a menu_remove=(
+            "  [11] Uninstall tunnel from Debian (keep definition + PSK)"
+            "  [12] Delete tunnel completely"
+        )
 
-        menu_group_header "IMPORT / TAKE OVER" "${C_BLUE}"
-        echo "  [13] Discover / import existing tunnels"
-        echo "  [14] Take over imported tunnel"
-        echo "  [15] Show Take Over backups"
+        local -a menu_import=(
+            "  [13] Discover / import existing tunnels"
+            "  [14] Take over imported tunnel"
+            "  [15] Show Take Over backups"
+        )
 
-        menu_group_header "EXPORT / TRANSFER" "${C_GREEN}"
-        echo "  [16] Export tunnel backup"
-        echo "  [17] Create Debian peer bundle"
-        echo "  [18] Transfer Debian peer bundle via SCP"
-        echo "  [19] Import Debian peer bundle"
+        local -a menu_export=(
+            "  [16] Export tunnel backup"
+            "  [17] Create Debian peer bundle"
+            "  [18] Transfer Debian peer bundle via SCP"
+            "  [19] Import Debian peer bundle"
+        )
 
-        menu_group_header "SYSTEM" "${C_CYAN}"
-        echo "  [20] Show system status"
+        local -a menu_system=(
+            "  [20] Show system status"
+        )
+
+        render_menu_pair \
+            "TUNNEL CONFIGURATION" "${C_CYAN}" menu_config \
+            "TUNNEL OPERATIONS" "${C_GREEN}" menu_operations
+
+        render_menu_pair \
+            "REMOVE / DELETE" "${C_YELLOW}" menu_remove \
+            "IMPORT / TAKE OVER" "${C_BLUE}" menu_import
+
+        render_menu_pair \
+            "EXPORT / TRANSFER" "${C_GREEN}" menu_export \
+            "SYSTEM" "${C_CYAN}" menu_system
 
         echo
         echo "  [E] Exit"
