@@ -27,7 +27,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.48-test"
+VERSION="0.49-test"
 
 STATE_DIR="/root/s2s-manager-test"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -3426,7 +3426,8 @@ select_tunnel_for_operation() {
     local operation="$1"
     local -a names=() labels=() states=()
     local -a primary_idx=() secondary_idx=()
-    local name state label selection i display
+    local -a display_order=()
+    local name state selection display
 
     while read -r name; do
         [[ -n "${name}" ]] || continue
@@ -3439,27 +3440,39 @@ select_tunnel_for_operation() {
 
         case "${operation}:${state}" in
             install:DEFINED)
-                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                names+=("${name}")
+                labels+=("${display}")
+                states+=("${state}")
                 primary_idx+=("$(( ${#names[@]} - 1 ))")
                 ;;
             install:PARTIAL)
-                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                names+=("${name}")
+                labels+=("${display}")
+                states+=("${state}")
                 secondary_idx+=("$(( ${#names[@]} - 1 ))")
                 ;;
             uninstall:INSTALLED)
-                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                names+=("${name}")
+                labels+=("${display}")
+                states+=("${state}")
                 primary_idx+=("$(( ${#names[@]} - 1 ))")
                 ;;
             uninstall:PARTIAL)
-                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                names+=("${name}")
+                labels+=("${display}")
+                states+=("${state}")
                 secondary_idx+=("$(( ${#names[@]} - 1 ))")
                 ;;
             reapply:INSTALLED)
-                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                names+=("${name}")
+                labels+=("${display}")
+                states+=("${state}")
                 primary_idx+=("$(( ${#names[@]} - 1 ))")
                 ;;
             reapply:PARTIAL)
-                names+=("${name}"); labels+=("${display}"); states+=("${state}")
+                names+=("${name}")
+                labels+=("${display}")
+                states+=("${state}")
                 secondary_idx+=("$(( ${#names[@]} - 1 ))")
                 ;;
         esac
@@ -3477,15 +3490,17 @@ select_tunnel_for_operation() {
 
     echo
     local n=1 idx
+
     if (( ${#primary_idx[@]} > 0 )); then
         case "${operation}" in
             install)   printf '%b\n' "${C_GREEN}${C_BOLD}  READY TO INSTALL${C_RESET}" ;;
             uninstall) printf '%b\n' "${C_GREEN}${C_BOLD}  INSTALLED${C_RESET}" ;;
             reapply)   printf '%b\n' "${C_GREEN}${C_BOLD}  INSTALLED${C_RESET}" ;;
         esac
+
         for idx in "${primary_idx[@]}"; do
             printf '  [%d] %s\n' "${n}" "${labels[$idx]}"
-            DISPLAY_ORDER_${n}="${idx}"
+            display_order[$n]="${idx}"
             ((n += 1))
         done
         echo
@@ -3493,9 +3508,10 @@ select_tunnel_for_operation() {
 
     if (( ${#secondary_idx[@]} > 0 )); then
         printf '%b\n' "${C_YELLOW}${C_BOLD}  PARTIAL / BROKEN${C_RESET}"
+
         for idx in "${secondary_idx[@]}"; do
             printf '  [%d] %s  [repair needed]\n' "${n}" "${labels[$idx]}"
-            DISPLAY_ORDER_${n}="${idx}"
+            display_order[$n]="${idx}"
             ((n += 1))
         done
         echo
@@ -3510,11 +3526,11 @@ select_tunnel_for_operation() {
         ""|b|B|0) return 1 ;;
         e|E) clear_screen; echo "Bye."; exit 0 ;;
     esac
+
     [[ "${selection}" =~ ^[0-9]+$ ]] || return 1
     (( selection >= 1 && selection < n )) || return 1
 
-    local order_var="DISPLAY_ORDER_${selection}"
-    idx="${!order_var}"
+    idx="${display_order[$selection]}"
     SELECTED_TUNNEL="${names[$idx]}"
     SELECTED_ACTUAL_STATE="${states[$idx]}"
     return 0
