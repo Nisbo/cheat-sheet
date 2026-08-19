@@ -41,7 +41,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.8-test"
+VERSION="1.2.9-test"
 
 STATE_DIR="/root/s2s-manager"
 TUNNEL_DIR="${STATE_DIR}/tunnels"
@@ -7419,7 +7419,7 @@ wireguard_show_client_qr() {
         return
     fi
 
-    local export_file="${WG_EXPORT_DIR}/${id}.conf"
+    local export_file="${WG_CLIENT_EXPORT_DIR}/${id}.conf"
     if [[ ! -f "${export_file}" ]]; then
         wireguard_render_client_export "${id}" || {
             error "Could not generate the WireGuard client configuration."
